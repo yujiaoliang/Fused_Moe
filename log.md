@@ -114,3 +114,21 @@
     * 将选中专家输出进行加权并归一化
     * 每个rank的本地专家做两次gemm和以此SwiGLU
 
+
+### 0218_log
+* 构造了一个脚本但是没有print出trace信息。打印如下：
+  ```
+  Loading solution...
+Loaded: my-team-solution-v1 (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
+
+Running benchmark on Modal B200...
+⠼ Loading images (1 containers initializing)... View app at https://modal.com/apps/jiaoliangyu968/main/ap-18ebzVjg2AzpsDShutting down worker
+Shutting down worker
+Shutting down worker
+Shutting down worker
+
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+Stopping app - local entrypoint completed.
+✓ App completed. View run at https://modal.com/apps/jiaoliangyu968/main/ap-18ebzVjg2AzpsDJekZi9oV
+```
+没有trace信息，定位中。。。
