@@ -24,12 +24,12 @@ def pack_solution() -> Path:
     sources = []
     for p in sorted(src_dir.rglob("*.py" if lang == "triton" else "*.cu")):
         rel = p.relative_to(src_dir).as_posix()
-        sources.append(SourceFile(path=rel, content=p.read_text()))
+        sources.append(SourceFile(path=rel, content=p.read_text(encoding="utf-8")))
     # Also grab .py files for CUDA binding
     if lang == "cuda":
         for p in sorted(src_dir.rglob("*.py")):
             rel = p.relative_to(src_dir).as_posix()
-            sources.append(SourceFile(path=rel, content=p.read_text()))
+            sources.append(SourceFile(path=rel, content=p.read_text(encoding="utf-8")))
 
     solution = Solution(
         name=config["solution"]["name"],
@@ -44,7 +44,7 @@ def pack_solution() -> Path:
     )
 
     out_path = PROJECT_ROOT / "solution.json"
-    out_path.write_text(solution.model_dump_json(indent=2))
+    out_path.write_text(solution.model_dump_json(indent=2), encoding="utf-8")
     print(f"Solution packed: {out_path}")
     print(f"  Name: {solution.name}")
     print(f"  Definition: {solution.definition}")

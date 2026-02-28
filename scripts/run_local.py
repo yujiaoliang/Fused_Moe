@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
-from scripts.pack_solution import pack_solution
+from scripts.pack_solution_simple import pack_solution
 
 
 def get_trace_set_path() -> str:
@@ -30,7 +30,9 @@ def get_trace_set_path() -> str:
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark locally and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        import os
+        log_dir = os.path.join(os.getcwd(), "worker_logs")
+        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5, log_dir=log_dir, use_isolated_runner=True)
 
     trace_set_path = get_trace_set_path()
     trace_set = TraceSet.from_path(trace_set_path)
@@ -43,6 +45,9 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
 
     if not workloads:
         raise ValueError(f"No workloads found for definition '{solution.definition}'")
+    
+    print(f"Found {len(workloads)} workloads for {solution.definition}")
+    print(f"Config: {config}")
 
     bench_trace_set = TraceSet(
         root=trace_set.root,
@@ -104,7 +109,7 @@ def main():
     solution_path = pack_solution()
 
     print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text())
+    solution = Solution.model_validate_json(solution_path.read_text(encoding="utf-8"))
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark...")
@@ -118,4 +123,7 @@ def main():
 
 
 if __name__ == "__main__":
+    import logging
+    logging.getLogger("flashinfer_bench").setLevel(logging.DEBUG)
+    logging.basicConfig(level=logging.DEBUG)
     main()
