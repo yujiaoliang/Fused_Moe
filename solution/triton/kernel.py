@@ -395,82 +395,71 @@ def kernel(
         routing_logits, routing_bias, float(routed_scaling_factor)
     )
 
-    # ── 2. Token sorting ──
-    BLOCK_M = 64
-    sorted_token_ids, block_expert_ids, sorted_weights, num_padded = \
-        moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device)
+    # ── 2. FP8 block-scale dequantization of hidden_states ──
+    BLOCK = QBLOCK  # 128
+    
+    # Dequant hidden_states: [T, H] fp8 * scale [H/128, T] → fp32
+    A_fp32 = hidden_states.to(torch.float32)
+    A_scale = hidden_states_scale.float().permute(1, 0).contiguous()  # [T, H/128]
+    A_scale_expanded = A_scale.unsqueeze(-1).expand(-1, -1, BLOCK).reshape(T, H)
+    A = A_fp32 * A_scale_expanded  # [T, H] fp32
+    del A_fp32, A_scale, A_scale_expanded
 
-    if sorted_token_ids is None:
-        return torch.zeros((T, H), dtype=torch.bfloat16, device=device)
-
-    num_blocks = num_padded // BLOCK_M
-
-    # ── 3. GEMM1: [T, H=7168]fp8 × [E, 4096, 7168]fp8 → [EM, 4096]bf16 ──
-    GEMM1_N = 2 * I_SIZE  # 4096
-    gemm1_out = torch.empty((num_padded, GEMM1_N), dtype=torch.bfloat16, device=device)
-
-    BLOCK_N = QBLOCK  # 128
-    BLOCK_K = QBLOCK  # 128
-    grid_gemm1 = (num_blocks * (GEMM1_N // BLOCK_N),)
-
-    _grouped_gemm_fp8_kernel[grid_gemm1](
-        hidden_states, gemm1_weights, gemm1_out,
-        hidden_states_scale, gemm1_weights_scale,
-        sorted_token_ids, block_expert_ids,
-        T=T, K=H, N=GEMM1_N,
-        stride_at=hidden_states.stride(0), stride_ak=hidden_states.stride(1),
-        stride_be=gemm1_weights.stride(0), stride_bn=gemm1_weights.stride(1),
-        stride_bk=gemm1_weights.stride(2),
-        stride_cm=gemm1_out.stride(0), stride_cn=gemm1_out.stride(1),
-        stride_as0=hidden_states_scale.stride(0), stride_as1=hidden_states_scale.stride(1),
-        stride_bs0=gemm1_weights_scale.stride(0), stride_bs1=gemm1_weights_scale.stride(1),
-        stride_bs2=gemm1_weights_scale.stride(2),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=8,
-    )
-
-    # ── 4. SwiGLU: [EM, 4096] → [EM, 2048] ──
-    swiglu_out = torch.empty((num_padded, I_SIZE), dtype=torch.bfloat16, device=device)
-    SW_BLOCK_M = 32
-    SW_BLOCK_I = min(I_SIZE, 1024)
-    swiglu_grid = (triton.cdiv(num_padded, SW_BLOCK_M), triton.cdiv(I_SIZE, SW_BLOCK_I))
-    _swiglu_kernel[swiglu_grid](
-        gemm1_out, swiglu_out, num_padded,
-        I_SIZE=I_SIZE,
-        BLOCK_M=SW_BLOCK_M, BLOCK_I=SW_BLOCK_I,
-    )
-
-    # ── 5. GEMM2: [EM, 2048]bf16 × [E, 7168, 2048]fp8 → [EM, 7168]bf16 ──
-    gemm2_out = torch.empty((num_padded, H), dtype=torch.bfloat16, device=device)
-    GEMM2_K = I_SIZE   # 2048
-    GEMM2_N = H        # 7168
-
-    grid_gemm2 = (num_blocks * (GEMM2_N // BLOCK_N),)
-
-    _grouped_gemm_bf16xfp8_kernel[grid_gemm2](
-        swiglu_out, gemm2_weights, gemm2_out,
-        gemm2_weights_scale, block_expert_ids, sorted_weights,
-        EM=num_padded, K=GEMM2_K, N=GEMM2_N,
-        stride_am=swiglu_out.stride(0), stride_ak=swiglu_out.stride(1),
-        stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1),
-        stride_bk=gemm2_weights.stride(2),
-        stride_cm=gemm2_out.stride(0), stride_cn=gemm2_out.stride(1),
-        stride_bs0=gemm2_weights_scale.stride(0), stride_bs1=gemm2_weights_scale.stride(1),
-        stride_bs2=gemm2_weights_scale.stride(2),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
-        GROUP_SIZE_M=8,
-        MUL_WEIGHT=True,
-    )
-
-    # ── 6. Weighted reduce: scatter-add back to original tokens ──
+    # ── 3. Per-expert compute (dequant weights per-expert to save memory) ──
     output = torch.zeros((T, H), dtype=torch.float32, device=device)
 
-    # Only accumulate valid (non-padded) entries
-    valid_mask = sorted_token_ids < T
-    valid_token_ids = sorted_token_ids[valid_mask]
-    valid_out = gemm2_out[valid_mask].float()
-    # Weight already applied in GEMM2 kernel
+    for le in range(E_LOCAL):
+        ge = local_start + le
+        if ge < 0 or ge >= E_GLOBAL:
+            continue
 
-    output.index_add_(0, valid_token_ids, valid_out)
+        # Find tokens that selected this expert
+        sel_mask = (topk_idx == ge).any(dim=1)  # [T] bool
+        if not sel_mask.any():
+            continue
+
+        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)  # [Tk]
+
+        # Gather input tokens
+        A_e = A.index_select(0, token_idx)      # [Tk, H]
+
+        # Dequant W13 for this expert only: [2I, H]
+        w13_e_fp32 = gemm1_weights[le].to(torch.float32)       # [2I, H]
+        s13_e = gemm1_weights_scale[le].float()                 # [2I/128, H/128]
+        s13_exp = s13_e.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
+        W13_e = w13_e_fp32 * s13_exp                            # [2I, H]
+        del w13_e_fp32, s13_e, s13_exp
+
+        # GEMM1: [Tk, H] @ [H, 2I] → [Tk, 2I]
+        G1 = A_e.matmul(W13_e.t())              # [Tk, 2I]
+        del W13_e
+
+        # SwiGLU: gate = first half, up = second half
+        X1 = G1[:, :I_SIZE]                      # [Tk, I]
+        X2 = G1[:, I_SIZE:]                      # [Tk, I]
+        silu_X2 = X2 * torch.sigmoid(X2)         # silu(x) = x * sigmoid(x)
+        C = silu_X2 * X1                         # [Tk, I]
+        del G1, X1, X2, silu_X2
+
+        # Dequant W2 for this expert only: [H, I]
+        w2_e_fp32 = gemm2_weights[le].to(torch.float32)        # [H, I]
+        s2_e = gemm2_weights_scale[le].float()                  # [H/128, I/128]
+        s2_exp = s2_e.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
+        W2_e = w2_e_fp32 * s2_exp                               # [H, I]
+        del w2_e_fp32, s2_e, s2_exp
+
+        # GEMM2: [Tk, I] @ [I, H] → [Tk, H]
+        O = C.matmul(W2_e.t())                   # [Tk, H]
+        del C, W2_e
+
+        # Get routing weight for this expert
+        w_tok = torch.zeros(token_idx.shape[0], dtype=torch.float32, device=device)
+        for k_pos in range(TOP_K):
+            mask_k = topk_idx[token_idx, k_pos] == ge
+            w_tok[mask_k] = topk_weights[token_idx[mask_k], k_pos]
+
+        # Weighted accumulation
+        output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
 
     return output.to(torch.bfloat16)
+

@@ -1,4 +1,4 @@
-"""Detailed correctness debug: step-by-step comparison."""
+"""Direct correctness test with matched_ratio computation."""
 import torch
 import sys
 sys.path.insert(0, 'solution/triton')
@@ -30,63 +30,54 @@ def run_test():
     ref_out = baseline.outputs[0]['output']
     
     T = inp['routing_logits'].shape[0]
-    local_start = int(inp['local_expert_offset'])
-    scale_factor = float(inp['routed_scaling_factor'])
+    print(f"T={T}")
+    print(f"Inputs:")
+    for k, v in inp.items():
+        if isinstance(v, torch.Tensor):
+            print(f"  {k}: {v.shape} {v.dtype}")
+        else:
+            print(f"  {k}: {v}")
     
-    print(f"T={T}, local_start={local_start}, scale_factor={scale_factor}")
-    
-    # Step 1: Compare routing
-    print("\n=== Step 1: Routing ===")
-    topk_idx, topk_weights = fused_moe.ds_routing(
-        inp['routing_logits'], inp['routing_bias'], scale_factor
-    )
-    print(f"topk_idx: {topk_idx}")
-    print(f"topk_weights: {topk_weights}")
-    
-    # Check which local experts are selected
-    local_end = local_start + 32
-    local_mask = (topk_idx >= local_start) & (topk_idx < local_end)
-    print(f"\nLocal expert mask (any per token): {local_mask.any(dim=1)}")
-    num_local = local_mask.sum().item()
-    print(f"Total local expert assignments: {num_local}")
-    
-    if num_local == 0:
-        print("No local experts selected! Output should be all zeros.")
-        print(f"Ref output non-zero count: {(ref_out.float().abs() > 1e-6).sum().item()}")
-        return
-    
-    # Step 2: Token sorting
-    print("\n=== Step 2: Token Sorting ===")
-    BLOCK_M = 64
-    sorted_token_ids, block_expert_ids, sorted_weights, num_padded = \
-        fused_moe.moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device)
-    
-    if sorted_token_ids is None:
-        print("No tokens sorted!")
-        return
-    
-    print(f"num_padded: {num_padded}")
-    print(f"sorted_token_ids: {sorted_token_ids}")
-    print(f"block_expert_ids: {block_expert_ids}")
-    print(f"sorted_weights: {sorted_weights}")
-    
-    # Step 3: Compare per-token error
-    print("\n=== Step 3: Full kernel output comparison ===")
+    # Run our kernel
+    print("\nRunning our kernel...")
     our_out = fused_moe.kernel(**inp)
     
-    ref_f = ref_out.float()
-    our_f = our_out.float()
+    print(f"Ref output: {ref_out.shape} {ref_out.dtype}")
+    print(f"Our output: {our_out.shape} {our_out.dtype}")
     
+    # Compute error stats (same as benchmark evaluator)
+    x = our_out.float()
+    y = ref_out.float()
+    eps = 1e-8
+    abs_error = torch.abs(x - y)
+    rel_error = abs_error / (torch.abs(y) + eps)
+    
+    atol, rtol = 0.01, 0.01
+    exceeds_mask = (abs_error > atol) & (rel_error > rtol)
+    total = abs_error.numel()
+    exceeds_count = exceeds_mask.sum().item()
+    matched_ratio = 1.0 - (exceeds_count / total)
+    
+    print(f"\n=== Error Stats ===")
+    print(f"Max absolute error: {abs_error.max().item():.4f}")
+    print(f"Max relative error: {rel_error.max().item():.4f}")
+    print(f"Mean absolute error: {abs_error.mean().item():.4f}")
+    print(f"Mean relative error: {rel_error.mean().item():.4f}")
+    print(f"\nExceeds tolerance: {exceeds_count}/{total} elements")
+    print(f"Matched ratio: {matched_ratio:.6f} (need >= 0.95)")
+    print(f"PASS: {matched_ratio >= 0.95}")
+    
+    # Per-token breakdown
+    print(f"\n=== Per-token breakdown ===")
     for t in range(T):
-        abs_err_t = (ref_f[t] - our_f[t]).abs()
-        max_ae = abs_err_t.max().item()
-        mean_ae = abs_err_t.mean().item()
-        ref_norm = ref_f[t].abs().mean().item()
-        our_norm = our_f[t].abs().mean().item()
-        print(f"  Token {t}: max_abs_err={max_ae:.4f}, mean_abs_err={mean_ae:.4f}, "
-              f"ref_norm={ref_norm:.4f}, our_norm={our_norm:.4f}")
-    
-    # Cleanup
+        abs_t = abs_error[t]
+        rel_t = rel_error[t]
+        exc_t = ((abs_t > atol) & (rel_t > rtol)).sum().item()
+        total_t = abs_t.numel()
+        ratio_t = 1.0 - exc_t / total_t
+        print(f"  Token {t}: max_abs={abs_t.max().item():.2f}, max_rel={rel_t.max().item():.4f}, "
+              f"exceeds={exc_t}/{total_t}, matched={ratio_t:.4f}")
+
     del baseline
     torch.cuda.empty_cache()
 
