@@ -109,18 +109,19 @@ def moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device):
     loc_experts = loc_experts[sort_idx]
     loc_weights = loc_weights[sort_idx]
 
-    # Count per expert
+    # Vectorized padding: count per expert and compute padded offsets
     counts = torch.zeros(E_LOCAL, dtype=torch.int32, device=device)
     counts.scatter_add_(0, loc_experts.long(), torch.ones_like(loc_experts, dtype=torch.int32))
 
-    # Pad each expert's tokens to BLOCK_M alignment
+    # Compute padded lengths and offsets per expert (on CPU for indexing)
+    counts_cpu = counts.cpu().tolist()
     padded_tokens_list = []
     padded_weights_list = []
     block_experts_list = []
     offset = 0
 
     for e in range(E_LOCAL):
-        cnt = counts[e].item()
+        cnt = counts_cpu[e]
         if cnt == 0:
             continue
         num_blocks = (cnt + BLOCK_M - 1) // BLOCK_M
@@ -130,7 +131,6 @@ def moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device):
         padded_weights_list.append(loc_weights[offset:offset + cnt])
 
         if pad_cnt > 0:
-            # Pad with T (out-of-range, will be masked)
             padded_tokens_list.append(torch.full((pad_cnt,), T, device=device, dtype=torch.int64))
             padded_weights_list.append(torch.zeros(pad_cnt, device=device))
 
