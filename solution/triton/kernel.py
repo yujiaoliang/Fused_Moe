@@ -385,6 +385,7 @@ def kernel(
     gemm2_weights_scale,      # [32, 56, 16]      float32
     local_expert_offset,      # int32 scalar
     routed_scaling_factor,    # float32 scalar
+    output,                   # [T, 7168]         bfloat16  (destination-passing, last)
 ):
     T = routing_logits.shape[0]
     device = hidden_states.device
@@ -406,7 +407,7 @@ def kernel(
     del A_fp32, A_scale, A_scale_expanded
 
     # ── 3. Per-expert compute (dequant weights per-expert to save memory) ──
-    output = torch.zeros((T, H), dtype=torch.float32, device=device)
+    accum = torch.zeros((T, H), dtype=torch.float32, device=device)
 
     for le in range(E_LOCAL):
         ge = local_start + le
@@ -459,7 +460,7 @@ def kernel(
             w_tok[mask_k] = topk_weights[token_idx[mask_k], k_pos]
 
         # Weighted accumulation
-        output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
+        accum.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
 
-    return output.to(torch.bfloat16)
-
+    # Write result into pre-allocated output tensor
+    output.copy_(accum.to(torch.bfloat16))

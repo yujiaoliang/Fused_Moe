@@ -23,7 +23,8 @@ from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
-TRACE_SET_PATH = "/data"
+VOLUME_MOUNT = "/data"
+TRACE_SET_PATH = "/data/mlsys26-contest"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -31,13 +32,18 @@ image = (
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOLUME_MOUNT: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
+
+    import os
+    print(f"TRACE_SET_PATH: {TRACE_SET_PATH}")
+    print(f"Contents of {TRACE_SET_PATH}: {os.listdir(TRACE_SET_PATH) if os.path.exists(TRACE_SET_PATH) else 'PATH NOT FOUND'}")
+    print(f"Available definitions: {list(trace_set.definitions.keys())}")
 
     if solution.definition not in trace_set.definitions:
         raise ValueError(f"Definition '{solution.definition}' not found in trace set")
@@ -67,6 +73,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             entry = {
                 "status": trace.evaluation.status.value,
                 "solution": trace.solution,
+                "log": trace.evaluation.log[:500] if trace.evaluation.log else "",
             }
             if trace.evaluation.performance:
                 entry["latency_ms"] = trace.evaluation.performance.latency_ms
@@ -75,6 +82,9 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             if trace.evaluation.correctness:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+                extra = getattr(trace.evaluation.correctness, 'extra', None)
+                if extra:
+                    entry["correctness_extra"] = extra
             results[definition.name][trace.workload.uuid] = entry
 
     return results
@@ -101,17 +111,27 @@ def print_results(results: dict):
 
             print()
 
+            # Print error log for failures
+            if status != "PASSED" and result.get("log"):
+                for line in result["log"].strip().split("\n")[:5]:
+                    print(f"    LOG: {line}")
+
 
 @app.local_entrypoint()
 def main():
     """Pack solution and run benchmark on Modal."""
-    from scripts.pack_solution import pack_solution
+    import subprocess
+    import json
 
     print("Packing solution from source files...")
-    solution_path = pack_solution()
+    subprocess.run(
+        [sys.executable, str(PROJECT_ROOT / "scripts" / "pack_solution_simple.py")],
+        cwd=str(PROJECT_ROOT), check=True,
+    )
 
+    solution_path = PROJECT_ROOT / "solution.json"
     print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text())
+    solution = Solution.model_validate_json(solution_path.read_text(encoding="utf-8"))
     print(f"Loaded: {solution.name} ({solution.definition})")
 
     print("\nRunning benchmark on Modal B200...")
@@ -122,3 +142,4 @@ def main():
         return
 
     print_results(results)
+
