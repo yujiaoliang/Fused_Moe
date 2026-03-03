@@ -2,7 +2,7 @@
 
 > **赛道:** Track A — Fused MoE  
 > **目标硬件:** NVIDIA B200 (Blackwell, sm100)  
-> **当前状态:** ✅ 19/19 workloads PASSED（正确性通过，性能待优化）
+> **当前状态:** ✅ 19/19 PASSED｜最高 **4.05x** 加速｜8/19 workloads > 1x
 
 ---
 
@@ -11,21 +11,36 @@
 | 项目 | 状态 |
 |------|------|
 | DeepSeek-V3 routing | ✅ 完成 |
+| Token sorting (expert 分组) | ✅ 完成（`moe_sort_tokens()` + expert 边界检测） |
 | FP8 block-scale 反量化 | ✅ 完成（per-expert fp32 dequant） |
 | SwiGLU 激活 | ✅ 完成 |
-| GEMM1/GEMM2 | ⚠️ PyTorch fp32 matmul（正确但慢，~0.5x） |
+| GEMM1/GEMM2 | ✅ PyTorch fp32 matmul + token sorting（~1.8x 提速） |
 | Benchmark 正确性 | ✅ 19/19 PASSED |
-| 性能优化 | ❌ 待做（需要 Triton GEMM） |
+| Triton GEMM | ⚠️ 已实现但精度不够（bf16 累积误差 ~4096），保留代码待优化 |
 
-### B200 Benchmark 结果
+### B200 Benchmark 结果（最新）
 
-| Workload | Latency | Speedup | Max Abs Err |
-|----------|---------|---------|-------------|
-| b8f4f012 (T=7) | 8.92ms | **1.29x** | 0.00 |
-| e05c6c03 (T=14) | 4.56ms | **2.40x** | 0.00 |
-| 2e69caee | 6.95ms | **1.63x** | 16 |
-| a7c2bcfd | 15.55ms | 0.80x | 128 |
-| 其余 workloads | 20-69ms | 0.47-0.65x | ≤1024 |
+| Workload | Latency | Speedup | Max Abs Err | 备注 |
+|----------|---------|---------|-------------|------|
+| e05c6c03 | 2.70ms | **4.05x** | 4 | 🔥 |
+| 2e69caee | 3.94ms | **2.87x** | 0 | 🔥 |
+| b8f4f012 (T=7) | 4.86ms | **2.37x** | 0 | 🔥 |
+| 8cba5890 | 7.69ms | **1.59x** | 0 | |
+| a7c2bcfd | 8.54ms | **1.46x** | 256 | |
+| f7d6ac7c | 10.64ms | **1.23x** | 2 | |
+| 5eadab1e | 11.57ms | **1.19x** | 0 | |
+| eedc63b2 | 11.83ms | **1.14x** | 2 | |
+| 6230e838 | 13.44ms | **1.03x** | 2 | |
+| 76010cb4 | 14.24ms | 0.99x | 128 | |
+| 81955b1e | 14.77ms | 0.97x | 16 | |
+| 74d7ff04 | 15.50ms | 0.96x | 64 | |
+| fc378037 | 15.14ms | 0.95x | 256 | |
+| e626d3e6 | 16.53ms | 0.93x | 32 | |
+| 4822167c | 15.95ms | 0.93x | 32 | |
+| 8f1ff9f1 | 17.83ms | 0.88x | 512 | |
+| 5e8dc11c | 51.78ms | 0.87x | 1024 | |
+| 58a34f27 | 41.47ms | 0.86x | 2048 | |
+| 1a4c6ba1 | 24.77ms | 0.84x | 1024 | |
 
 ---
 
@@ -114,6 +129,7 @@ mlsys_note/
 ├── test_kernel.py               # 本地快速测试（直接对比 reference）
 ├── scripts/
 │   ├── test_modal.py            # Modal B200 benchmark（推荐）
+│   ├── debug_modal.py           # Modal B200 调试（逐步对比 reference）
 │   ├── run_modal.py             # Modal B200 完整 benchmark
 │   ├── run_local.py             # 本地 benchmark
 │   ├── pack_solution_simple.py  # 打包 solution.json
@@ -137,12 +153,13 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 ### 计算流程
 
 1. **Routing** — DeepSeek-V3 no-aux routing：sigmoid → group-filter → top-8 → normalized weights
-2. **Dequant** — FP8 block-scale → fp32（block=128）
-3. **Per-expert loop:**
+2. **Token sorting** — `moe_sort_tokens()` 按 expert 排序 token，padding 到 BLOCK_M=64
+3. **Dequant** — FP8 block-scale → fp32（block=128）
+4. **Per-expert loop**（通过 `block_expert_ids` 边界检测，无需重复遍历）:
    - GEMM1: `[Tk, 7168] @ [7168, 4096]` → `[Tk, 4096]`
    - SwiGLU: `silu(second_half) * first_half` → `[Tk, 2048]`
    - GEMM2: `[Tk, 2048] @ [2048, 7168]` → `[Tk, 7168]`
-4. **Weighted reduce** — 按 routing weight 加权累加到 output
+5. **Weighted reduce** — fp32 `index_add_` 加权累加 → bf16 output
 
 ### 关键约束
 
@@ -154,36 +171,36 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 
 ## TODO（优化方向）
 
-### 🔴 P0: 性能优化（大 workloads 目前 ~0.5x）
+### ✅ 已完成
 
-- [ ] **用 Triton GEMM 替换 PyTorch matmul**
-  - 当前 per-expert 循环 + PyTorch matmul 太慢
-  - 需要实现 grouped GEMM：多个 expert 共享一次 kernel launch
-  - B200 (sm100) 支持 FP8 tensor core + fp32 accumulation
+- [x] **Token sorting** — `moe_sort_tokens()` 按 expert 分组 + BLOCK_M padding
+- [x] **Expert 边界检测** — 遍历 `block_expert_ids` 直接定位 expert 边界，~1.8x 加速
+- [x] **fp32 accumulation** — scatter-add 用 fp32 避免 bf16 精度损失
 
-- [ ] **FP8 dot product + block-scale 精度**
-  - `tl.dot(fp8, fp8)` 在 sm89 上精度不够（93.5% matched ratio）
-  - 在 B200 sm100 上精度可能更好，需要测试
-  - 方案A：`tl.dot(fp8, fp8, acc_type=tl.float32) * scales`
-  - 方案B：dequant fp8 → bf16，`tl.dot(bf16, bf16)`（精度更好但更慢）
+### 🔴 P0: Triton GEMM 精度修复（替换 PyTorch matmul）
 
-- [ ] **Token sorting + grouped GEMM**
-  - `moe_sort_tokens()` 已实现（按 expert 分组 + padding）
-  - 已有 `_grouped_gemm_fp8_kernel` 和 `_grouped_gemm_bf16xfp8_kernel` Triton 内核
-  - 需要调通精度后重新启用
+已有 Triton kernel 代码（`_grouped_gemm_fp8_kernel`, `_grouped_gemm_bf16xfp8_kernel`），但精度不够：
+
+- [ ] **`tl.dot(bf16, bf16)` 累积误差** — 56 个 K-block 的 bf16 乘积累积导致 abs_err ~4096
+  - 已测试方案（均失败）：
+    - `tl.dot(fp8, fp8) * a_scale * b_scale` — 同样 ~4096 误差
+    - 先 dequant fp8→bf16 再 `tl.dot(bf16, bf16)` — 同样 ~4096 误差
+  - 待测试方案：
+    - [ ] `tl.dot(fp32, fp32)` — 不用 tensor core 但精度好
+    - [ ] 分段累积：每 N 个 K-block 做一次 fp32 归约
+    - [ ] B200 sm100 可能有更高精度的 tensor core 配置
 
 ### 🟡 P1: 进一步优化
 
-- [ ] **Fused SwiGLU** — 合并进 GEMM1 output 或 GEMM2 input
-- [ ] **Shared memory 优化** — 利用 B200 的 256KB shared memory
+- [ ] **Fused SwiGLU** — 用 Triton kernel 合并进 GEMM1 epilogue
+- [ ] **批量 dequant** — 一次 dequant 所有 active expert 的权重，减少重复开销
+- [ ] **torch.compile** — 加速 routing + per-expert matmul
 - [ ] **Persistent kernels** — 减少 kernel launch overhead
-- [ ] **Auto-tuning BLOCK_M/BLOCK_N/BLOCK_K** — 针对 B200 调优
 
-### 🟢 P2: 工程优化
+### 🟢 P2: 调试工具
 
-- [ ] **Torch.compile** — 尝试用 torch.compile 加速 routing 部分
-- [ ] **移除 per-expert 循环** — 改为批量处理所有 active expert
-- [ ] **Profile** — 用 NCU 找到 bottleneck
+- [x] **debug_modal.py** — 逐步对比 kernel vs reference 的中间结果
+- [ ] **NCU Profiling** — 找到 B200 上的 bottleneck
 
 ---
 
