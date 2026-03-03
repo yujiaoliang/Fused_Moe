@@ -415,9 +415,8 @@ def kernel(
     BLOCK = QBLOCK  # 128
     A_fp32 = hidden_states.to(torch.float32)
     A_scale = hidden_states_scale.float().permute(1, 0).contiguous()  # [T, H/128]
-    A_scale_expanded = A_scale.unsqueeze(-1).expand(-1, -1, BLOCK).reshape(T, H)
-    A = A_fp32 * A_scale_expanded  # [T, H] fp32
-    del A_fp32, A_scale, A_scale_expanded
+    A = A_fp32 * A_scale.unsqueeze(-1).expand(-1, -1, BLOCK).reshape(T, H)
+    del A_fp32, A_scale
 
     # ── 4. Per-expert GEMM1 → SwiGLU → GEMM2 ──
     accum = torch.zeros((T, H), dtype=torch.float32, device=device)
@@ -425,7 +424,12 @@ def kernel(
     num_m_blocks = num_padded // BLOCK_M
     experts_cpu = block_expert_ids[:num_m_blocks].cpu().tolist()
 
-    # Find contiguous expert segments and process
+    # Precompute scale dimensions
+    n13 = 2 * I_SIZE // BLOCK  # 32
+    k13 = H // BLOCK            # 56
+    n2 = H // BLOCK              # 56
+    k2 = I_SIZE // BLOCK         # 16
+
     seg_start = 0
     for seg_end in range(1, num_m_blocks + 1):
         if seg_end == num_m_blocks or experts_cpu[seg_end] != experts_cpu[seg_start]:
@@ -433,11 +437,9 @@ def kernel(
             start_pos = seg_start * BLOCK_M
             end_pos = seg_end * BLOCK_M
 
-            # Get token ids and weights for this expert
+            # Get valid (non-padding) token ids and weights
             expert_token_ids = sorted_token_ids[start_pos:end_pos]
             expert_weights = sorted_weights[start_pos:end_pos]
-
-            # Filter padding
             valid = expert_token_ids < T
             tok_ids = expert_token_ids[valid]
             tok_weights = expert_weights[valid]
@@ -445,30 +447,32 @@ def kernel(
             if tok_ids.numel() > 0:
                 A_e = A.index_select(0, tok_ids)  # [Tk, H]
 
-                # Dequant W13 for this expert only
-                w13_fp32 = gemm1_weights[le].to(torch.float32)
-                s13 = gemm1_weights_scale[le].float()
-                s13 = s13.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
-                W13_e = w13_fp32 * s13
-                del w13_fp32, s13
+                # Dequant W13: view+expand instead of repeat_interleave
+                w13 = gemm1_weights[le].float()          # [2I, H]
+                s13 = gemm1_weights_scale[le].float()     # [n13, k13]
+                # Broadcast: [n13,1,k13,1] * [n13,128,k13,128] → reshape [2I, H]
+                s13 = s13.view(n13, 1, k13, 1).expand(n13, BLOCK, k13, BLOCK).reshape(2*I_SIZE, H)
+                w13 = w13 * s13
 
-                # GEMM1 + SwiGLU
-                G1 = A_e.matmul(W13_e.t())
-                del W13_e
-                X1, X2 = G1[:, :I_SIZE], G1[:, I_SIZE:]
-                C = (X2 * torch.sigmoid(X2)) * X1
-                del G1, X1, X2
+                # GEMM1: [Tk, H] @ [2I, H].T → [Tk, 2I]
+                G1 = torch.mm(A_e, w13.t())
+                del w13, s13
 
-                # Dequant W2 for this expert only
-                w2_fp32 = gemm2_weights[le].to(torch.float32)
-                s2 = gemm2_weights_scale[le].float()
-                s2 = s2.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
-                W2_e = w2_fp32 * s2
-                del w2_fp32, s2
+                # SwiGLU (fused silu)
+                C = torch.nn.functional.silu(G1[:, I_SIZE:]) * G1[:, :I_SIZE]
+                del G1
 
-                # GEMM2 + weighted accumulation
-                O = C.matmul(W2_e.t())
-                del C, W2_e
+                # Dequant W2: view+expand
+                w2 = gemm2_weights[le].float()            # [H, I]
+                s2 = gemm2_weights_scale[le].float()       # [n2, k2]
+                s2 = s2.view(n2, 1, k2, 1).expand(n2, BLOCK, k2, BLOCK).reshape(H, I_SIZE)
+                w2 = w2 * s2
+
+                # GEMM2: [Tk, I] @ [H, I].T → [Tk, H]
+                O = torch.mm(C, w2.t())
+                del C, w2, s2
+
+                # Weighted accumulation
                 accum.index_add_(0, tok_ids, O * tok_weights.unsqueeze(1))
 
             seg_start = seg_end
