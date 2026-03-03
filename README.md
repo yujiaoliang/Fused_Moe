@@ -2,7 +2,7 @@
 
 > **赛道:** Track A — Fused MoE  
 > **目标硬件:** NVIDIA B200 (Blackwell, sm100)  
-> **当前状态:** ✅ 19/19 PASSED｜最高 **8.46x** 加速｜**全部 19/19 workloads ≥ 1x**
+> **当前状态:** ✅ 19/19 PASSED｜最高 **7.36x** 加速｜**全部 19/19 workloads ≥ 1x**
 
 ---
 
@@ -22,25 +22,25 @@
 
 | Workload | Latency | Speedup | Max Abs Err | 备注 |
 |----------|---------|---------|-------------|------|
-| e05c6c03 | 1.23ms | **8.46x** | 512 | 🔥 |
-| b8f4f012 (T=7) | 1.87ms | **5.82x** | 256 | 🔥 |
-| 2e69caee | 1.89ms | **5.73x** | 512 | 🔥 |
-| 8cba5890 | 2.85ms | **4.01x** | 1024 | 🔥 |
-| a7c2bcfd | 3.29ms | **3.56x** | 512 | 🔥 |
-| f7d6ac7c | 4.08ms | **3.01x** | 1024 | 🔥 |
-| eedc63b2 | 4.71ms | **2.68x** | 512 | |
-| 5eadab1e | 4.83ms | **2.66x** | 256 | |
-| 6230e838 | 5.06ms | **2.55x** | 1024 | |
-| 76010cb4 | 5.59ms | **2.36x** | 1024 | |
-| 81955b1e | 5.99ms | **2.25x** | 1024 | |
-| fc378037 | 6.08ms | **2.23x** | 512 | |
-| 74d7ff04 | 6.43ms | **2.14x** | 1024 | |
-| 4822167c | 6.37ms | **2.17x** | 1024 | |
-| e626d3e6 | 7.16ms | **2.00x** | 1024 | |
-| 8f1ff9f1 | 7.96ms | **1.87x** | 1024 | |
-| 1a4c6ba1 | 13.21ms | **1.51x** | 1024 | |
-| 58a34f27 | 27.96ms | **1.25x** | 2048 | |
-| 5e8dc11c | 37.05ms | **1.18x** | 1024 | |
+| e05c6c03 | 1.48ms | **7.36x** | 512 | 🔥 |
+| b8f4f012 (T=7) | 2.33ms | **4.94x** | 512 | 🔥 |
+| 2e69caee | 2.31ms | **4.91x** | 512 | 🔥 |
+| 8cba5890 | 3.60ms | **3.37x** | 512 | 🔥 |
+| a7c2bcfd | 4.16ms | **2.99x** | 512 | 🔥 |
+| f7d6ac7c | 5.29ms | **2.49x** | 512 | |
+| 6230e838 | 6.29ms | **2.17x** | 512 | |
+| 5eadab1e | 6.35ms | **2.16x** | 512 | |
+| eedc63b2 | 6.36ms | **2.14x** | 1024 | |
+| 76010cb4 | 7.30ms | **1.95x** | 512 | |
+| fc378037 | 7.67ms | **1.89x** | 1024 | |
+| 81955b1e | 7.97ms | **1.82x** | 2048 | |
+| 74d7ff04 | 8.32ms | **1.79x** | 1024 | |
+| 4822167c | 8.44ms | **1.77x** | 1024 | |
+| e626d3e6 | 9.33ms | **1.64x** | 512 | |
+| 8f1ff9f1 | 9.57ms | **1.64x** | 16 | |
+| 1a4c6ba1 | 15.43ms | **1.35x** | 512 | |
+| 58a34f27 | 30.51ms | **1.17x** | 1024 | |
+| 5e8dc11c | 38.75ms | **1.15x** | 1024 | |
 
 ---
 
@@ -180,6 +180,9 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 - [x] **view+expand dequant** — 零拷贝广播替代 `repeat_interleave`
 - [x] **F.silu** — 融合 CUDA kernel 替代手动 `x*sigmoid(x)`
 - [x] **torch.compile** — `max-autotune-no-cudagraphs, dynamic=True` 融合 dequant+GEMM+SwiGLU，**全部 19/19 ≥1x**
+- [x] **编译 A dequant** — `_dequant_compiled` 融合 fp8→fp32 cast + scale multiply
+- [x] **预转换 weight scales** — `.float()` 移到循环外，避免每 expert 转换开销
+- [x] **代码清理** — 删除 100+ 行 dead fp8 代码，solution 体积 24KB→19KB
 
 ### 🔴 P0: 消除 re-quantization 开销
 

@@ -380,8 +380,8 @@ def _grouped_gemm_bf16xfp8_kernel(
 # Per-expert compute: FP8 native matmul on B200
 # ═══════════════════════════════════════════════════════════════
 
-def _expert_fwd_dequant(A_e, w13_fp8, s13, w2_fp8, s2, tok_weights):
-    """Fallback: full dequant + fp32 matmul (always correct)."""
+def _expert_fwd(A_e, w13_fp8, s13, w2_fp8, s2, tok_weights):
+    """Single expert: dequant W → GEMM1 → SwiGLU → GEMM2 → weighted output."""
     BLOCK = QBLOCK
     n13, k13 = s13.shape
     w13 = w13_fp8.float() * s13.view(n13, 1, k13, 1).expand(n13, BLOCK, k13, BLOCK).reshape(2*I_SIZE, H)
@@ -393,57 +393,18 @@ def _expert_fwd_dequant(A_e, w13_fp8, s13, w2_fp8, s2, tok_weights):
     return O * tok_weights.unsqueeze(1)
 
 
-def _expert_fwd_fp8(A_e, w13_t, scale_b_13, w2_t, scale_b_2, tok_weights):
-    """Native FP8 BlockWise 128x128 matmul on B200.
-    
-    A_e: [Tk, H] float32 (already dequanted)
-    w13_t: [H, 2I] float8_e4m3fn (pre-transposed, contiguous)
-    scale_b_13: [H/128, 2I/128] float32 (pre-transposed, contiguous)
-    """
-    BLOCK = QBLOCK  # 128
-    Tk = A_e.shape[0]
-    FP8_MAX = 448.0
-
-    # --- GEMM1 ---
-    a_amax = A_e.abs().amax().clamp(min=1e-12)
-    a_scale_val = (a_amax / FP8_MAX).item()
-    A_fp8 = (A_e * (FP8_MAX / a_amax)).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    
-    M_padded = ((Tk + 127) // 128) * 128
-    if Tk < M_padded:
-        A_fp8 = torch.nn.functional.pad(A_fp8, (0, 0, 0, M_padded - Tk))
-    
-    n_m_blocks = M_padded // 128
-    scale_a = torch.full((n_m_blocks, H // BLOCK), a_scale_val,
-                         device=A_e.device, dtype=torch.float32)
-    
-    G1 = torch._scaled_mm(A_fp8, w13_t, scale_a=scale_a, scale_b=scale_b_13,
-                           out_dtype=torch.float32)
-    G1 = G1[:Tk]
-
-    # SwiGLU
-    C = torch.nn.functional.silu(G1[:, I_SIZE:]) * G1[:, :I_SIZE]
-
-    # --- GEMM2 ---
-    c_amax = C.abs().amax().clamp(min=1e-12)
-    c_scale_val = (c_amax / FP8_MAX).item()
-    C_fp8 = (C * (FP8_MAX / c_amax)).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
-    
-    if Tk < M_padded:
-        C_fp8 = torch.nn.functional.pad(C_fp8, (0, 0, 0, M_padded - Tk))
-    
-    scale_a2 = torch.full((n_m_blocks, I_SIZE // BLOCK), c_scale_val,
-                           device=A_e.device, dtype=torch.float32)
-    
-    O = torch._scaled_mm(C_fp8, w2_t, scale_a=scale_a2, scale_b=scale_b_2,
-                          out_dtype=torch.float32)
-    O = O[:Tk]
-
-    return O * tok_weights.unsqueeze(1)
+_expert_fwd_compiled = torch.compile(_expert_fwd, mode='max-autotune-no-cudagraphs', dynamic=True)
 
 
-# Compiled fallback (proven correct)
-_expert_fwd_compiled = torch.compile(_expert_fwd_dequant, mode='max-autotune-no-cudagraphs', dynamic=True)
+# Compiled A dequant: fuse fp8→fp32 cast + block-scale multiply into one kernel
+def _dequant_hidden_states(hidden_states, hidden_states_scale):
+    """Dequant [T, H] fp8 → fp32 using [56, T] block scales."""
+    BLOCK = QBLOCK
+    A_fp32 = hidden_states.to(torch.float32)
+    A_scale = hidden_states_scale.permute(1, 0).contiguous()  # [T, H/128]
+    return A_fp32 * A_scale.unsqueeze(-1).expand(-1, -1, BLOCK).reshape(A_fp32.shape[0], H)
+
+_dequant_compiled = torch.compile(_dequant_hidden_states, mode='max-autotune-no-cudagraphs', dynamic=True)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -481,12 +442,12 @@ def kernel(
         output.zero_()
         return
 
-    # ── 3. Dequant hidden_states fp8 → fp32 ──
-    BLOCK = QBLOCK  # 128
-    A_fp32 = hidden_states.to(torch.float32)
-    A_scale = hidden_states_scale.float().permute(1, 0).contiguous()  # [T, H/128]
-    A = A_fp32 * A_scale.unsqueeze(-1).expand(-1, -1, BLOCK).reshape(T, H)
-    del A_fp32, A_scale
+    # ── 3. Dequant hidden_states fp8 → fp32 (compiled: fused kernel) ──
+    A = _dequant_compiled(hidden_states, hidden_states_scale.float())
+
+    # Pre-convert weight scales to float32 (avoid per-expert .float() overhead)
+    gemm1_scales_f32 = gemm1_weights_scale.float()  # [32, 32, 56]
+    gemm2_scales_f32 = gemm2_weights_scale.float()  # [32, 56, 16]
 
     # ── 4. Per-expert GEMM1 → SwiGLU → GEMM2 ──
     accum = torch.zeros((T, H), dtype=torch.float32, device=device)
@@ -511,11 +472,10 @@ def kernel(
             if tok_ids.numel() > 0:
                 A_e = A.index_select(0, tok_ids)  # [Tk, H]
 
-                # Compiled dequant + matmul (fastest path)
                 weighted_out = _expert_fwd_compiled(
                     A_e,
-                    gemm1_weights[le], gemm1_weights_scale[le].float(),
-                    gemm2_weights[le], gemm2_weights_scale[le].float(),
+                    gemm1_weights[le], gemm1_scales_f32[le],
+                    gemm2_weights[le], gemm2_scales_f32[le],
                     tok_weights,
                 )
                 accum.index_add_(0, tok_ids, weighted_out)
