@@ -377,6 +377,34 @@ def _grouped_gemm_bf16xfp8_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════
+# Per-expert compute (torch.compile-optimized)
+# ═══════════════════════════════════════════════════════════════
+
+def _expert_fwd(A_e, w13_fp8, s13, w2_fp8, s2, tok_weights):
+    """Single expert: dequant W13 → GEMM1 → SwiGLU → dequant W2 → GEMM2 → weighted output."""
+    BLOCK = QBLOCK
+
+    # Dequant W13: [2I, H]
+    n13, k13 = s13.shape
+    w13 = w13_fp8.float() * s13.view(n13, 1, k13, 1).expand(n13, BLOCK, k13, BLOCK).reshape(2*I_SIZE, H)
+
+    # GEMM1 + SwiGLU
+    G1 = torch.mm(A_e, w13.t())
+    C = torch.nn.functional.silu(G1[:, I_SIZE:]) * G1[:, :I_SIZE]
+
+    # Dequant W2: [H, I]
+    n2, k2 = s2.shape
+    w2 = w2_fp8.float() * s2.view(n2, 1, k2, 1).expand(n2, BLOCK, k2, BLOCK).reshape(H, I_SIZE)
+
+    # GEMM2 + weight
+    O = torch.mm(C, w2.t())
+    return O * tok_weights.unsqueeze(1)
+
+
+_expert_fwd_compiled = torch.compile(_expert_fwd, mode='max-autotune-no-cudagraphs')
+
+
+# ═══════════════════════════════════════════════════════════════
 # Entry Point
 # ═══════════════════════════════════════════════════════════════
 
@@ -447,33 +475,14 @@ def kernel(
             if tok_ids.numel() > 0:
                 A_e = A.index_select(0, tok_ids)  # [Tk, H]
 
-                # Dequant W13: view+expand instead of repeat_interleave
-                w13 = gemm1_weights[le].float()          # [2I, H]
-                s13 = gemm1_weights_scale[le].float()     # [n13, k13]
-                # Broadcast: [n13,1,k13,1] * [n13,128,k13,128] → reshape [2I, H]
-                s13 = s13.view(n13, 1, k13, 1).expand(n13, BLOCK, k13, BLOCK).reshape(2*I_SIZE, H)
-                w13 = w13 * s13
-
-                # GEMM1: [Tk, H] @ [2I, H].T → [Tk, 2I]
-                G1 = torch.mm(A_e, w13.t())
-                del w13, s13
-
-                # SwiGLU (fused silu)
-                C = torch.nn.functional.silu(G1[:, I_SIZE:]) * G1[:, :I_SIZE]
-                del G1
-
-                # Dequant W2: view+expand
-                w2 = gemm2_weights[le].float()            # [H, I]
-                s2 = gemm2_weights_scale[le].float()       # [n2, k2]
-                s2 = s2.view(n2, 1, k2, 1).expand(n2, BLOCK, k2, BLOCK).reshape(H, I_SIZE)
-                w2 = w2 * s2
-
-                # GEMM2: [Tk, I] @ [H, I].T → [Tk, H]
-                O = torch.mm(C, w2.t())
-                del C, w2, s2
-
-                # Weighted accumulation
-                accum.index_add_(0, tok_ids, O * tok_weights.unsqueeze(1))
+                # Use compiled per-expert function
+                weighted_out = _expert_fwd_compiled(
+                    A_e,
+                    gemm1_weights[le], gemm1_weights_scale[le].float(),
+                    gemm2_weights[le], gemm2_weights_scale[le].float(),
+                    tok_weights,
+                )
+                accum.index_add_(0, tok_ids, weighted_out)
 
             seg_start = seg_end
 

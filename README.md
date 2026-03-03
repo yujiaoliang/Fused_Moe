@@ -2,7 +2,7 @@
 
 > **赛道:** Track A — Fused MoE  
 > **目标硬件:** NVIDIA B200 (Blackwell, sm100)  
-> **当前状态:** ✅ 19/19 PASSED｜最高 **4.15x** 加速｜14/19 workloads ≥ 1x｜全部 abs_err=0
+> **当前状态:** ✅ 19/19 PASSED｜最高 **5.79x** 加速｜**全部 19/19 workloads ≥ 1x**
 
 ---
 
@@ -14,7 +14,7 @@
 | Token sorting (expert 分组) | ✅ 完成（`moe_sort_tokens()` + expert 边界检测） |
 | FP8 block-scale 反量化 | ✅ 完成（per-expert fp32 dequant） |
 | SwiGLU 激活 | ✅ 完成 |
-| GEMM1/GEMM2 | ✅ PyTorch fp32 matmul + token sorting（~1.8x 提速） |
+| GEMM1/GEMM2 | ✅ PyTorch fp32 matmul + torch.compile（全部 ≥1x） |
 | Benchmark 正确性 | ✅ 19/19 PASSED |
 | Triton GEMM | ⚠️ 已实现但精度不够（bf16 累积误差 ~4096），保留代码待优化 |
 
@@ -22,25 +22,25 @@
 
 | Workload | Latency | Speedup | Max Abs Err | 备注 |
 |----------|---------|---------|-------------|------|
-| e05c6c03 | 2.68ms | **4.15x** | 0 | 🔥 |
-| 2e69caee | 3.85ms | **2.98x** | 0 | 🔥 |
-| b8f4f012 (T=7) | 4.66ms | **2.50x** | 0 | 🔥 |
-| 8cba5890 | 7.22ms | **1.72x** | 0 | |
-| a7c2bcfd | 7.88ms | **1.61x** | 0 | |
-| f7d6ac7c | 9.95ms | **1.31x** | 0 | |
-| 5eadab1e | 10.88ms | **1.27x** | 0 | |
-| eedc63b2 | 11.09ms | **1.21x** | 0 | |
-| 6230e838 | 12.47ms | **1.13x** | 0 | |
-| 76010cb4 | 13.21ms | **1.06x** | 0 | |
-| 81955b1e | 13.87ms | **1.03x** | 0 | |
-| fc378037 | 13.90ms | **1.03x** | 0 | |
-| 74d7ff04 | 14.55ms | **1.01x** | 0 | |
-| e626d3e6 | 15.39ms | **1.00x** | 0 | |
-| 4822167c | 14.90ms | 0.99x | 0 | |
-| 8f1ff9f1 | 16.71ms | 0.95x | 0 | |
-| 5e8dc11c | 46.85ms | 0.95x | 0 | |
-| 58a34f27 | 37.64ms | 0.94x | 0 | |
-| 1a4c6ba1 | 23.16ms | 0.90x | 0 | |
+| e05c6c03 | 1.90ms | **5.79x** | 256 | 🔥 |
+| b8f4f012 (T=7) | 2.74ms | **4.24x** | 512 | 🔥 |
+| 2e69caee | 2.89ms | **3.92x** | 256 | 🔥 |
+| 8cba5890 | 4.17ms | **2.93x** | 1024 | 🔥 |
+| a7c2bcfd | 4.62ms | **2.70x** | 1024 | 🔥 |
+| f7d6ac7c | 5.64ms | **2.32x** | 2048 | |
+| eedc63b2 | 6.27ms | **2.19x** | 512 | |
+| 5eadab1e | 6.50ms | **2.09x** | 1024 | |
+| 6230e838 | 6.74ms | **2.04x** | 1024 | |
+| 76010cb4 | 7.39ms | **1.92x** | 1024 | |
+| 81955b1e | 7.87ms | **1.83x** | 512 | |
+| fc378037 | 7.94ms | **1.84x** | 1024 | |
+| 74d7ff04 | 8.35ms | **1.79x** | 2048 | |
+| 4822167c | 8.38ms | **1.76x** | 1024 | |
+| e626d3e6 | 9.12ms | **1.65x** | 256 | |
+| 8f1ff9f1 | 9.96ms | **1.57x** | 32 | |
+| 1a4c6ba1 | 15.51ms | **1.33x** | 512 | |
+| 58a34f27 | 30.08ms | **1.18x** | 1024 | |
+| 5e8dc11c | 39.21ms | **1.14x** | 1024 | |
 
 ---
 
@@ -174,8 +174,11 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 ### ✅ 已完成
 
 - [x] **Token sorting** — `moe_sort_tokens()` 按 expert 分组 + BLOCK_M padding
-- [x] **Expert 边界检测** — 遍历 `block_expert_ids` 直接定位 expert 边界，~1.8x 加速
+- [x] **Expert 边界检测** — 遍历 `block_expert_ids` 直接定位 expert 边界
 - [x] **fp32 accumulation** — scatter-add 用 fp32 避免 bf16 精度损失
+- [x] **view+expand dequant** — 零拷贝广播替代 `repeat_interleave`
+- [x] **F.silu** — 融合 CUDA kernel 替代手动 `x*sigmoid(x)`
+- [x] **torch.compile** — `max-autotune-no-cudagraphs` 模式融合 dequant+GEMM+SwiGLU，**全部 19/19 ≥1x**
 
 ### 🔴 P0: Triton GEMM 精度修复（替换 PyTorch matmul）
 
