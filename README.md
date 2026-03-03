@@ -16,7 +16,7 @@
 | SwiGLU 激活 | ✅ 完成 |
 | GEMM1/GEMM2 | ✅ PyTorch fp32 matmul + torch.compile(dynamic=True)（全部 ≥1x） |
 | Benchmark 正确性 | ✅ 19/19 PASSED |
-| torch._scaled_mm | 🚧 B200 原生支持 BlockWise 128x128 fp8 matmul（**11.68x faster**），待接入 |
+| torch._scaled_mm | ✅ 已测试，B200 BlockWise 128x128 fp8（**11.68x raw**）但 re-quant 开销抵消加速 |
 
 ### B200 Benchmark 结果（最新）
 
@@ -181,24 +181,19 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 - [x] **F.silu** — 融合 CUDA kernel 替代手动 `x*sigmoid(x)`
 - [x] **torch.compile** — `max-autotune-no-cudagraphs, dynamic=True` 融合 dequant+GEMM+SwiGLU，**全部 19/19 ≥1x**
 
-### 🔴 P0: `torch._scaled_mm` 原生 FP8 matmul（消除 dequant 开销）
+### 🔴 P0: 消除 re-quantization 开销
 
-B200 原生支持 BlockWise 128x128 fp8 GEMM，测试显示 **fp8 matmul 比 fp32 快 11.68x**：
+`torch._scaled_mm` BlockWise 128 fp8 matmul 在 B200 上 **raw 快 11.68x**，但当前接入后反而慢（peak 5.30x vs compiled dequant 8.46x）：
 
-```
-_scaled_mm API (B200 sm100):
-- TensorWise:    scale_a=[1], scale_b=[1]
-- RowWise:       scale_a=[M,1], scale_b=[1,N]  (bf16/fp16 output only)
-- BlockWise 128: scale_a=[M/128, K/128], scale_b=[K/128, N/128]  ← 我们需要的
-- MXFP8 1x32:   scale_a=fp8_e8m0fnu, scale_b=fp8_e8m0fnu
-```
+**瓶颈分析：**
+1. A 需要 fp32→fp8 re-quantization（求 amax + scale + clamp + cast）
+2. Tk padding 到 128 对齐
+3. `torch.full()` 创建 uniformscale tensor
+4. SwiGLU 中间结果 C 也需要 fp32→fp8 re-quant
 
-- [x] **探针测试** — `test_scaled_mm.py` 确认 B200 API 和性能
-- [ ] **BlockWise 128x128 接入** — 需要：
-  - scale_a/scale_b 要求 near-inner-dim-major + 16-byte aligned strides
-  - M (Tk) 必须对齐到 128（需要 padding tokens）
-  - 重新排布 hidden_states_scale: `[H/128, T]` → `[Tk/128, H/128]`
-- [ ] **精度验证** — block-128 `_scaled_mm` vs fp32 dequant 的精度差异
+- [ ] **避免 re-quant** — 直接用原始 fp8 hidden_states + block scale 进 _scaled_mm
+- [ ] **预计算 weight transpose** — 在 kernel 外层一次性转置
+- [ ] **融合 SwiGLU 为 Triton kernel** — 避免 GEMM1 输出落到 HBM 再 re-quant
 
 ### 🟡 P1: 进一步优化
 
@@ -219,7 +214,7 @@ _scaled_mm API (B200 sm100):
 | 批量 dequant 32 experts | 0.92x 回退 | 5.3GB fp32 临时数据的带宽开销 |
 | Triton GEMM (bf16 dot) | abs_err ~4096 | bf16 累积56个 K-block 丢精度 |
 | 编译 routing 函数 | peak 下降 ~20% | compilation 开销 > 运行时收益 |
-| 分块 _scaled_mm (56×小 matmul) | 未测试（预期慢）| 56个小 matmul 比 1个大 matmul 过头大 |
+| `_scaled_mm` BlockWise 128 | peak 5.30x (vs 8.46x) | fp32→fp8 re-quant + padding + scale 创建的开销抵消加速 |
 
 ---
 

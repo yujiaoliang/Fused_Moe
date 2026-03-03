@@ -393,67 +393,56 @@ def _expert_fwd_dequant(A_e, w13_fp8, s13, w2_fp8, s2, tok_weights):
     return O * tok_weights.unsqueeze(1)
 
 
-def _expert_fwd_fp8(A_e_fp8, a_scale_row, w13_fp8, s13, w2_fp8, s2, tok_weights):
-    """Native FP8 matmul on B200 using torch._scaled_mm with block scaling.
+def _expert_fwd_fp8(A_e, w13_t, scale_b_13, w2_t, scale_b_2, tok_weights):
+    """Native FP8 BlockWise 128x128 matmul on B200.
     
-    A_e_fp8: [Tk, H] float8_e4m3fn — raw fp8 activation (NOT dequanted)
-    a_scale_row: [Tk, H/128] float32 — per-row-block activation scales
-    w13_fp8: [2I, H] float8_e4m3fn — raw fp8 weights
-    s13: [2I/128, H/128] float32 — block-128 weight scales
+    A_e: [Tk, H] float32 (already dequanted)
+    w13_t: [H, 2I] float8_e4m3fn (pre-transposed, contiguous)
+    scale_b_13: [H/128, 2I/128] float32 (pre-transposed, contiguous)
     """
-    BLOCK = QBLOCK
-    Tk = A_e_fp8.shape[0]
+    BLOCK = QBLOCK  # 128
+    Tk = A_e.shape[0]
+    FP8_MAX = 448.0
+
+    # --- GEMM1 ---
+    a_amax = A_e.abs().amax().clamp(min=1e-12)
+    a_scale_val = (a_amax / FP8_MAX).item()
+    A_fp8 = (A_e * (FP8_MAX / a_amax)).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
     
-    # GEMM1: A_e_fp8[Tk, H] @ W13[2I, H].T → [Tk, 2I]
-    # _scaled_mm(A[M,K], B.T[K,N], scale_a=[M/128, K/128], scale_b=[K/128, N/128])
-    # But M=Tk might not be divisible by 128. For blockwise 128x128, need M%128==0
-    # Use per-row scaling (scale_a=[M,1]) if Tk not divisible by 128
+    M_padded = ((Tk + 127) // 128) * 128
+    if Tk < M_padded:
+        A_fp8 = torch.nn.functional.pad(A_fp8, (0, 0, 0, M_padded - Tk))
     
-    # For block 128x128: scale_a = [ceil(Tk/128), H/128], scale_b = [H/128, 2I/128]
-    # scale_b needs to be [K/128, N/128] = [H/128, 2I/128] = s13.T
-    scale_b_13 = s13.t().contiguous()  # [H/128, 2I/128] = [56, 32]
+    n_m_blocks = M_padded // 128
+    scale_a = torch.full((n_m_blocks, H // BLOCK), a_scale_val,
+                         device=A_e.device, dtype=torch.float32)
     
-    # For scale_a, use per-row mean across K-blocks
-    scale_a_row = a_scale_row.mean(dim=1, keepdim=True)  # [Tk, 1]
-    
-    try:
-        G1 = torch._scaled_mm(
-            A_e_fp8, w13_fp8.t().contiguous(),
-            scale_a=scale_a_row,
-            scale_b=torch.ones(1, 2*I_SIZE, device=A_e_fp8.device),
-            out_dtype=torch.float32,
-        )
-        # Apply weight block scales post-hoc per N-block
-        # This is an approximation since we used per-row scale for A
-        # TODO: try blockwise 128x128 if Tk is divisible by 128
-    except Exception:
-        # Fall back to dequant path
-        A_e = A_e_fp8.float() * a_scale_row.unsqueeze(-1).expand(-1, -1, BLOCK).reshape(Tk, H)
-        return _expert_fwd_dequant(A_e, w13_fp8, s13, w2_fp8, s2, tok_weights)
-    
+    G1 = torch._scaled_mm(A_fp8, w13_t, scale_a=scale_a, scale_b=scale_b_13,
+                           out_dtype=torch.float32)
+    G1 = G1[:Tk]
+
     # SwiGLU
     C = torch.nn.functional.silu(G1[:, I_SIZE:]) * G1[:, :I_SIZE]
+
+    # --- GEMM2 ---
+    c_amax = C.abs().amax().clamp(min=1e-12)
+    c_scale_val = (c_amax / FP8_MAX).item()
+    C_fp8 = (C * (FP8_MAX / c_amax)).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
     
-    # GEMM2: C[Tk, I] @ W2[H, I].T → [Tk, H]  
-    # C is fp32, need to convert to fp8 for _scaled_mm
-    c_fp8 = C.to(torch.float8_e4m3fn)
-    scale_b_2 = s2.t().contiguous()  # [I/128, H/128] = [16, 56]
+    if Tk < M_padded:
+        C_fp8 = torch.nn.functional.pad(C_fp8, (0, 0, 0, M_padded - Tk))
     
-    try:
-        O = torch._scaled_mm(
-            c_fp8, w2_fp8.t().contiguous(),
-            scale_a=torch.ones(Tk, 1, device=c_fp8.device),
-            scale_b=torch.ones(1, H, device=c_fp8.device),
-            out_dtype=torch.float32,
-        )
-    except Exception:
-        n2, k2 = s2.shape
-        w2 = w2_fp8.float() * s2.view(n2, 1, k2, 1).expand(n2, BLOCK, k2, BLOCK).reshape(H, I_SIZE)
-        O = torch.mm(C, w2.t())
+    scale_a2 = torch.full((n_m_blocks, I_SIZE // BLOCK), c_scale_val,
+                           device=A_e.device, dtype=torch.float32)
     
+    O = torch._scaled_mm(C_fp8, w2_t, scale_a=scale_a2, scale_b=scale_b_2,
+                          out_dtype=torch.float32)
+    O = O[:Tk]
+
     return O * tok_weights.unsqueeze(1)
 
 
+# Compiled fallback (proven correct)
 _expert_fwd_compiled = torch.compile(_expert_fwd_dequant, mode='max-autotune-no-cudagraphs', dynamic=True)
 
 
@@ -505,12 +494,6 @@ def kernel(
     num_m_blocks = num_padded // BLOCK_M
     experts_cpu = block_expert_ids[:num_m_blocks].cpu().tolist()
 
-    # Precompute scale dimensions
-    n13 = 2 * I_SIZE // BLOCK  # 32
-    k13 = H // BLOCK            # 56
-    n2 = H // BLOCK              # 56
-    k2 = I_SIZE // BLOCK         # 16
-
     seg_start = 0
     for seg_end in range(1, num_m_blocks + 1):
         if seg_end == num_m_blocks or experts_cpu[seg_end] != experts_cpu[seg_start]:
@@ -528,7 +511,7 @@ def kernel(
             if tok_ids.numel() > 0:
                 A_e = A.index_select(0, tok_ids)  # [Tk, H]
 
-                # Use compiled per-expert function
+                # Compiled dequant + matmul (fastest path)
                 weighted_out = _expert_fwd_compiled(
                     A_e,
                     gemm1_weights[le], gemm1_weights_scale[le].float(),
