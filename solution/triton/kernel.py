@@ -411,7 +411,7 @@ def kernel(
         output.zero_()
         return
 
-    # ── 3. Pre-dequant hidden_states fp8 → fp32 ──
+    # ── 3. Dequant hidden_states fp8 → fp32 ──
     BLOCK = QBLOCK  # 128
     A_fp32 = hidden_states.to(torch.float32)
     A_scale = hidden_states_scale.float().permute(1, 0).contiguous()  # [T, H/128]
@@ -419,76 +419,58 @@ def kernel(
     A = A_fp32 * A_scale_expanded  # [T, H] fp32
     del A_fp32, A_scale, A_scale_expanded
 
-    # ── 4. Per-expert GEMM1 → SwiGLU → GEMM2 using sorted token info ──
+    # ── 4. Per-expert GEMM1 → SwiGLU → GEMM2 ──
     accum = torch.zeros((T, H), dtype=torch.float32, device=device)
 
-    # Group sorted tokens by expert using block_expert_ids
-    # block_expert_ids has one entry per BLOCK_M block
     num_m_blocks = num_padded // BLOCK_M
+    experts_cpu = block_expert_ids[:num_m_blocks].cpu().tolist()
 
-    # Find expert boundaries in the sorted array
-    expert_start = 0
-    current_expert = block_expert_ids[0].item() if num_m_blocks > 0 else -1
+    # Find contiguous expert segments and process
+    seg_start = 0
+    for seg_end in range(1, num_m_blocks + 1):
+        if seg_end == num_m_blocks or experts_cpu[seg_end] != experts_cpu[seg_start]:
+            le = experts_cpu[seg_start]
+            start_pos = seg_start * BLOCK_M
+            end_pos = seg_end * BLOCK_M
 
-    for block_idx in range(num_m_blocks + 1):
-        # Check if we've moved to a new expert or reached the end
-        if block_idx < num_m_blocks:
-            this_expert = block_expert_ids[block_idx].item()
-        else:
-            this_expert = -1  # sentinel
+            # Get token ids and weights for this expert
+            expert_token_ids = sorted_token_ids[start_pos:end_pos]
+            expert_weights = sorted_weights[start_pos:end_pos]
 
-        if this_expert != current_expert or block_idx == num_m_blocks:
-            if current_expert >= 0:
-                # Process all blocks for current_expert
-                start_pos = expert_start * BLOCK_M
-                end_pos = block_idx * BLOCK_M
+            # Filter padding
+            valid = expert_token_ids < T
+            tok_ids = expert_token_ids[valid]
+            tok_weights = expert_weights[valid]
 
-                # Get token ids and weights for this expert's blocks  
-                expert_token_ids = sorted_token_ids[start_pos:end_pos]
-                expert_weights = sorted_weights[start_pos:end_pos]
+            if tok_ids.numel() > 0:
+                A_e = A.index_select(0, tok_ids)  # [Tk, H]
 
-                # Filter out padding tokens (id >= T)
-                valid = expert_token_ids < T
-                if valid.any():
-                    tok_ids = expert_token_ids[valid]
-                    tok_weights = expert_weights[valid]
+                # Dequant W13 for this expert only
+                w13_fp32 = gemm1_weights[le].to(torch.float32)
+                s13 = gemm1_weights_scale[le].float()
+                s13 = s13.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
+                W13_e = w13_fp32 * s13
+                del w13_fp32, s13
 
-                    # Gather input tokens
-                    A_e = A.index_select(0, tok_ids)  # [Tk, H]
+                # GEMM1 + SwiGLU
+                G1 = A_e.matmul(W13_e.t())
+                del W13_e
+                X1, X2 = G1[:, :I_SIZE], G1[:, I_SIZE:]
+                C = (X2 * torch.sigmoid(X2)) * X1
+                del G1, X1, X2
 
-                    # Dequant W13 for this expert
-                    le = current_expert
-                    w13_fp32 = gemm1_weights[le].to(torch.float32)
-                    s13 = gemm1_weights_scale[le].float()
-                    s13_exp = s13.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
-                    W13 = w13_fp32 * s13_exp
-                    del w13_fp32, s13, s13_exp
+                # Dequant W2 for this expert only
+                w2_fp32 = gemm2_weights[le].to(torch.float32)
+                s2 = gemm2_weights_scale[le].float()
+                s2 = s2.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
+                W2_e = w2_fp32 * s2
+                del w2_fp32, s2
 
-                    # GEMM1: [Tk, H] @ [H, 2I] → [Tk, 2I]
-                    G1 = A_e.matmul(W13.t())
-                    del W13
+                # GEMM2 + weighted accumulation
+                O = C.matmul(W2_e.t())
+                del C, W2_e
+                accum.index_add_(0, tok_ids, O * tok_weights.unsqueeze(1))
 
-                    # SwiGLU
-                    X1 = G1[:, :I_SIZE]
-                    X2 = G1[:, I_SIZE:]
-                    C = (X2 * torch.sigmoid(X2)) * X1
-                    del G1, X1, X2
-
-                    # Dequant W2 for this expert
-                    w2_fp32 = gemm2_weights[le].to(torch.float32)
-                    s2 = gemm2_weights_scale[le].float()
-                    s2_exp = s2.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
-                    W2 = w2_fp32 * s2_exp
-                    del w2_fp32, s2, s2_exp
-
-                    # GEMM2: [Tk, I] @ [I, H] → [Tk, H]
-                    O = C.matmul(W2.t())
-                    del C, W2
-
-                    # Weighted accumulation
-                    accum.index_add_(0, tok_ids, O * tok_weights.unsqueeze(1))
-
-            current_expert = this_expert
-            expert_start = block_idx
+            seg_start = seg_end
 
     output.copy_(accum.to(torch.bfloat16))
