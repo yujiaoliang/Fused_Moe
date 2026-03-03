@@ -27,6 +27,11 @@ N_GROUP = 8
 TOPK_GROUP = 4
 QBLOCK = 128  # FP8 quantization block size
 
+# ── Triton tuning parameters ──
+BLOCK_M = 64   # tokens per M-block (for token sorting & GEMM)
+BLOCK_K = 128  # K-block (must equal QBLOCK for scale alignment)
+GROUP_SIZE_M = 8  # L2 cache reuse grouping
+
 
 # ═══════════════════════════════════════════════════════════════
 # Routing (PyTorch) — DeepSeek-V3 no-aux routing
@@ -229,8 +234,10 @@ def _grouped_gemm_fp8_kernel(
                           mask=token_mask, other=0.0)           # [BLOCK_M]
         b_scale = tl.load(b_scale_base + k * stride_bs2)       # scalar
 
-        # FP8 dot + block-scale dequant
-        acc += tl.dot(a, b) * a_scale[:, None] * b_scale
+        # Dequant fp8 → fp32 * scale → bf16 BEFORE dot
+        a_dequant = (a.to(tl.float32) * a_scale[:, None]).to(tl.bfloat16)
+        b_dequant = (b.to(tl.float32) * b_scale).to(tl.bfloat16)
+        acc += tl.dot(a_dequant, b_dequant)
 
         # Advance pointers
         a_ptrs += BLOCK_K * stride_ak
@@ -396,71 +403,92 @@ def kernel(
         routing_logits, routing_bias, float(routed_scaling_factor)
     )
 
-    # ── 2. FP8 block-scale dequantization of hidden_states ──
+    # ── 2. Token sorting ──
+    sorted_token_ids, block_expert_ids, sorted_weights, num_padded = \
+        moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device)
+
+    if sorted_token_ids is None or num_padded == 0:
+        output.zero_()
+        return
+
+    # ── 3. Pre-dequant hidden_states fp8 → fp32 ──
     BLOCK = QBLOCK  # 128
-    
-    # Dequant hidden_states: [T, H] fp8 * scale [H/128, T] → fp32
     A_fp32 = hidden_states.to(torch.float32)
     A_scale = hidden_states_scale.float().permute(1, 0).contiguous()  # [T, H/128]
     A_scale_expanded = A_scale.unsqueeze(-1).expand(-1, -1, BLOCK).reshape(T, H)
     A = A_fp32 * A_scale_expanded  # [T, H] fp32
     del A_fp32, A_scale, A_scale_expanded
 
-    # ── 3. Per-expert compute (dequant weights per-expert to save memory) ──
+    # ── 4. Per-expert GEMM1 → SwiGLU → GEMM2 using sorted token info ──
     accum = torch.zeros((T, H), dtype=torch.float32, device=device)
 
-    for le in range(E_LOCAL):
-        ge = local_start + le
-        if ge < 0 or ge >= E_GLOBAL:
-            continue
+    # Group sorted tokens by expert using block_expert_ids
+    # block_expert_ids has one entry per BLOCK_M block
+    num_m_blocks = num_padded // BLOCK_M
 
-        # Find tokens that selected this expert
-        sel_mask = (topk_idx == ge).any(dim=1)  # [T] bool
-        if not sel_mask.any():
-            continue
+    # Find expert boundaries in the sorted array
+    expert_start = 0
+    current_expert = block_expert_ids[0].item() if num_m_blocks > 0 else -1
 
-        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)  # [Tk]
+    for block_idx in range(num_m_blocks + 1):
+        # Check if we've moved to a new expert or reached the end
+        if block_idx < num_m_blocks:
+            this_expert = block_expert_ids[block_idx].item()
+        else:
+            this_expert = -1  # sentinel
 
-        # Gather input tokens
-        A_e = A.index_select(0, token_idx)      # [Tk, H]
+        if this_expert != current_expert or block_idx == num_m_blocks:
+            if current_expert >= 0:
+                # Process all blocks for current_expert
+                start_pos = expert_start * BLOCK_M
+                end_pos = block_idx * BLOCK_M
 
-        # Dequant W13 for this expert only: [2I, H]
-        w13_e_fp32 = gemm1_weights[le].to(torch.float32)       # [2I, H]
-        s13_e = gemm1_weights_scale[le].float()                 # [2I/128, H/128]
-        s13_exp = s13_e.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
-        W13_e = w13_e_fp32 * s13_exp                            # [2I, H]
-        del w13_e_fp32, s13_e, s13_exp
+                # Get token ids and weights for this expert's blocks  
+                expert_token_ids = sorted_token_ids[start_pos:end_pos]
+                expert_weights = sorted_weights[start_pos:end_pos]
 
-        # GEMM1: [Tk, H] @ [H, 2I] → [Tk, 2I]
-        G1 = A_e.matmul(W13_e.t())              # [Tk, 2I]
-        del W13_e
+                # Filter out padding tokens (id >= T)
+                valid = expert_token_ids < T
+                if valid.any():
+                    tok_ids = expert_token_ids[valid]
+                    tok_weights = expert_weights[valid]
 
-        # SwiGLU: gate = first half, up = second half
-        X1 = G1[:, :I_SIZE]                      # [Tk, I]
-        X2 = G1[:, I_SIZE:]                      # [Tk, I]
-        silu_X2 = X2 * torch.sigmoid(X2)         # silu(x) = x * sigmoid(x)
-        C = silu_X2 * X1                         # [Tk, I]
-        del G1, X1, X2, silu_X2
+                    # Gather input tokens
+                    A_e = A.index_select(0, tok_ids)  # [Tk, H]
 
-        # Dequant W2 for this expert only: [H, I]
-        w2_e_fp32 = gemm2_weights[le].to(torch.float32)        # [H, I]
-        s2_e = gemm2_weights_scale[le].float()                  # [H/128, I/128]
-        s2_exp = s2_e.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
-        W2_e = w2_e_fp32 * s2_exp                               # [H, I]
-        del w2_e_fp32, s2_e, s2_exp
+                    # Dequant W13 for this expert
+                    le = current_expert
+                    w13_fp32 = gemm1_weights[le].to(torch.float32)
+                    s13 = gemm1_weights_scale[le].float()
+                    s13_exp = s13.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
+                    W13 = w13_fp32 * s13_exp
+                    del w13_fp32, s13, s13_exp
 
-        # GEMM2: [Tk, I] @ [I, H] → [Tk, H]
-        O = C.matmul(W2_e.t())                   # [Tk, H]
-        del C, W2_e
+                    # GEMM1: [Tk, H] @ [H, 2I] → [Tk, 2I]
+                    G1 = A_e.matmul(W13.t())
+                    del W13
 
-        # Get routing weight for this expert
-        w_tok = torch.zeros(token_idx.shape[0], dtype=torch.float32, device=device)
-        for k_pos in range(TOP_K):
-            mask_k = topk_idx[token_idx, k_pos] == ge
-            w_tok[mask_k] = topk_weights[token_idx[mask_k], k_pos]
+                    # SwiGLU
+                    X1 = G1[:, :I_SIZE]
+                    X2 = G1[:, I_SIZE:]
+                    C = (X2 * torch.sigmoid(X2)) * X1
+                    del G1, X1, X2
 
-        # Weighted accumulation
-        accum.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
+                    # Dequant W2 for this expert
+                    w2_fp32 = gemm2_weights[le].to(torch.float32)
+                    s2 = gemm2_weights_scale[le].float()
+                    s2_exp = s2.repeat_interleave(BLOCK, dim=0).repeat_interleave(BLOCK, dim=1)
+                    W2 = w2_fp32 * s2_exp
+                    del w2_fp32, s2, s2_exp
 
-    # Write result into pre-allocated output tensor
+                    # GEMM2: [Tk, I] @ [I, H] → [Tk, H]
+                    O = C.matmul(W2.t())
+                    del C, W2
+
+                    # Weighted accumulation
+                    accum.index_add_(0, tok_ids, O * tok_weights.unsqueeze(1))
+
+            current_expert = this_expert
+            expert_start = block_idx
+
     output.copy_(accum.to(torch.bfloat16))
