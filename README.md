@@ -14,9 +14,9 @@
 | Token sorting (expert 分组) | ✅ 完成（`moe_sort_tokens()` + expert 边界检测） |
 | FP8 block-scale 反量化 | ✅ 完成（per-expert fp32 dequant） |
 | SwiGLU 激活 | ✅ 完成 |
-| GEMM1/GEMM2 | ✅ PyTorch fp32 matmul + torch.compile（全部 ≥1x） |
+| GEMM1/GEMM2 | ✅ PyTorch fp32 matmul + torch.compile(dynamic=True)（全部 ≥1x） |
 | Benchmark 正确性 | ✅ 19/19 PASSED |
-| Triton GEMM | ⚠️ 已实现但精度不够（bf16 累积误差 ~4096），保留代码待优化 |
+| torch._scaled_mm | 🚧 B200 原生支持 BlockWise 128x128 fp8 matmul（**11.68x faster**），待接入 |
 
 ### B200 Benchmark 结果（最新）
 
@@ -130,6 +130,7 @@ mlsys_note/
 ├── scripts/
 │   ├── test_modal.py            # Modal B200 benchmark（推荐）
 │   ├── debug_modal.py           # Modal B200 调试（逐步对比 reference）
+│   ├── test_scaled_mm.py        # 测试 torch._scaled_mm API（fp8 matmul 探针）
 │   ├── run_modal.py             # Modal B200 完整 benchmark
 │   ├── run_local.py             # 本地 benchmark
 │   ├── pack_solution_simple.py  # 打包 solution.json
@@ -178,32 +179,47 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 - [x] **fp32 accumulation** — scatter-add 用 fp32 避免 bf16 精度损失
 - [x] **view+expand dequant** — 零拷贝广播替代 `repeat_interleave`
 - [x] **F.silu** — 融合 CUDA kernel 替代手动 `x*sigmoid(x)`
-- [x] **torch.compile** — `max-autotune-no-cudagraphs` 模式融合 dequant+GEMM+SwiGLU，**全部 19/19 ≥1x**
+- [x] **torch.compile** — `max-autotune-no-cudagraphs, dynamic=True` 融合 dequant+GEMM+SwiGLU，**全部 19/19 ≥1x**
 
-### 🔴 P0: Triton GEMM 精度修复（替换 PyTorch matmul）
+### 🔴 P0: `torch._scaled_mm` 原生 FP8 matmul（消除 dequant 开销）
 
-已有 Triton kernel 代码（`_grouped_gemm_fp8_kernel`, `_grouped_gemm_bf16xfp8_kernel`），但精度不够：
+B200 原生支持 BlockWise 128x128 fp8 GEMM，测试显示 **fp8 matmul 比 fp32 快 11.68x**：
 
-- [ ] **`tl.dot(bf16, bf16)` 累积误差** — 56 个 K-block 的 bf16 乘积累积导致 abs_err ~4096
-  - 已测试方案（均失败）：
-    - `tl.dot(fp8, fp8) * a_scale * b_scale` — 同样 ~4096 误差
-    - 先 dequant fp8→bf16 再 `tl.dot(bf16, bf16)` — 同样 ~4096 误差
-  - 待测试方案：
-    - [ ] `tl.dot(fp32, fp32)` — 不用 tensor core 但精度好
-    - [ ] 分段累积：每 N 个 K-block 做一次 fp32 归约
-    - [ ] B200 sm100 可能有更高精度的 tensor core 配置
+```
+_scaled_mm API (B200 sm100):
+- TensorWise:    scale_a=[1], scale_b=[1]
+- RowWise:       scale_a=[M,1], scale_b=[1,N]  (bf16/fp16 output only)
+- BlockWise 128: scale_a=[M/128, K/128], scale_b=[K/128, N/128]  ← 我们需要的
+- MXFP8 1x32:   scale_a=fp8_e8m0fnu, scale_b=fp8_e8m0fnu
+```
+
+- [x] **探针测试** — `test_scaled_mm.py` 确认 B200 API 和性能
+- [ ] **BlockWise 128x128 接入** — 需要：
+  - scale_a/scale_b 要求 near-inner-dim-major + 16-byte aligned strides
+  - M (Tk) 必须对齐到 128（需要 padding tokens）
+  - 重新排布 hidden_states_scale: `[H/128, T]` → `[Tk/128, H/128]`
+- [ ] **精度验证** — block-128 `_scaled_mm` vs fp32 dequant 的精度差异
 
 ### 🟡 P1: 进一步优化
 
 - [ ] **Fused SwiGLU** — 用 Triton kernel 合并进 GEMM1 epilogue
-- [ ] **批量 dequant** — 一次 dequant 所有 active expert 的权重，减少重复开销
-- [ ] **torch.compile** — 加速 routing + per-expert matmul
 - [ ] **Persistent kernels** — 减少 kernel launch overhead
+- [ ] **编译 routing** — `torch.compile` routing 函数（当前 overhead > 收益，等 warmup 抵消后可能有帮助）
 
 ### 🟢 P2: 调试工具
 
 - [x] **debug_modal.py** — 逐步对比 kernel vs reference 的中间结果
+- [x] **test_scaled_mm.py** — 探测 B200 `_scaled_mm` API
 - [ ] **NCU Profiling** — 找到 B200 上的 bottleneck
+
+### ❌ 已尝试但不 work 的优化
+
+| 尝试 | 结果 | 原因 |
+|------|------|------|
+| 批量 dequant 32 experts | 0.92x 回退 | 5.3GB fp32 临时数据的带宽开销 |
+| Triton GEMM (bf16 dot) | abs_err ~4096 | bf16 累积56个 K-block 丢精度 |
+| 编译 routing 函数 | peak 下降 ~20% | compilation 开销 > 运行时收益 |
+| 分块 _scaled_mm (56×小 matmul) | 未测试（预期慢）| 56个小 matmul 比 1个大 matmul 过头大 |
 
 ---
 

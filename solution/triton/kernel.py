@@ -377,31 +377,84 @@ def _grouped_gemm_bf16xfp8_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Per-expert compute (torch.compile-optimized)
+# Per-expert compute: FP8 native matmul on B200
 # ═══════════════════════════════════════════════════════════════
 
-def _expert_fwd(A_e, w13_fp8, s13, w2_fp8, s2, tok_weights):
-    """Single expert: dequant W13 → GEMM1 → SwiGLU → dequant W2 → GEMM2 → weighted output."""
+def _expert_fwd_dequant(A_e, w13_fp8, s13, w2_fp8, s2, tok_weights):
+    """Fallback: full dequant + fp32 matmul (always correct)."""
     BLOCK = QBLOCK
-
-    # Dequant W13: [2I, H]
     n13, k13 = s13.shape
     w13 = w13_fp8.float() * s13.view(n13, 1, k13, 1).expand(n13, BLOCK, k13, BLOCK).reshape(2*I_SIZE, H)
-
-    # GEMM1 + SwiGLU
     G1 = torch.mm(A_e, w13.t())
     C = torch.nn.functional.silu(G1[:, I_SIZE:]) * G1[:, :I_SIZE]
-
-    # Dequant W2: [H, I]
     n2, k2 = s2.shape
     w2 = w2_fp8.float() * s2.view(n2, 1, k2, 1).expand(n2, BLOCK, k2, BLOCK).reshape(H, I_SIZE)
-
-    # GEMM2 + weight
     O = torch.mm(C, w2.t())
     return O * tok_weights.unsqueeze(1)
 
 
-_expert_fwd_compiled = torch.compile(_expert_fwd, mode='max-autotune-no-cudagraphs', dynamic=True)
+def _expert_fwd_fp8(A_e_fp8, a_scale_row, w13_fp8, s13, w2_fp8, s2, tok_weights):
+    """Native FP8 matmul on B200 using torch._scaled_mm with block scaling.
+    
+    A_e_fp8: [Tk, H] float8_e4m3fn — raw fp8 activation (NOT dequanted)
+    a_scale_row: [Tk, H/128] float32 — per-row-block activation scales
+    w13_fp8: [2I, H] float8_e4m3fn — raw fp8 weights
+    s13: [2I/128, H/128] float32 — block-128 weight scales
+    """
+    BLOCK = QBLOCK
+    Tk = A_e_fp8.shape[0]
+    
+    # GEMM1: A_e_fp8[Tk, H] @ W13[2I, H].T → [Tk, 2I]
+    # _scaled_mm(A[M,K], B.T[K,N], scale_a=[M/128, K/128], scale_b=[K/128, N/128])
+    # But M=Tk might not be divisible by 128. For blockwise 128x128, need M%128==0
+    # Use per-row scaling (scale_a=[M,1]) if Tk not divisible by 128
+    
+    # For block 128x128: scale_a = [ceil(Tk/128), H/128], scale_b = [H/128, 2I/128]
+    # scale_b needs to be [K/128, N/128] = [H/128, 2I/128] = s13.T
+    scale_b_13 = s13.t().contiguous()  # [H/128, 2I/128] = [56, 32]
+    
+    # For scale_a, use per-row mean across K-blocks
+    scale_a_row = a_scale_row.mean(dim=1, keepdim=True)  # [Tk, 1]
+    
+    try:
+        G1 = torch._scaled_mm(
+            A_e_fp8, w13_fp8.t().contiguous(),
+            scale_a=scale_a_row,
+            scale_b=torch.ones(1, 2*I_SIZE, device=A_e_fp8.device),
+            out_dtype=torch.float32,
+        )
+        # Apply weight block scales post-hoc per N-block
+        # This is an approximation since we used per-row scale for A
+        # TODO: try blockwise 128x128 if Tk is divisible by 128
+    except Exception:
+        # Fall back to dequant path
+        A_e = A_e_fp8.float() * a_scale_row.unsqueeze(-1).expand(-1, -1, BLOCK).reshape(Tk, H)
+        return _expert_fwd_dequant(A_e, w13_fp8, s13, w2_fp8, s2, tok_weights)
+    
+    # SwiGLU
+    C = torch.nn.functional.silu(G1[:, I_SIZE:]) * G1[:, :I_SIZE]
+    
+    # GEMM2: C[Tk, I] @ W2[H, I].T → [Tk, H]  
+    # C is fp32, need to convert to fp8 for _scaled_mm
+    c_fp8 = C.to(torch.float8_e4m3fn)
+    scale_b_2 = s2.t().contiguous()  # [I/128, H/128] = [16, 56]
+    
+    try:
+        O = torch._scaled_mm(
+            c_fp8, w2_fp8.t().contiguous(),
+            scale_a=torch.ones(Tk, 1, device=c_fp8.device),
+            scale_b=torch.ones(1, H, device=c_fp8.device),
+            out_dtype=torch.float32,
+        )
+    except Exception:
+        n2, k2 = s2.shape
+        w2 = w2_fp8.float() * s2.view(n2, 1, k2, 1).expand(n2, BLOCK, k2, BLOCK).reshape(H, I_SIZE)
+        O = torch.mm(C, w2.t())
+    
+    return O * tok_weights.unsqueeze(1)
+
+
+_expert_fwd_compiled = torch.compile(_expert_fwd_dequant, mode='max-autotune-no-cudagraphs', dynamic=True)
 
 
 # ═══════════════════════════════════════════════════════════════
