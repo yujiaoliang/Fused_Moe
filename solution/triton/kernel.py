@@ -401,7 +401,7 @@ def _expert_fwd(A_e, w13_fp8, s13, w2_fp8, s2, tok_weights):
     return O * tok_weights.unsqueeze(1)
 
 
-_expert_fwd_compiled = torch.compile(_expert_fwd, mode='max-autotune-no-cudagraphs')
+_expert_fwd_compiled = torch.compile(_expert_fwd, mode='max-autotune-no-cudagraphs', dynamic=True)
 
 
 # ═══════════════════════════════════════════════════════════════
