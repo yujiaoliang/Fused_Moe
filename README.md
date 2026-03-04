@@ -134,15 +134,17 @@ python test_kernel.py
 ```
 mlsys_note/
 ├── solution/triton/kernel.py    # ← 主要编辑的文件（Triton kernel）
+├── check_modal.py               # Modal B200 快速正确性检查
 ├── test_kernel.py               # 本地快速测试（直接对比 reference）
 ├── scripts/
 │   ├── test_modal.py            # Modal B200 benchmark（推荐）
-│   ├── debug_modal.py           # Modal B200 调试（逐步对比 reference）
-│   ├── test_scaled_mm.py        # 测试 torch._scaled_mm API（fp8 matmul 探针）
 │   ├── run_modal.py             # Modal B200 完整 benchmark
-│   ├── run_local.py             # 本地 benchmark
+│   ├── profile_modal.py         # Modal B200 NCU profiling
+│   ├── debug_modal.py           # Modal B200 调试（逐步对比 reference）
 │   ├── pack_solution_simple.py  # 打包 solution.json
-│   └── pack_solution.py         # 打包（需要 flashinfer_bench.agents）
+│   ├── pack_solution.py         # 打包（需要 flashinfer_bench.agents）
+│   ├── run_local.py             # 本地 benchmark
+│   └── test_scaled_mm.py        # 测试 torch._scaled_mm API
 ├── config.toml                  # 配置（队名、赛道等）
 ├── solution.json                # 打包后的提交文件
 └── mlsys26-contest/             # 比赛数据集（git submodule）
@@ -198,20 +200,14 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 
 ### 🟡 P1: 进一步优化
 
-- [ ] **Fully Fused Epilogue** — 用一个 Kernel 合并 GEMM1+SwiGLU+GEMM2 （受限于 SRAM 空间，需优化内存布局）
-- [ ] **Persistent kernels** — 通过静态 dispatch 完全抵消 Triton run 时的 CPU 端 Python 开销。
+- [ ] **Persistent kernels** — 通过静态 dispatch 完全抵消 Triton run 时的 CPU 端 Python 开销
+- [ ] **等待 Triton sm100 修复** — Phase 3 Fully Fused Kernel 算法已验证正确，等 Triton nightly 修复 `tl.dot` codegen 后重新测试
+- [ ] **NCU Profiling** — 分析 B200 上的 shared memory access 和 instruction latency bottleneck
 
-### 🟡 P1: 进一步优化
-
-- [ ] **Fused SwiGLU** — 用 Triton kernel 合并进 GEMM1 epilogue
-- [ ] **Persistent kernels** — 减少 kernel launch overhead
-- [ ] **编译 routing** — `torch.compile` routing 函数（当前 overhead > 收益，等 warmup 抵消后可能有帮助）
-
-### 🟢 P2: 调试工具
+### 🟢 P2: 已完成的调试工具
 
 - [x] **debug_modal.py** — 逐步对比 kernel vs reference 的中间结果
 - [x] **test_scaled_mm.py** — 探测 B200 `_scaled_mm` API
-- [ ] **NCU Profiling** — 找到 B200 上的 bottleneck
 
 ### ❌ 已尝试但不 work 的优化
 
