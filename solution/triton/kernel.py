@@ -150,13 +150,23 @@ def moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device):
 # Computes: SwiGLU( A[sorted_idx] @ W13 )
 # ═══════════════════════════════════════════════════════════════
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+    ],
+    key=['num_padded', 'N', 'K'],
+    restore_value=['C_ptr'],
+)
 @triton.jit
 def _fused_moe_gemm1_swiglu_kernel(
     # Data pointers
     A_ptr,            # [T, H] fp8 (hidden_states)
     A_scale_ptr,      # [H//128, T] fp32 (hidden_states_scale)
     B_ptr,            # [E, N, H] fp8 (W13 weights, transposed physically or logically)
-    C_ptr,            # [num_padded, N//2] bf16 (intermediate SwiGLU output)
+    C_ptr,            # [num_padded, N//2] fp32 (intermediate SwiGLU output)
     B_scale_ptr,      # [E, N//128, H//128] fp32 (weight scales)
     token_ids_ptr,    # [num_padded] int64 (sorted token indices)
     expert_ids_ptr,   # [num_blocks] int32 (expert for each M-block)
@@ -215,11 +225,11 @@ def _fused_moe_gemm1_swiglu_kernel(
     acc_1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     acc_3 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+    safe_token_idx = tl.where(token_idx < T, token_idx, 0)
+
     # K loop
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
-        
-        safe_token_idx = tl.where(token_idx < T, token_idx, 0)
         
         # Load A: fp8
         a_ptrs = A_ptr + (safe_token_idx[:, None] * stride_at + rk[None, :] * stride_ah)
@@ -277,10 +287,20 @@ def _fused_moe_gemm1_swiglu_kernel(
 # Computes: Output[token_id] += (Intermediate[sorted_idx] @ W2) * routing_weight
 # ═══════════════════════════════════════════════════════════════
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+    ],
+    key=['num_padded', 'N', 'K'],
+    restore_value=['C_ptr'],
+)
 @triton.jit
 def _fused_moe_gemm2_scatter_kernel(
     # Data pointers
-    A_ptr,            # [num_padded, K] bf16 (intermediate SwiGLU output)
+    A_ptr,            # [num_padded, K] fp32 (intermediate SwiGLU output)
     B_ptr,            # [E, N, K] fp8 (W2 weights trans)
     C_ptr,            # [T, N] bf16 (final output tensor, modified in place)
     B_scale_ptr,      # [E, N//16, K//128] fp32 (W2 block scales)
@@ -334,35 +354,23 @@ def _fused_moe_gemm2_scatter_kernel(
     # Accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
+    safe_rm = tl.where(rm < num_padded, rm, 0)
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
-        k_mask = rk < K
-        
-        # Load A: bf16 -> cast to fp32 or keep bf16
-        # A is [num_padded, K]
-        safe_rm = tl.where(rm < num_padded, rm, 0)
+
+        # Load A: fp32 from Intermediate buffer
         a_ptrs = A_ptr + safe_rm[:, None] * stride_am + rk[None, :] * stride_ak
-        a = tl.load(a_ptrs, mask=m_mask[:, None] & k_mask[None, :], other=0.0)
-        
-        # Load B: fp8
-        # B is [E, N, K] -> loaded as transposed W2
+        a = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
+
+        # Load B: fp8, dequant to fp32
         b_ptrs = B_ptr + expert_id * stride_be + rn[None, :] * stride_bn + rk[:, None] * stride_bk
-        b = tl.load(b_ptrs, mask=n_mask[None, :] & k_mask[:, None], other=0.0)
-        
-        # Load B scale: fp32
-        # b_scale is [E, K//128, N//128] (which is [32, 56, 16] for K=7168, N=2048)
-        # b_scale_ptrs receives transposed mapping accurately
+        b = tl.load(b_ptrs, mask=n_mask[None, :], other=0.0)
+
         b_scale_ptrs = B_scale_ptr + expert_id * stride_bse + (k // 128) * stride_bsk + (rn[None, :] // 128) * stride_bsn
-        b_scale = tl.load(b_scale_ptrs, mask=n_mask[None, :], other=0.0) # shape: [1, BLOCK_N]
-        
-        # We need mixed precision dot. tl.dot supports A=fp32, B=fp8 in some Triton versions?
-        # PyTorch baseline retains tf32 precision across GEMM2. We do NOT downcast to bf16!
-        # Load B natively as fp32 multiplied by scale.
+        b_scale = tl.load(b_scale_ptrs, mask=n_mask[None, :], other=0.0)
         b_fp32 = b.to(tl.float32) * b_scale
-        
-        # A is natively fp32 (from Intermediate buffer). Use TF32 dot accumulation to match PyTorch
-        dot_out = tl.dot(a, b_fp32, acc=None, out_dtype=tl.float32)
-        acc += dot_out
+
+        acc += tl.dot(a, b_fp32, out_dtype=tl.float32)
         
     # Scale by routing weights
     out = acc * token_weights[:, None]
@@ -818,15 +826,10 @@ def kernel(
     # W13 is [E, 4096, 7168], N=4096, K=7168
     # SwiGLU outputs N_OUT=2048. Zero allocated to prevent uninitialized padding NaNs.
     # Allocate as float32 to prevent bf16 mantissa clip from failing exact bench match
-    Intermediate = torch.zeros((num_padded, 2048), dtype=torch.float32, device=device)
-    
-    BLOCK_M_1 = 64
-    BLOCK_N_1 = 64
-    BLOCK_K_1 = 128
-    GROUP_M_1 = 8
+    Intermediate = torch.empty((num_padded, 2048), dtype=torch.float32, device=device)
     
     grid1 = lambda META: (triton.cdiv(num_padded, META['BLOCK_M']) * triton.cdiv(2048, META['BLOCK_N']),)
-    
+
     _fused_moe_gemm1_swiglu_kernel[grid1](
         A_ptr=hidden_states,
         A_scale_ptr=hidden_states_scale,
@@ -841,18 +844,12 @@ def kernel(
         stride_be=gemm1_weights.stride(0), stride_bn=gemm1_weights.stride(1), stride_bh=gemm1_weights.stride(2),
         stride_cm=Intermediate.stride(0), stride_cn=Intermediate.stride(1),
         stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
-        BLOCK_M=BLOCK_M_1, BLOCK_N=BLOCK_N_1, BLOCK_K=BLOCK_K_1, GROUP_M=GROUP_M_1
     )
 
     # ── 4. Fused GEMM2 + Scatter Add ──
     # Intermediate is [num_padded, 2048]
     # W2 is [E, 7168, 2048]
     # We scatter add directly to output [T, 7168]
-    
-    BLOCK_M_2 = 64
-    BLOCK_N_2 = 64
-    BLOCK_K_2 = 64
-    GROUP_M_2 = 8
     
     grid2 = lambda META: (triton.cdiv(num_padded, META['BLOCK_M']) * triton.cdiv(7168, META['BLOCK_N']),)
 
@@ -869,7 +866,6 @@ def kernel(
         stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1), stride_bk=gemm2_weights.stride(2),
         stride_ct=output_fp32.stride(0), stride_cn=output_fp32.stride(1),
         stride_bse=gemm2_weights_scale.stride(0), stride_bsn=gemm2_weights_scale.stride(1), stride_bsk=gemm2_weights_scale.stride(2),
-        BLOCK_M=BLOCK_M_2, BLOCK_N=BLOCK_N_2, BLOCK_K=BLOCK_K_2, GROUP_M=GROUP_M_2
     )
 
     # Final cast to bfloat16

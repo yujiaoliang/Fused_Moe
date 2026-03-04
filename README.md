@@ -1,8 +1,8 @@
 # Fused MoE Kernel — Track A (FlashInfer AI Kernel Generation Contest @ MLSys 2026)
 
-> **赛道:** Track A — Fused MoE  
-> **目标硬件:** NVIDIA B200 (Blackwell, sm100)  
-> **当前状态:** ✅ 19/19 PASSED｜最高 **12.90x** 加速｜**全部 19/19 workloads ≥ 1x**, 平均加速 ~9x
+> **赛道:** Track A — Fused MoE
+> **目标硬件:** NVIDIA B200 (Blackwell, sm100)
+> **当前状态:** ✅ 19/19 PASSED｜最高 **10.74x** 加速｜large-T ~3.5-3.9x｜平均 ~6.5x
 
 ---
 
@@ -18,7 +18,9 @@
 
 ### B200 Benchmark 结果（最新）
 
-通过完全消除外层的 PyTorch expert 循环和连续显存分配，我们的 custom fused Triton kernel 在极端 small-batch (T=7) workload 上达到了夸张的加速。
+通过完全消除外层的 PyTorch expert 循环和连续显存分配，加上 `@triton.autotune` 自动调参和 GEMM2 BLOCK_K=128 优化，我们的 custom fused Triton kernel 在 19/19 workloads 上全部通过，peak 10.74x 加速。
+
+> 注：以下为含 autotune 之前的逐 workload 数据，当前版本 peak ~10.74x（autotune 增加了少量 JIT 开销但改善了 large-T 表现）。
 
 | Workload | (New) Speedup | (Old PyTorch compiled) | 备注 |
 |----------|---------|---------|------|
@@ -165,13 +167,13 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 
 1. **Routing** — DeepSeek-V3 no-aux routing：sigmoid → group-filter → top-8 → normalized weights
 2. **Token sorting** — `moe_sort_tokens()` 按 expert 排序 token，padding 到 BLOCK_M=64
-3. **Monolithic Triton Kernel 1: GEMM1 + SwiGLU** 
-   - `_fused_moe_gemm1_swiglu_kernel`
+3. **Monolithic Triton Kernel 1: GEMM1 + SwiGLU**
+   - `_fused_moe_gemm1_swiglu_kernel`（`@triton.autotune` 自动调参）
    - FP8 Activation & Weights 传入
    - Block 内全 Native FP32 计算 (TF32 Tensor Cores) 保障精度对齐，并内部融合 dequantization
    - 输出 bf16 `Intermediate` [num_padded, 2048]
 4. **Monolithic Triton Kernel 2: GEMM2 + Scatter Add**
-   - `_fused_moe_gemm2_scatter_kernel`
+   - `_fused_moe_gemm2_scatter_kernel`（`@triton.autotune` 自动调参，BLOCK_K=128）
    - Native FP32 内积与 Routing Weights 相乘
    - 使用 Triton `tl.atomic_add` 直接将更新写入最终的 fp32 buffer，避免低精度 rounding error，随后复制至 `bfloat16` output。
 
@@ -197,12 +199,17 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 - [x] **预转换 weight scales** — `.float()` 移到循环外，避免每 expert 转换开销
 - [x] **Monolithic Fused Kernels** - 完美消除 Python 层面上基于各个 expert 的迭代 launch 惩罚，使用分组索引跨 block 读取。
 - [x] **Native TF32 数值等价** - 解决 `tl.dot()` 中各种 FP8/BF16 downcast 带来的误差。完全对齐纯 Eager 模式下的精度限度 (100% Correctness通过率)。
+- [x] **Triton Autotune** — `@triton.autotune` 自动选择最优 BLOCK_M/BLOCK_N/num_warps/num_stages 配置（需 `restore_value=['C_ptr']` 防止 atomic_add 在多次 trial 间累积）
+- [x] **GEMM2 BLOCK_K=128** — 与 QBLOCK=128 对齐，K-loop 迭代次数减半（2048/128=16 vs 2048/64=32）
+- [x] **torch.empty for Intermediate** — 避免不必要的零初始化（kernel 内 padding 行已 mask）
+- [x] **Hoisted safe_token_idx** — 将 safe_token_idx 计算移出 GEMM1 K-loop，减少冗余计算
 
 ### 🟡 P1: 进一步优化
 
 - [ ] **Persistent kernels** — 通过静态 dispatch 完全抵消 Triton run 时的 CPU 端 Python 开销
 - [ ] **等待 Triton sm100 修复** — Phase 3 Fully Fused Kernel 算法已验证正确，等 Triton nightly 修复 `tl.dot` codegen 后重新测试
 - [ ] **NCU Profiling** — 分析 B200 上的 shared memory access 和 instruction latency bottleneck
+- [ ] **FP8 Native Tensor Core Dot** — 等 Triton 修复 B200 sm100 上的 `tl.dot(fp8, fp8)` codegen（目前产生 garbage output）
 
 ### 🟢 P2: 已完成的调试工具
 
@@ -217,6 +224,9 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 | Triton GEMM (bf16 dot) | abs_err ~4096 | bf16 累积56个 K-block 丢精度 |
 | 编译 routing 函数 | peak 下降 ~20% | compilation 开销 > 运行时收益 |
 | `_scaled_mm` BlockWise 128 | peak 5.30x (vs 8.46x) | fp32→fp8 re-quant + padding + scale 创建的开销抵消加速 |
+| FP8 Native Tensor Core Dot | 0/19, abs_err ~1e9 | `tl.dot(fp8,fp8)` 在 B200 sm100 上的 Triton codegen 不正确，产生 garbage |
+| bf16 Dequant + bf16 Dot | 0/19, rel_err 2-10x | bf16 只有 7 bit mantissa，截断后精度不满足 tolerance |
+| GPU Token Sorting (per-expert .item()) | 19/19 但 peak 7.6x→11.2x | 每 expert 一次 `.item()` sync（~60次）比一次 `.cpu().tolist()` 慢得多 |
 
 ---
 
