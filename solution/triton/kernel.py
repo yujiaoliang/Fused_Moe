@@ -185,6 +185,8 @@ def moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device):
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=5),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=5),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
     ],
     key=['num_padded', 'N', 'K'],
     restore_value=['C_ptr'],
@@ -321,6 +323,8 @@ def _fused_moe_gemm1_swiglu_kernel(
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=5),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=4),
     ],
     key=['num_padded', 'N', 'K'],
     restore_value=['C_ptr'],
@@ -395,13 +399,14 @@ def _fused_moe_gemm2_scatter_kernel(
         # Load A: fp32 from Intermediate buffer
         a = tl.load(a_base + rk[None, :] * stride_ak, mask=m_mask[:, None], other=0.0)
 
-        # Load B: fp8, dequant to fp32 (N=7168 always divisible by BLOCK_N, no mask needed)
+        # Load B: fp8 (N=7168 always divisible by BLOCK_N, no mask needed)
         b = tl.load(b_base + rk[:, None] * stride_bk)
 
+        # Post-dot B-scale: BLOCK_K == QBLOCK so b_scale constant along K within tile
+        # a @ (b * scale) = (a @ b) * scale — fewer muls + better TF32 precision
         b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk)
-        b_fp32 = b.to(tl.float32) * b_scale
-
-        acc = tl.dot(a, b_fp32, acc=acc, out_dtype=tl.float32)
+        partial = tl.dot(a, b.to(tl.float32), out_dtype=tl.float32)
+        acc += partial * b_scale
         
     # Scale by routing weights
     out = acc * token_weights[:, None]

@@ -2,7 +2,7 @@
 
 > **赛道:** Track A — Fused MoE
 > **目标硬件:** NVIDIA B200 (Blackwell, sm100)
-> **当前状态:** ✅ 19/19 PASSED｜最高 **11.91x** 加速｜large-T **7.1-7.5x**｜平均 **~9.6x**
+> **当前状态:** ✅ 19/19 PASSED｜最高 **12.14x** 加速｜large-T **7.0-7.4x**｜平均 **~10.1x**
 
 ---
 
@@ -18,29 +18,29 @@
 
 ### B200 Benchmark 结果（最新）
 
-Round 5 优化：GEMM1 中使用 FP8 原生 Tensor Core dot（`tl.dot(fp8, fp8)` + 后乘 scale），Triton 3.6.0 已修复 sm100 codegen。2x tensor core 吞吐，消除 3 次 dequant 乘法/K-iter。Large-T 从 ~4x 跃升至 ~7x，平均从 ~7.7x 提升至 ~9.6x。
+Round 6 优化：GEMM2 中使用 post-dot B-scale（`tl.dot(a, b.to(f32))` + `acc += partial * b_scale`），消除 [BLOCK_K, BLOCK_N] dequant 乘法，替换为更小的 [BLOCK_M, BLOCK_N] post-dot scale。扩展 autotune 配置（GEMM1 增加 BLOCK_N=256，GEMM2 增加更高 num_stages + BLOCK_N=256）。中等规模 workload 提升 ~0.3-0.8x，平均从 ~9.6x 提升至 ~10.1x。
 
-| Workload | Round 1 | Round 4 | Round 5 | 备注 |
+| Workload | Round 1 | Round 5 | Round 6 | 备注 |
 |----------|---------|---------|---------|------|
-| e05c6c03 (T=14) | 12.90x | 11.45x | **11.91x** | 🔥 peak |
-| 2e69caee | 12.21x | 9.53x | **11.54x** | +2.0x |
-| 1a4c6ba1 | 1.35x | 8.47x | **10.80x** | +2.3x |
-| b8f4f012 (T=7) | 12.02x | 10.00x | **10.93x** | |
-| 8cba5890 | 10.14x | 9.66x | **10.35x** | |
-| a7c2bcfd (T=128)| 10.00x | 8.87x | **10.00x** | |
-| 5eadab1e | 10.06x | 8.22x | **9.98x** | |
-| 6230e838 | 8.97x | 7.16x | **9.88x** | +2.7x |
-| f7d6ac7c | 9.60x | 8.54x | **9.85x** | |
-| 81955b1e | 8.94x | 7.18x | **9.71x** | |
-| 74d7ff04 | 9.02x | 7.35x | **9.68x** | |
-| 4822167c | 8.75x | 7.35x | **9.68x** | |
-| fc378037 | 9.02x | 7.58x | **9.52x** | |
-| 76010cb4 | 8.76x | 7.31x | **9.39x** | |
-| e626d3e6 | 9.18x | 7.49x | **9.35x** | |
-| eedc63b2 | 9.30x | 7.38x | **9.32x** | |
-| 8f1ff9f1 | 8.80x | 7.10x | **8.95x** | |
-| 58a34f27 (T=4096)| 4.14x | 4.45x | **7.46x** | 🔥 large-T +3.0x |
-| 5e8dc11c (T=4096)| 3.69x | 3.99x | **7.08x** | 🔥 large-T +3.1x |
+| e05c6c03 (T=14) | 12.90x | 11.91x | **12.14x** | 🔥 peak |
+| 2e69caee | 12.21x | 11.54x | **11.97x** | +0.4x |
+| 1a4c6ba1 | 1.35x | 10.80x | **11.34x** | +0.5x |
+| b8f4f012 (T=7) | 12.02x | 10.93x | **11.06x** | |
+| a7c2bcfd (T=128)| 10.00x | 10.00x | **10.84x** | +0.8x |
+| 8cba5890 | 10.14x | 10.35x | **10.78x** | |
+| 5eadab1e | 10.06x | 9.98x | **10.76x** | +0.8x |
+| f7d6ac7c | 9.60x | 9.85x | **10.53x** | +0.7x |
+| 76010cb4 | 8.76x | 9.39x | **10.25x** | +0.9x |
+| 4822167c | 8.75x | 9.68x | **10.19x** | +0.5x |
+| eedc63b2 | 9.30x | 9.32x | **10.18x** | +0.9x |
+| 74d7ff04 | 9.02x | 9.68x | **10.10x** | |
+| 81955b1e | 8.94x | 9.71x | **10.10x** | |
+| fc378037 | 9.02x | 9.52x | **10.06x** | +0.5x |
+| 6230e838 | 8.97x | 9.88x | **10.05x** | |
+| 8f1ff9f1 | 8.80x | 8.95x | **10.02x** | +1.1x |
+| e626d3e6 | 9.18x | 9.35x | **9.98x** | +0.6x |
+| 58a34f27 (T=4096)| 4.14x | 7.46x | **7.43x** | large-T |
+| 5e8dc11c (T=4096)| 3.69x | 7.08x | **6.98x** | large-T |
 
 ---
 
@@ -164,7 +164,7 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
    - 输出 fp32 `Intermediate` [num_padded, 2048]（bf16 精度不足，6/19 失败）
 4. **Monolithic Triton Kernel 2: GEMM2 + Scatter Add**
    - `_fused_moe_gemm2_scatter_kernel`（`@triton.autotune` 自动调参，BLOCK_K=128）
-   - Native FP32 内积与 Routing Weights 相乘
+   - Post-dot B-scale：`tl.dot(a, b.to(f32))` + `acc += partial * b_scale`，减少标量乘法并提升 TF32 精度
    - 使用 Triton `tl.atomic_add` 直接将更新写入最终的 fp32 buffer，避免低精度 rounding error，随后复制至 `bfloat16` output。
 
 ### 关键约束
@@ -202,6 +202,8 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 - [x] **Pre-allocated pad buffers** — CPU sorting path 中单次 `torch.full`/`torch.zeros` 替代每 expert 分配
 - [x] **移除冗余 cast** — GEMM2 `atomic_add` 中 `.to(tl.float32)` 已冗余（out 本身即 fp32）
 - [x] **FP8 Native Tensor Core Dot (GEMM1)** — `tl.dot(fp8, fp8)` + post-dot scale，Triton 3.6.0 已修复 sm100 codegen（2x 吞吐，large-T +3x，avg +1.9x）
+- [x] **GEMM2 Post-dot B-scale** — `tl.dot(a, b.to(f32))` + `acc += partial * b_scale`，消除 [BLOCK_K, BLOCK_N] dequant 乘法（中等规模 +0.3-0.8x，avg +0.5x）
+- [x] **Autotune 扩展** — GEMM1 增加 BLOCK_N=256 配置，GEMM2 增加 num_stages=5 和 BLOCK_N=256 配置
 
 ### 🟡 P1: 进一步优化
 
