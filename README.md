@@ -2,7 +2,7 @@
 
 > **赛道:** Track A — Fused MoE
 > **目标硬件:** NVIDIA B200 (Blackwell, sm100)
-> **当前状态:** ✅ 19/19 PASSED｜最高 **10.74x** 加速｜large-T ~3.5-3.9x｜平均 ~6.5x
+> **当前状态:** ✅ 19/19 PASSED｜最高 **10.26x** 加速｜large-T **4.0-4.5x**｜平均 **~6.9x**
 
 ---
 
@@ -18,39 +18,29 @@
 
 ### B200 Benchmark 结果（最新）
 
-通过完全消除外层的 PyTorch expert 循环和连续显存分配，加上 `@triton.autotune` 自动调参和 GEMM2 BLOCK_K=128 优化，我们的 custom fused Triton kernel 在 19/19 workloads 上全部通过，peak 10.74x 加速。
+Round 3 优化：hybrid CPU/GPU token sorting（<1024 tokens 走 CPU 快速路径）、K-loop pointer hoisting、routing in-place ops。Peak 从 Round 2 的 8.8x 恢复至 10.26x，1a4c6ba1 从 1.35x 跃升至 8.26x。
 
-> 注：以下为含 autotune 之前的逐 workload 数据，当前版本 peak ~10.74x（autotune 增加了少量 JIT 开销但改善了 large-T 表现）。
-
-| Workload | (New) Speedup | (Old PyTorch compiled) | 备注 |
+| Workload | Round 1 | Round 3 | 备注 |
 |----------|---------|---------|------|
-| e05c6c03 (T=14) | **12.90x** | 2.40x | 🔥 消除 Kernel Launch 开销 |
-| 2e69caee | **12.21x** | 1.63x | 🔥 |
-| b8f4f012 (T=7) | **12.02x** | 1.29x | 🔥 |
-| 8cba5890 | **10.14x** | 0.84x | 🔥 |
-| 5eadab1e | **10.06x** | 0.63x | 🔥 |
-| a7c2bcfd (T=128)| **10.00x** | 0.80x | 🔥 |
-| f7d6ac7c | **9.60x** | 0.65x | |
-| eedc63b2 | **9.30x** | 0.59x | |
-| e626d3e6 | **9.18x** | 0.48x | |
-| 74d7ff04 | **9.02x** | 0.49x | |
-| fc378037 | **9.02x** | 0.51x | |
-| 6230e838 | **8.97x** | 0.55x | |
-| 81955b1e | **8.94x** | 0.50x | |
-| 8f1ff9f1 | **8.80x** | 0.47x | |
-| 76010cb4 | **8.76x** | 0.52x | |
-| 4822167c | **8.75x** | 0.48x | |
-| 58a34f27 (T=4096)| **4.14x** | 1.17x | |
-| 5e8dc11c (T=4096)| **3.69x** | 1.15x | |
-| 1a4c6ba1 | **1.35x** | 1.35x | |
-
-### Phase 3: Fully Fused Kernel Investigation (Concluded)
-
-开发了 unified 单趟融合算子 (`_fully_fused_moe_kernel`)，将 GEMM1+SwiGLU+GEMM2 全部融合于同一个 Triton JIT kernel，所有中间变量保留在 SRAM 中：
-- **SRAM 极限利用**：`BLOCK_M=16`，每 token 的 4096 维中间激活完全在 B200 SRAM (256KB/SM) 中持有
-- **本地验证（RTX 4080, sm89）**：Phase 2 vs Phase 3 误差仅 6.76（fp8 精度范围内）✅
-- **B200 (sm100) 问题**：所有 19/19 workloads 报告 ~4096 绝对误差（2的幂次），疑似 Triton sm100 codegen 在 `tl.dot` `BLOCK_H=64` 场景下的 bug
-- **结论**：算法数学正确，但受限于 Triton 编译器对 sm100 的支持。已回退至 Phase 2 两 kernel 方案，代码保留于 `kernel.py` 供未来验证
+| e05c6c03 (T=14) | 12.90x | **10.26x** | hybrid sort 恢复 peak |
+| 2e69caee | 12.21x | **9.40x** | |
+| b8f4f012 (T=7) | 12.02x | **8.18x** | |
+| 1a4c6ba1 | 1.35x | **8.26x** | 🔥 hybrid sort 大幅提升 |
+| 8cba5890 | 10.14x | **7.60x** | |
+| a7c2bcfd (T=128)| 10.00x | **7.63x** | |
+| 5eadab1e | 10.06x | **7.26x** | |
+| f7d6ac7c | 9.60x | **7.10x** | |
+| 6230e838 | 8.97x | **6.39x** | |
+| e626d3e6 | 9.18x | **6.46x** | |
+| eedc63b2 | 9.30x | **6.40x** | |
+| 81955b1e | 8.94x | **6.39x** | |
+| 76010cb4 | 8.76x | **6.38x** | |
+| 74d7ff04 | 9.02x | **6.31x** | |
+| fc378037 | 9.02x | **6.29x** | |
+| 4822167c | 8.75x | **6.20x** | |
+| 8f1ff9f1 | 8.80x | **5.92x** | |
+| 58a34f27 (T=4096)| 4.14x | **4.46x** | large-T 提升 |
+| 5e8dc11c (T=4096)| 3.69x | **4.01x** | large-T 提升 |
 
 ---
 
@@ -171,7 +161,7 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
    - `_fused_moe_gemm1_swiglu_kernel`（`@triton.autotune` 自动调参）
    - FP8 Activation & Weights 传入
    - Block 内全 Native FP32 计算 (TF32 Tensor Cores) 保障精度对齐，并内部融合 dequantization
-   - 输出 bf16 `Intermediate` [num_padded, 2048]
+   - 输出 fp32 `Intermediate` [num_padded, 2048]（bf16 精度不足，6/19 失败）
 4. **Monolithic Triton Kernel 2: GEMM2 + Scatter Add**
    - `_fused_moe_gemm2_scatter_kernel`（`@triton.autotune` 自动调参，BLOCK_K=128）
    - Native FP32 内积与 Routing Weights 相乘
@@ -203,6 +193,10 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 - [x] **GEMM2 BLOCK_K=128** — 与 QBLOCK=128 对齐，K-loop 迭代次数减半（2048/128=16 vs 2048/64=32）
 - [x] **torch.empty for Intermediate** — 避免不必要的零初始化（kernel 内 padding 行已 mask）
 - [x] **Hoisted safe_token_idx** — 将 safe_token_idx 计算移出 GEMM1 K-loop，减少冗余计算
+- [x] **Fused tl.dot accumulation** — `acc=` 参数融合 GEMM1 和 GEMM2 的 dot 累加
+- [x] **GPU Token Sorting** — vectorized cumsum + scatter，单次 `.item()` sync（大 T 提升但小 T 回退）
+- [x] **Extended Autotune** — GEMM1 +3 configs (stages=5,2), GEMM2 +4 configs (BLOCK_N=256, stages=2-4)
+- [x] **fp32 Intermediate** — bf16 SwiGLU output 精度不足（6/19 PASSED），改用 fp32
 
 ### 🟡 P1: 进一步优化
 
@@ -227,6 +221,8 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 | FP8 Native Tensor Core Dot | 0/19, abs_err ~1e9 | `tl.dot(fp8,fp8)` 在 B200 sm100 上的 Triton codegen 不正确，产生 garbage |
 | bf16 Dequant + bf16 Dot | 0/19, rel_err 2-10x | bf16 只有 7 bit mantissa，截断后精度不满足 tolerance |
 | GPU Token Sorting (per-expert .item()) | 19/19 但 peak 7.6x→11.2x | 每 expert 一次 `.item()` sync（~60次）比一次 `.cpu().tolist()` 慢得多 |
+| bf16 Intermediate | 6/19 PASSED | SwiGLU 输出需要 fp32 精度，bf16 mantissa 截断导致精度不足 |
+| Phase 3 Fully Fused Kernel | 0/19, abs_err ~4096 | Triton sm100 codegen bug：`tl.dot` BLOCK_H=64 场景下的精度问题（本地 sm89 正确） |
 
 ---
 

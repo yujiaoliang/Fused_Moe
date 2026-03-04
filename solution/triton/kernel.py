@@ -59,16 +59,17 @@ def ds_routing(logits, bias, scale_factor):
     s_mask = g_mask.unsqueeze(2).expand(T, N_GROUP, gs).reshape(T, E_GLOBAL)
 
     neg_inf = torch.finfo(torch.float32).min
-    pruned = sb.masked_fill(s_mask == 0, neg_inf)
-    _, topk_idx = torch.topk(pruned, k=TOP_K, dim=1,
+    sb.masked_fill_(s_mask == 0, neg_inf)
+    _, topk_idx = torch.topk(sb, k=TOP_K, dim=1,
                              largest=True, sorted=False)       # [T, 8]
 
-    # Weights from s (without bias), normalized
+    # Weights from s (without bias), normalized — in-place to reduce allocations
     m = torch.zeros_like(s)
     m.scatter_(1, topk_idx, 1.0)
-    w = s * m
-    w = (w / (w.sum(dim=1, keepdim=True) + 1e-20)) * scale_factor
-    topk_weights = torch.gather(w, 1, topk_idx)               # [T, 8]
+    s.mul_(m)
+    s.div_(s.sum(dim=1, keepdim=True) + 1e-20)
+    s.mul_(scale_factor)
+    topk_weights = torch.gather(s, 1, topk_idx)               # [T, 8]
 
     return topk_idx, topk_weights
 
@@ -109,38 +110,61 @@ def moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device):
     loc_experts = loc_experts[sort_idx]
     loc_weights = loc_weights[sort_idx]
 
-    # Vectorized padding: count per expert and compute padded offsets
+    # Count tokens per expert
     counts = torch.zeros(E_LOCAL, dtype=torch.int32, device=device)
     counts.scatter_add_(0, loc_experts.long(), torch.ones_like(loc_experts, dtype=torch.int32))
 
-    # Compute padded lengths and offsets per expert (on CPU for indexing)
-    counts_cpu = counts.cpu().tolist()
-    padded_tokens_list = []
-    padded_weights_list = []
-    block_experts_list = []
-    offset = 0
+    if loc_tokens.numel() < 1024:
+        # CPU path: single .cpu().tolist() sync + fast Python loop
+        # Faster for small T (covers T≤128, 16/19 workloads) — avoids ~25 GPU kernel launches
+        counts_cpu = counts.cpu().tolist()
+        padded_tokens_list = []
+        padded_weights_list = []
+        block_experts_list = []
+        offset = 0
+        for e in range(E_LOCAL):
+            cnt = counts_cpu[e]
+            if cnt == 0:
+                continue
+            num_blocks = (cnt + BLOCK_M - 1) // BLOCK_M
+            pad_cnt = num_blocks * BLOCK_M - cnt
+            padded_tokens_list.append(loc_tokens[offset:offset + cnt])
+            padded_weights_list.append(loc_weights[offset:offset + cnt])
+            if pad_cnt > 0:
+                padded_tokens_list.append(torch.full((pad_cnt,), T, device=device, dtype=torch.int64))
+                padded_weights_list.append(torch.zeros(pad_cnt, device=device))
+            block_experts_list.extend([e] * num_blocks)
+            offset += cnt
+        sorted_token_ids = torch.cat(padded_tokens_list)
+        sorted_weights = torch.cat(padded_weights_list)
+        block_expert_ids = torch.tensor(block_experts_list, device=device, dtype=torch.int32)
+        num_padded = sorted_token_ids.shape[0]
+    else:
+        # GPU path: vectorized cumsum + scatter (faster for large T)
+        padded_counts = ((counts + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
+        offsets = torch.cumsum(padded_counts, dim=0)
+        total = offsets[-1].item()  # ONE sync point
+        starts = offsets - padded_counts
 
-    for e in range(E_LOCAL):
-        cnt = counts_cpu[e]
-        if cnt == 0:
-            continue
-        num_blocks = (cnt + BLOCK_M - 1) // BLOCK_M
-        pad_cnt = num_blocks * BLOCK_M - cnt
+        # Compute within-expert offsets for scatter
+        cum_actual = torch.cumsum(counts, dim=0)
+        cum_shifted = torch.cat([torch.zeros(1, dtype=torch.int32, device=device), cum_actual[:-1]])
+        arange = torch.arange(loc_tokens.numel(), device=device, dtype=torch.int32)
+        within_offset = arange - cum_shifted[loc_experts.long()]
+        dest_idx = starts[loc_experts.long()] + within_offset
 
-        padded_tokens_list.append(loc_tokens[offset:offset + cnt])
-        padded_weights_list.append(loc_weights[offset:offset + cnt])
+        # Scatter tokens and weights into padded buffer
+        sorted_token_ids = torch.full((total,), T, device=device, dtype=torch.int64)
+        sorted_token_ids[dest_idx.long()] = loc_tokens
+        sorted_weights = torch.zeros(total, device=device)
+        sorted_weights[dest_idx.long()] = loc_weights
 
-        if pad_cnt > 0:
-            padded_tokens_list.append(torch.full((pad_cnt,), T, device=device, dtype=torch.int64))
-            padded_weights_list.append(torch.zeros(pad_cnt, device=device))
-
-        block_experts_list.extend([e] * num_blocks)
-        offset += cnt
-
-    sorted_token_ids = torch.cat(padded_tokens_list)
-    sorted_weights = torch.cat(padded_weights_list)
-    block_expert_ids = torch.tensor(block_experts_list, device=device, dtype=torch.int32)
-    num_padded = sorted_token_ids.shape[0]
+        # Block expert IDs via repeat_interleave
+        blocks_per_expert = (padded_counts // BLOCK_M).long()
+        block_expert_ids = torch.repeat_interleave(
+            torch.arange(E_LOCAL, device=device, dtype=torch.int32),
+            blocks_per_expert)
+        num_padded = total
 
     return sorted_token_ids, block_expert_ids, sorted_weights, num_padded
 
@@ -156,6 +180,9 @@ def moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device):
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=5),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=5),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=2),
     ],
     key=['num_padded', 'N', 'K'],
     restore_value=['C_ptr'],
@@ -227,57 +254,52 @@ def _fused_moe_gemm1_swiglu_kernel(
 
     safe_token_idx = tl.where(token_idx < T, token_idx, 0)
 
+    # Hoist loop-invariant pointer bases outside K-loop (56 iterations)
+    a_base = A_ptr + safe_token_idx[:, None] * stride_at
+    a_scale_base = A_scale_ptr + safe_token_idx * stride_as1
+    b_base_1 = B_ptr + expert_id * stride_be + rn_1[None, :] * stride_bn
+    b_base_3 = B_ptr + expert_id * stride_be + rn_3[None, :] * stride_bn
+    b_scale_base_1 = B_scale_ptr + expert_id * stride_bse + (rn_1[None, :] // 128) * stride_bsn
+    b_scale_base_3 = B_scale_ptr + expert_id * stride_bse + (rn_3[None, :] // 128) * stride_bsn
+
     # K loop
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
-        
+
         # Load A: fp8
-        a_ptrs = A_ptr + (safe_token_idx[:, None] * stride_at + rk[None, :] * stride_ah)
-        a = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
-        
-        # Load A scale: fp32
-        # A_scale is [K//128, T] -> transposed logically
-        a_scale_ptrs = A_scale_ptr + (k // 128) * stride_as0 + safe_token_idx * stride_as1
-        a_scale = tl.load(a_scale_ptrs, mask=m_mask, other=0.0) # shape: [BLOCK_M]
-        
+        a = tl.load(a_base + rk[None, :] * stride_ah, mask=m_mask[:, None], other=0.0)
+
+        # Load A scale: fp32 [BLOCK_M]
+        a_scale = tl.load(a_scale_base + (k // 128) * stride_as0, mask=m_mask, other=0.0)
+
         # Load B for W1: fp8
-        b_ptrs_1 = B_ptr + expert_id * stride_be + rn_1[None, :] * stride_bn + rk[:, None] * stride_bh
-        b_1 = tl.load(b_ptrs_1)
-        
-        # Load B scale for W1 (fp32)
-        # B_scale is [E, N//128, K//128]
-        # We broadcast it over the K dimension (which is size 1 since BLOCK_K=128)
-        # Let's load it as [1, BLOCK_N] so it broadcasts over BLOCK_M
-        b_scale_ptrs_1 = B_scale_ptr + expert_id * stride_bse + (rn_1[None, :] // 128) * stride_bsn + (k // 128) * stride_bsh
-        b_scale_1 = tl.load(b_scale_ptrs_1) # shape: [1, BLOCK_N]
-        
+        b_1 = tl.load(b_base_1 + rk[:, None] * stride_bh)
+
+        # Load B scale for W1: fp32 [1, BLOCK_N]
+        b_scale_1 = tl.load(b_scale_base_1 + (k // 128) * stride_bsh)
+
         # Load B for W3: fp8
-        b_ptrs_3 = B_ptr + expert_id * stride_be + rn_3[None, :] * stride_bn + rk[:, None] * stride_bh
-        b_3 = tl.load(b_ptrs_3)
-        
-        # Load B scale for W3
-        b_scale_ptrs_3 = B_scale_ptr + expert_id * stride_bse + (rn_3[None, :] // 128) * stride_bsn + (k // 128) * stride_bsh
-        b_scale_3 = tl.load(b_scale_ptrs_3) # shape: [1, BLOCK_N]
-        
+        b_3 = tl.load(b_base_3 + rk[:, None] * stride_bh)
+
+        # Load B scale for W3: fp32 [1, BLOCK_N]
+        b_scale_3 = tl.load(b_scale_base_3 + (k // 128) * stride_bsh)
+
         # Cast A to fp32 and scale directly
         a_fp32 = a.to(tl.float32) * a_scale[:, None]
-        
+
         # Scale B natively in fp32
         b_1_fp32 = b_1.to(tl.float32) * b_scale_1
         b_3_fp32 = b_3.to(tl.float32) * b_scale_3
-        
-        # Dot natively via fp32 tensor cores (TF32) for precise verification matching
-        dot_out_1 = tl.dot(a_fp32, b_1_fp32, acc=None, out_dtype=tl.float32)
-        acc_1 += dot_out_1 # (BLOCK_M, BLOCK_N)
-        
-        dot_out_3 = tl.dot(a_fp32, b_3_fp32, acc=None, out_dtype=tl.float32)
-        acc_3 += dot_out_3
+
+        # Dot natively via fp32 tensor cores (TF32) — fused accumulation
+        acc_1 = tl.dot(a_fp32, b_1_fp32, acc=acc_1, out_dtype=tl.float32)
+        acc_3 = tl.dot(a_fp32, b_3_fp32, acc=acc_3, out_dtype=tl.float32)
 
     # Epilogue: SwiGLU (Note: PyTorch baseline does silu(W3) * W1)
     sig_out = 1.0 / (1.0 + tl.exp(-acc_3))
     swiglu_out = (acc_3 * sig_out) * acc_1
     
-    # Store to C (store directly as fp32 to match eager precision exactly without bf16 mantissa clip)
+    # Store to C as fp32 (bf16 causes too much precision loss — 6/19 PASSED)
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     tl.store(c_ptrs, swiglu_out, mask=m_mask[:, None])
 
@@ -293,6 +315,10 @@ def _fused_moe_gemm1_swiglu_kernel(
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=4),
     ],
     key=['num_padded', 'N', 'K'],
     restore_value=['C_ptr'],
@@ -355,22 +381,25 @@ def _fused_moe_gemm2_scatter_kernel(
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
     safe_rm = tl.where(rm < num_padded, rm, 0)
+
+    # Hoist loop-invariant pointer bases outside K-loop (16 iterations)
+    a_base = A_ptr + safe_rm[:, None] * stride_am
+    b_base = B_ptr + expert_id * stride_be + rn[None, :] * stride_bn
+    b_scale_base = B_scale_ptr + expert_id * stride_bse + (rn[None, :] // 128) * stride_bsn
+
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
 
         # Load A: fp32 from Intermediate buffer
-        a_ptrs = A_ptr + safe_rm[:, None] * stride_am + rk[None, :] * stride_ak
-        a = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
+        a = tl.load(a_base + rk[None, :] * stride_ak, mask=m_mask[:, None], other=0.0)
 
-        # Load B: fp8, dequant to fp32
-        b_ptrs = B_ptr + expert_id * stride_be + rn[None, :] * stride_bn + rk[:, None] * stride_bk
-        b = tl.load(b_ptrs, mask=n_mask[None, :], other=0.0)
+        # Load B: fp8, dequant to fp32 (N=7168 always divisible by BLOCK_N, no mask needed)
+        b = tl.load(b_base + rk[:, None] * stride_bk)
 
-        b_scale_ptrs = B_scale_ptr + expert_id * stride_bse + (k // 128) * stride_bsk + (rn[None, :] // 128) * stride_bsn
-        b_scale = tl.load(b_scale_ptrs, mask=n_mask[None, :], other=0.0)
+        b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk)
         b_fp32 = b.to(tl.float32) * b_scale
 
-        acc += tl.dot(a, b_fp32, out_dtype=tl.float32)
+        acc = tl.dot(a, b_fp32, acc=acc, out_dtype=tl.float32)
         
     # Scale by routing weights
     out = acc * token_weights[:, None]
@@ -382,412 +411,6 @@ def _fused_moe_gemm2_scatter_kernel(
     
     # Triton atomic_add into FP32 buffer
     tl.atomic_add(c_ptrs, out.to(tl.float32), mask=valid_mask[:, None] & n_mask[None, :], sem='relaxed')
-
-# ═══════════════════════════════════════════════════════════════
-# Triton Kernel: Grouped GEMM (FP8 × FP8) with block-scale dequant
-# For GEMM1: hidden_states[T,H]fp8 × W13[E,4096,7168]fp8 → [EM,4096]
-# ═══════════════════════════════════════════════════════════════
-
-@triton.jit
-def _grouped_gemm_fp8_kernel(
-    # Data pointers
-    A_ptr,            # [T, K] fp8 (hidden_states)
-    B_ptr,            # [E, N, K] fp8 (weights)
-    C_ptr,            # [EM, N] output buffer
-    A_scale_ptr,      # [K//128, T] fp32 (transposed layout)
-    B_scale_ptr,      # [E, N//128, K//128] fp32
-    token_ids_ptr,    # [EM] sorted token indices
-    expert_ids_ptr,   # [num_M_blocks] expert per block
-    # Dimensions
-    T,                # NOT constexpr — varies per workload
-    K: tl.constexpr,
-    N: tl.constexpr,
-    # Strides for A [T, K]
-    stride_at, stride_ak,
-    # Strides for B [E, N, K]
-    stride_be, stride_bn, stride_bk,
-    # Strides for C [EM, N]
-    stride_cm, stride_cn,
-    # Strides for A_scale [K//128, T]
-    stride_as0, stride_as1,
-    # Strides for B_scale [E, N//128, K//128]
-    stride_bs0, stride_bs1, stride_bs2,
-    # Block sizes
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_pid_n: tl.constexpr = N // BLOCK_N
-    num_pid_m = tl.num_programs(0) // num_pid_n
-
-    # Grouped ordering for L2 reuse
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    # Load token indices for this M-block
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    token_ids = tl.load(token_ids_ptr + offs_m)
-    token_mask = token_ids < T
-
-    # Get expert for this block
-    expert_id = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-
-    # Offsets
-    offs_k = tl.arange(0, BLOCK_K)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    # A pointers: gather rows by token_ids. A[token_id, k]
-    a_ptrs = A_ptr + token_ids[:, None].to(tl.int64) * stride_at + offs_k[None, :] * stride_ak
-
-    # B pointers: B[expert].T accessed as B[expert, n, k] -> [K, N]
-    b_ptrs = (B_ptr + expert_id * stride_be
-              + offs_k[:, None] * stride_bk
-              + offs_n[None, :].to(tl.int64) * stride_bn)
-
-    # A_scale base: A_scale[k_block, token_id]
-    a_scale_base = A_scale_ptr + token_ids.to(tl.int64) * stride_as1
-
-    # B_scale base: B_scale[expert, n_block, k_block]
-    n_block_idx = pid_n  # BLOCK_N == QBLOCK assumed
-    b_scale_base = (B_scale_ptr + expert_id * stride_bs0
-                    + n_block_idx * stride_bs1)
-
-    # Accumulator
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    num_k_iters: tl.constexpr = K // BLOCK_K
-    for k in range(num_k_iters):
-        # Load FP8 data
-        a = tl.load(a_ptrs, mask=token_mask[:, None], other=0.0)
-        b = tl.load(b_ptrs)
-
-        # Load scales
-        a_scale = tl.load(a_scale_base + k * stride_as0,
-                          mask=token_mask, other=0.0)           # [BLOCK_M]
-        b_scale = tl.load(b_scale_base + k * stride_bs2)       # scalar
-
-        # Dequant fp8 → fp32 * scale → bf16 BEFORE dot
-        a_dequant = (a.to(tl.float32) * a_scale[:, None]).to(tl.bfloat16)
-        b_dequant = (b.to(tl.float32) * b_scale).to(tl.bfloat16)
-        acc += tl.dot(a_dequant, b_dequant)
-
-        # Advance pointers
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    # Store result as bf16
-    c_ptrs = (C_ptr + offs_m[:, None].to(tl.int64) * stride_cm
-              + offs_n[None, :].to(tl.int64) * stride_cn)
-    c_mask = token_mask[:, None] & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc.to(tl.bfloat16), mask=c_mask)
-
-
-# ═══════════════════════════════════════════════════════════════
-# Triton Kernel: SwiGLU
-# ═══════════════════════════════════════════════════════════════
-
-@triton.jit
-def _swiglu_kernel(
-    IN_ptr,      # [M, 2*I_SIZE] input (GEMM1 output)
-    OUT_ptr,     # [M, I_SIZE]   output
-    M,
-    I_SIZE: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_I: tl.constexpr,
-):
-    pid_m = tl.program_id(0)
-    pid_i = tl.program_id(1)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_i = pid_i * BLOCK_I + tl.arange(0, BLOCK_I)
-    mask = (offs_m[:, None] < M) & (offs_i[None, :] < I_SIZE)
-
-    stride_in = 2 * I_SIZE
-    # gate = IN[:, :I_SIZE],  up = IN[:, I_SIZE:]
-    gate = tl.load(IN_ptr + offs_m[:, None] * stride_in + offs_i[None, :],
-                   mask=mask, other=0.0).to(tl.float32)
-    up = tl.load(IN_ptr + offs_m[:, None] * stride_in + offs_i[None, :] + I_SIZE,
-                 mask=mask, other=0.0).to(tl.float32)
-
-    silu_up = up * tl.sigmoid(up)
-    result = silu_up * gate
-
-    tl.store(OUT_ptr + offs_m[:, None] * I_SIZE + offs_i[None, :],
-             result.to(tl.bfloat16), mask=mask)
-
-
-# ═══════════════════════════════════════════════════════════════
-# Triton Kernel: Grouped GEMM (BF16 × FP8) with weight block-scale
-# For GEMM2: swiglu_out[EM,2048]bf16 × W2[E,7168,2048]fp8 → [EM,7168]
-# ═══════════════════════════════════════════════════════════════
-
-@triton.jit
-def _grouped_gemm_bf16xfp8_kernel(
-    A_ptr,            # [EM, K] bf16 (SwiGLU output, contiguous)
-    B_ptr,            # [E, N, K] fp8 (weights)
-    C_ptr,            # [EM, N] output buffer
-    B_scale_ptr,      # [E, N//128, K//128] fp32
-    expert_ids_ptr,   # [num_M_blocks] expert per block
-    weights_ptr,      # [EM] routing weights (f32)
-    # Dimensions
-    EM,
-    K: tl.constexpr,
-    N: tl.constexpr,
-    # Strides for A [EM, K]
-    stride_am, stride_ak,
-    # Strides for B [E, N, K]
-    stride_be, stride_bn, stride_bk,
-    # Strides for C [EM, N]
-    stride_cm, stride_cn,
-    # Strides for B_scale [E, N//128, K//128]
-    stride_bs0, stride_bs1, stride_bs2,
-    # Block sizes
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    GROUP_SIZE_M: tl.constexpr,
-    MUL_WEIGHT: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    num_pid_m = tl.num_programs(0) // num_pid_n
-
-    # Grouped ordering for L2 reuse
-    num_pid_in_group = GROUP_SIZE_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_SIZE_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    # Row offsets (contiguous — no gather needed)
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    row_mask = offs_m < EM
-
-    # Expert for this block
-    expert_id = tl.load(expert_ids_ptr + pid_m).to(tl.int64)
-
-    offs_k = tl.arange(0, BLOCK_K)
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-
-    # A pointers: contiguous rows
-    a_ptrs = A_ptr + offs_m[:, None].to(tl.int64) * stride_am + offs_k[None, :] * stride_ak
-
-    # B pointers: B[expert].T → B[expert, n, k] read as [K, N]
-    b_ptrs = (B_ptr + expert_id * stride_be
-              + offs_k[:, None] * stride_bk
-              + offs_n[None, :].to(tl.int64) * stride_bn)
-
-    # B_scale base
-    n_block_idx = pid_n  # BLOCK_N == QBLOCK
-    b_scale_base = B_scale_ptr + expert_id * stride_bs0 + n_block_idx * stride_bs1
-
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-
-    num_k_blocks: tl.constexpr = K // BLOCK_K
-    for k in range(num_k_blocks):
-        a = tl.load(a_ptrs, mask=row_mask[:, None], other=0.0)
-        b = tl.load(b_ptrs)
-
-        b_scale = tl.load(b_scale_base + k * stride_bs2)
-
-        # Dequant FP8 weight to bf16 (fp8 -> fp32 * scale -> bf16 for dot)
-        b_dequant = (b.to(tl.float32) * b_scale).to(tl.bfloat16)
-        acc += tl.dot(a, b_dequant)
-
-        a_ptrs += BLOCK_K * stride_ak
-        b_ptrs += BLOCK_K * stride_bk
-
-    # Multiply by routing weight
-    if MUL_WEIGHT:
-        w = tl.load(weights_ptr + offs_m, mask=row_mask, other=0.0)
-        acc *= w[:, None]
-
-    c_ptrs = (C_ptr + offs_m[:, None].to(tl.int64) * stride_cm
-              + offs_n[None, :].to(tl.int64) * stride_cn)
-    c_mask = row_mask[:, None] & (offs_n[None, :] < N)
-    tl.store(c_ptrs, acc.to(tl.bfloat16), mask=c_mask)
-
-
-# ═══════════════════════════════════════════════════════════════
-# Per-expert compute: FP8 native matmul on B200
-# ═══════════════════════════════════════════════════════════════
-
-# ═══════════════════════════════════════════════════════════════
-# Triton Kernel 3: FULLY FUSED GEMM1 + SwiGLU + GEMM2
-# (Phase 3 Optimization: Zero Intermediate HBM Reads/Writes)
-# ═══════════════════════════════════════════════════════════════
-
-@triton.jit
-def _fully_fused_moe_kernel(
-    # Data pointers
-    A_ptr,            # [T, H] fp8 (hidden_states)
-    A_scale_ptr,      # [H//128, T] fp32 (hidden_states_scale)
-    B1_ptr,           # [E, N1, H] fp8 (W13 weights trans)
-    B1_scale_ptr,     # [E, N1//128, H//128] fp32 (W13 scales)
-    B2_ptr,           # [E, H, N1//2] fp8 (W2 weights trans)
-    B2_scale_ptr,     # [E, H//16, (N1//2)//128] fp32 (W2 scales)
-    C_ptr,            # [T, H] float32 (Output Accumulation Buffer)
-    token_weights_ptr,# [num_padded] fp32
-    token_ids_ptr,    # [num_padded] int64
-    expert_ids_ptr,   # [num_blocks] int32
-    
-    # Dimensions
-    T, num_padded: tl.constexpr, 
-    H: tl.constexpr, N1: tl.constexpr, N1_HALF: tl.constexpr,
-    
-    # Strides
-    stride_at, stride_ah,
-    stride_as0, stride_as1,
-    stride_b1e, stride_b1n, stride_b1h,
-    stride_b1se, stride_b1sn, stride_b1sh,
-    stride_b2e, stride_b2h, stride_b2n,
-    stride_b2se, stride_b2sh, stride_b2sn,
-    stride_ct, stride_ch,
-    
-    # Block sizes (Critical for SRAM limits)
-    BLOCK_M: tl.constexpr, BLOCK_N1: tl.constexpr, BLOCK_H: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    
-    num_pid_m = tl.cdiv(num_padded, BLOCK_M)
-    num_pid_h = tl.cdiv(H, BLOCK_H)
-    
-    pid_m = pid % num_pid_m
-    pid_h = pid // num_pid_m
-    
-    # Sorting upstream uses BLOCK_M=64 globally, but fully fused kernel runs at BLOCK_M=16
-    # So every 4 `pid_m` blocks belong to the same expert!
-    # To fetch the correct expert ID from `expert_ids_ptr` which is sized for BLOCK_M=64:
-    sorter_block_m = 64
-    stride_pid_m = sorter_block_m // BLOCK_M
-    expert_id = tl.load(expert_ids_ptr + (pid_m // stride_pid_m))
-    
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    m_mask = rm < num_padded
-    
-    # Safe bounds indexing
-    token_idx = tl.load(token_ids_ptr + rm, mask=m_mask, other=T)
-    safe_token_idx = tl.where(token_idx < T, token_idx, 0)
-    valid_mask = token_idx < T
-    token_weights = tl.load(token_weights_ptr + rm, mask=m_mask, other=0.0)
-
-    # ────────────────────────────────────────────────────────
-    # STAGE 1: Compute GEMM1 (A @ W13) directly into SRAM
-    # ────────────────────────────────────────────────────────
-    
-    # We must operate loop over H (7168) for A @ W13 
-    # Since we need the FULL SwiGLU activation [BLOCK_M, 2048] to multiply with W2,
-    # we must compute SwiGLU fully *before* starting GEMM2!
-    
-    # Since SwiGLU output is 2048, and B2 is [2048, 7168], 
-    # A single Triton block cannot easily `for h_out in range(0, 7168)` while re-computing 
-    # SwiGLU every time.
-    
-    # Let's use two loops:
-    # Outer Loop: computes SwiGLU outputs in blocks of size BLOCK_MID (e.g. 128)
-    # But wait, W2 expects the dot product across ALL 2048 SwiGLU outputs to produce 1 output channel.
-    # Therefore, we MUST compute ALL 2048 SwiGLU outputs and hold them in SRAM, OR we fuse the 
-    # loops by accumulating partial W2 dots as we stream SwiGLU outputs!
-    
-    # ────────────────────────────────────────────────────────
-    # STAGE 2: Compute Full GEMM1 -> SwiGLU -> partial GEMM2
-    # ────────────────────────────────────────────────────────
-    
-    # We output a slice of H (size BLOCK_H) per Triton thread block.
-    # Grid: (num_pid_m, num_pid_h)
-    
-    rh = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
-    h_mask = rh < H
-    
-    acc_out = tl.zeros((BLOCK_M, BLOCK_H), dtype=tl.float32)
-    
-    # We chunk the N1 dimension (4096) into BLOCK_N1 size to fit into SRAM
-    for n1_idx in range(0, N1_HALF, BLOCK_N1):
-        rn1 = n1_idx + tl.arange(0, BLOCK_N1)
-        rn1_3 = rn1 + N1_HALF
-        
-        acc_1 = tl.zeros((BLOCK_M, BLOCK_N1), dtype=tl.float32)
-        acc_3 = tl.zeros((BLOCK_M, BLOCK_N1), dtype=tl.float32)
-        
-        # Inner loop over H (7168) for A @ W13 in this specific N1 slice
-        for h_in in range(0, H, BLOCK_H):
-            rh_in = h_in + tl.arange(0, BLOCK_H)
-            
-            # Load A
-            a_ptrs = A_ptr + safe_token_idx[:, None] * stride_at + rh_in[None, :] * stride_ah
-            a = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
-            a_scale_ptrs = A_scale_ptr + (h_in // 128) * stride_as0 + safe_token_idx[:, None] * stride_as1
-            a_scale = tl.load(a_scale_ptrs, mask=m_mask[:, None], other=0.0)
-            a_fp32 = a.to(tl.float32) * a_scale
-            
-            # Load B1 (W1)
-            b1_ptrs_1 = B1_ptr + expert_id * stride_b1e + rn1[None, :] * stride_b1n + rh_in[:, None] * stride_b1h
-            b1_1 = tl.load(b1_ptrs_1)
-            b1_scale_ptrs_1 = B1_scale_ptr + expert_id * stride_b1se + (rn1[None, :] // 128) * stride_b1sn + ((h_in + tl.arange(0, BLOCK_H))[:, None] // 128) * stride_b1sh
-            b1_scale_1 = tl.load(b1_scale_ptrs_1) # [BLOCK_H, BLOCK_N1]
-            b1_1_fp32 = b1_1.to(tl.float32) * b1_scale_1
-            
-            # Load B1 (W3)
-            b1_ptrs_3 = B1_ptr + expert_id * stride_b1e + rn1_3[None, :] * stride_b1n + rh_in[:, None] * stride_b1h
-            b1_3 = tl.load(b1_ptrs_3)
-            b1_scale_ptrs_3 = B1_scale_ptr + expert_id * stride_b1se + (rn1_3[None, :] // 128) * stride_b1sn + ((h_in + tl.arange(0, BLOCK_H))[:, None] // 128) * stride_b1sh
-            b1_scale_3 = tl.load(b1_scale_ptrs_3) # [BLOCK_H, BLOCK_N1]
-            b1_3_fp32 = b1_3.to(tl.float32) * b1_scale_3
-            
-            a_dequant = a_fp32.to(tl.bfloat16)
-            b1_1_dequant = b1_1_fp32.to(tl.bfloat16)
-            b1_3_dequant = b1_3_fp32.to(tl.bfloat16)
-            acc_1 += tl.dot(a_dequant, b1_1_dequant, out_dtype=tl.float32)
-            acc_3 += tl.dot(a_dequant, b1_3_dequant, out_dtype=tl.float32)
-
-        # Apply SwiGLU over the computed block
-        sig_out = 1.0 / (1.0 + tl.exp(-acc_3))
-        swiglu_out = (acc_3 * sig_out) * acc_1 # [BLOCK_M, BLOCK_N1]
-        
-        # Immediately multiply this SwiGLU chunk with its counterpart in W2!
-        # W2 is [2048, 7168], so we load W2[rn1, rh]
-        # Wait, GEMM2 input is `swiglu_out` [BLOCK_M, BLOCK_N1]. 
-        # B2 is W2 transposed -> loaded as [H, N1//2]
-        
-        # Here we dot `[BLOCK_M, BLOCK_N1]` with `W2^T [BLOCK_N1, BLOCK_H]`.
-        # Transpose B2 memory fetch mapping: B2 is [H, N1//2]
-        # We need it as [N1//2, H] logically
-        # B2 is initially [E, 7168, 2048]. 
-        # So we fetch `[rh, rn1]` from B2. 
-        # Wait, GEMM1's loops were over H, so `rh` is the `H` dimension (7168). `rn1` is `N_OUT` (2048).
-        # We need b2_fp32 as `[BLOCK_N1, BLOCK_H]` to multiply `swiglu_out` which is `[BLOCK_M, BLOCK_N1]`.
-        # That means `tl.load` of B2 must be fetched as `[rn1[:, None], rh[None, :]]`.
-        
-        n1_mask = rn1 < N1_HALF
-        
-        b2_ptrs = B2_ptr + expert_id * stride_b2e + rh[None, :] * stride_b2h + rn1[:, None] * stride_b2n
-        b2_mask = h_mask[None, :] & n1_mask[:, None]
-        b2 = tl.load(b2_ptrs, mask=b2_mask, other=0.0)
-        
-        # B2_scale is [E, 56, 16] -> [E, H//128, N_OUT//128]
-        # We load it as [rn1, 1] to match b2
-        b2_scale_ptrs = B2_scale_ptr + expert_id * stride_b2se + ((pid_h * BLOCK_H) // 128) * stride_b2sh + (rn1[:, None] // 128) * stride_b2sn
-        b2_scale_mask = n1_mask[:, None]
-        b2_scale = tl.load(b2_scale_ptrs, mask=b2_scale_mask, other=0.0)
-        
-        b2_fp32 = b2.to(tl.float32) * b2_scale
-        
-        swiglu_bf16 = swiglu_out.to(tl.bfloat16)
-        b2_dequant = b2_fp32.to(tl.bfloat16)
-        acc_out += tl.dot(swiglu_bf16, b2_dequant, out_dtype=tl.float32)
-
-    # Scale by routing weight
-    acc_out *= token_weights[:, None]
-    
-    # Store atomically to output
-    c_ptrs = C_ptr + safe_token_idx[:, None] * stride_ct + rh[None, :] * stride_ch
-    tl.atomic_add(c_ptrs, acc_out, mask=valid_mask[:, None] & h_mask[None, :], sem='relaxed')
 
 @torch.no_grad()
 def kernel(
