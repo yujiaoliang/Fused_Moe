@@ -286,16 +286,16 @@ def _fused_moe_gemm1_swiglu_kernel(
         # Load B scale for W3: fp32 [1, BLOCK_N]
         b_scale_3 = tl.load(b_scale_base_3 + (k // 128) * stride_bsh)
 
-        # Cast A to fp32 and scale directly
-        a_fp32 = a.to(tl.float32) * a_scale[:, None]
+        # Native FP8 tensor cores — 2x throughput vs TF32 on Blackwell
+        partial_1 = tl.dot(a, b_1, out_dtype=tl.float32)
+        partial_3 = tl.dot(a, b_3, out_dtype=tl.float32)
 
-        # Scale B natively in fp32
-        b_1_fp32 = b_1.to(tl.float32) * b_scale_1
-        b_3_fp32 = b_3.to(tl.float32) * b_scale_3
-
-        # Dot natively via fp32 tensor cores (TF32) — fused accumulation
-        acc_1 = tl.dot(a_fp32, b_1_fp32, acc=acc_1, out_dtype=tl.float32)
-        acc_3 = tl.dot(a_fp32, b_3_fp32, acc=acc_3, out_dtype=tl.float32)
+        # Post-dot scale: BLOCK_K == QBLOCK so scales are constant within each dot
+        # (a * a_scale) @ (b * b_scale) = (a_scale ⊗ b_scale) * (a @ b)
+        scale_1 = a_scale[:, None] * b_scale_1
+        scale_3 = a_scale[:, None] * b_scale_3
+        acc_1 += partial_1 * scale_1
+        acc_3 += partial_3 * scale_3
 
     # Epilogue: SwiGLU (Note: PyTorch baseline does silu(W3) * W1)
     sig_out = 1.0 / (1.0 + tl.exp(-acc_3))
