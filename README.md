@@ -2,7 +2,7 @@
 
 > **赛道:** Track A — Fused MoE
 > **目标硬件:** NVIDIA B200 (Blackwell, sm100)
-> **当前状态:** ✅ 19/19 PASSED｜最高 **10.26x** 加速｜large-T **4.0-4.5x**｜平均 **~6.9x**
+> **当前状态:** ✅ 19/19 PASSED｜最高 **11.45x** 加速｜large-T **4.0-4.5x**｜平均 **~7.7x**
 
 ---
 
@@ -18,29 +18,29 @@
 
 ### B200 Benchmark 结果（最新）
 
-Round 3 优化：hybrid CPU/GPU token sorting（<1024 tokens 走 CPU 快速路径）、K-loop pointer hoisting、routing in-place ops。Peak 从 Round 2 的 8.8x 恢复至 10.26x，1a4c6ba1 从 1.35x 跃升至 8.26x。
+Round 4 优化：routing gather-first 简化（[T,8] 替代 [T,256] 上的 normalize）、bool group mask、pre-allocated pad buffers、移除冗余 `.to(tl.float32)` cast。Peak 从 10.26x 提升至 11.45x，平均从 ~6.9x 提升至 ~7.7x。
 
-| Workload | Round 1 | Round 3 | 备注 |
-|----------|---------|---------|------|
-| e05c6c03 (T=14) | 12.90x | **10.26x** | hybrid sort 恢复 peak |
-| 2e69caee | 12.21x | **9.40x** | |
-| b8f4f012 (T=7) | 12.02x | **8.18x** | |
-| 1a4c6ba1 | 1.35x | **8.26x** | 🔥 hybrid sort 大幅提升 |
-| 8cba5890 | 10.14x | **7.60x** | |
-| a7c2bcfd (T=128)| 10.00x | **7.63x** | |
-| 5eadab1e | 10.06x | **7.26x** | |
-| f7d6ac7c | 9.60x | **7.10x** | |
-| 6230e838 | 8.97x | **6.39x** | |
-| e626d3e6 | 9.18x | **6.46x** | |
-| eedc63b2 | 9.30x | **6.40x** | |
-| 81955b1e | 8.94x | **6.39x** | |
-| 76010cb4 | 8.76x | **6.38x** | |
-| 74d7ff04 | 9.02x | **6.31x** | |
-| fc378037 | 9.02x | **6.29x** | |
-| 4822167c | 8.75x | **6.20x** | |
-| 8f1ff9f1 | 8.80x | **5.92x** | |
-| 58a34f27 (T=4096)| 4.14x | **4.46x** | large-T 提升 |
-| 5e8dc11c (T=4096)| 3.69x | **4.01x** | large-T 提升 |
+| Workload | Round 1 | Round 3 | Round 4 | 备注 |
+|----------|---------|---------|---------|------|
+| e05c6c03 (T=14) | 12.90x | 10.26x | **11.45x** | 🔥 routing 简化 +1.2x |
+| b8f4f012 (T=7) | 12.02x | 8.18x | **10.00x** | |
+| 8cba5890 | 10.14x | 7.60x | **9.66x** | |
+| 2e69caee | 12.21x | 9.40x | **9.53x** | |
+| a7c2bcfd (T=128)| 10.00x | 7.63x | **8.87x** | |
+| f7d6ac7c | 9.60x | 7.10x | **8.54x** | |
+| 1a4c6ba1 | 1.35x | 8.26x | **8.47x** | |
+| 5eadab1e | 10.06x | 7.26x | **8.22x** | |
+| fc378037 | 9.02x | 6.29x | **7.58x** | |
+| e626d3e6 | 9.18x | 6.46x | **7.49x** | |
+| eedc63b2 | 9.30x | 6.40x | **7.38x** | |
+| 4822167c | 8.75x | 6.20x | **7.35x** | |
+| 74d7ff04 | 9.02x | 6.31x | **7.35x** | |
+| 76010cb4 | 8.76x | 6.38x | **7.31x** | |
+| 81955b1e | 8.94x | 6.39x | **7.18x** | |
+| 6230e838 | 8.97x | 6.39x | **7.16x** | |
+| 8f1ff9f1 | 8.80x | 5.92x | **7.10x** | |
+| 58a34f27 (T=4096)| 4.14x | 4.46x | **4.45x** | large-T（kernel-bound） |
+| 5e8dc11c (T=4096)| 3.69x | 4.01x | **3.99x** | large-T（kernel-bound） |
 
 ---
 
@@ -197,6 +197,10 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 - [x] **GPU Token Sorting** — vectorized cumsum + scatter，单次 `.item()` sync（大 T 提升但小 T 回退）
 - [x] **Extended Autotune** — GEMM1 +3 configs (stages=5,2), GEMM2 +4 configs (BLOCK_N=256, stages=2-4)
 - [x] **fp32 Intermediate** — bf16 SwiGLU output 精度不足（6/19 PASSED），改用 fp32
+- [x] **Routing gather-first** — 先 gather [T,8]，再 normalize on [T,8] 替代 [T,256] 上的 mask+mul+div+gather（最大提升 +1.2x）
+- [x] **Bool group mask** — `dtype=torch.bool` + `~s_mask` 避免 float→bool 临时 tensor 分配
+- [x] **Pre-allocated pad buffers** — CPU sorting path 中单次 `torch.full`/`torch.zeros` 替代每 expert 分配
+- [x] **移除冗余 cast** — GEMM2 `atomic_add` 中 `.to(tl.float32)` 已冗余（out 本身即 fp32）
 
 ### 🟡 P1: 进一步优化
 

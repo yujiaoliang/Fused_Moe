@@ -54,22 +54,18 @@ def ds_routing(logits, bias, scale_factor):
 
     _, g_idx = torch.topk(g_scores, k=TOPK_GROUP, dim=1,
                           largest=True, sorted=False)
-    g_mask = torch.zeros_like(g_scores)
-    g_mask.scatter_(1, g_idx, 1.0)
+    g_mask = torch.zeros(T, N_GROUP, dtype=torch.bool, device=logits.device)
+    g_mask.scatter_(1, g_idx, True)
     s_mask = g_mask.unsqueeze(2).expand(T, N_GROUP, gs).reshape(T, E_GLOBAL)
 
     neg_inf = torch.finfo(torch.float32).min
-    sb.masked_fill_(s_mask == 0, neg_inf)
+    sb.masked_fill_(~s_mask, neg_inf)
     _, topk_idx = torch.topk(sb, k=TOP_K, dim=1,
                              largest=True, sorted=False)       # [T, 8]
 
-    # Weights from s (without bias), normalized — in-place to reduce allocations
-    m = torch.zeros_like(s)
-    m.scatter_(1, topk_idx, 1.0)
-    s.mul_(m)
-    s.div_(s.sum(dim=1, keepdim=True) + 1e-20)
-    s.mul_(scale_factor)
-    topk_weights = torch.gather(s, 1, topk_idx)               # [T, 8]
+    # Gather first, normalize on [T, 8] instead of [T, 256] — 32x fewer elements
+    topk_s = torch.gather(s, 1, topk_idx)                      # [T, 8]
+    topk_weights = topk_s / (topk_s.sum(dim=1, keepdim=True) + 1e-20) * scale_factor
 
     return topk_idx, topk_weights
 
@@ -118,6 +114,11 @@ def moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device):
         # CPU path: single .cpu().tolist() sync + fast Python loop
         # Faster for small T (covers T≤128, 16/19 workloads) — avoids ~25 GPU kernel launches
         counts_cpu = counts.cpu().tolist()
+        # Pre-allocate padding buffers to avoid per-expert torch.full/torch.zeros
+        max_padding = E_LOCAL * BLOCK_M  # worst case
+        pad_token_buf = torch.full((max_padding,), T, device=device, dtype=torch.int64)
+        pad_weight_buf = torch.zeros(max_padding, device=device)
+        pad_offset = 0
         padded_tokens_list = []
         padded_weights_list = []
         block_experts_list = []
@@ -131,8 +132,9 @@ def moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device):
             padded_tokens_list.append(loc_tokens[offset:offset + cnt])
             padded_weights_list.append(loc_weights[offset:offset + cnt])
             if pad_cnt > 0:
-                padded_tokens_list.append(torch.full((pad_cnt,), T, device=device, dtype=torch.int64))
-                padded_weights_list.append(torch.zeros(pad_cnt, device=device))
+                padded_tokens_list.append(pad_token_buf[pad_offset:pad_offset + pad_cnt])
+                padded_weights_list.append(pad_weight_buf[pad_offset:pad_offset + pad_cnt])
+                pad_offset += pad_cnt
             block_experts_list.extend([e] * num_blocks)
             offset += cnt
         sorted_token_ids = torch.cat(padded_tokens_list)
@@ -410,7 +412,7 @@ def _fused_moe_gemm2_scatter_kernel(
     c_ptrs = C_ptr + safe_token_idx[:, None] * stride_ct + rn[None, :] * stride_cn
     
     # Triton atomic_add into FP32 buffer
-    tl.atomic_add(c_ptrs, out.to(tl.float32), mask=valid_mask[:, None] & n_mask[None, :], sem='relaxed')
+    tl.atomic_add(c_ptrs, out, mask=valid_mask[:, None] & n_mask[None, :], sem='relaxed')
 
 @torch.no_grad()
 def kernel(
