@@ -330,8 +330,8 @@ def _fused_moe_gemm2_scatter_kernel(
     # Data pointers
     A_ptr,            # [num_padded, K] fp32 (intermediate SwiGLU output)
     B_ptr,            # [E, N, K] fp8 (W2 weights trans)
-    C_ptr,            # [T, N] bf16 (final output tensor, modified in place)
-    B_scale_ptr,      # [E, N//16, K//128] fp32 (W2 block scales)
+    C_ptr,            # [T, N] fp32 (output accumulation buffer)
+    B_scale_ptr,      # [E, N//128, K//128] fp32 (W2 block scales)
     token_weights_ptr,# [num_padded] fp32 (routing weights for each slot)
     token_ids_ptr,    # [num_padded] int64 (original token indices to scatter to)
     expert_ids_ptr,   # [num_blocks] int32 (expert for each M-block)
@@ -449,8 +449,7 @@ def kernel(
 
     # ── 3. Fused GEMM1 + SwiGLU ──
     # W13 is [E, 4096, 7168], N=4096, K=7168
-    # SwiGLU outputs N_OUT=2048. Zero allocated to prevent uninitialized padding NaNs.
-    # Allocate as float32 to prevent bf16 mantissa clip from failing exact bench match
+    # SwiGLU outputs N_OUT=2048 as fp32 (bf16 precision insufficient — 6/19 PASSED)
     Intermediate = torch.empty((num_padded, 2048), dtype=torch.float32, device=device)
     
     grid1 = lambda META: (triton.cdiv(num_padded, META['BLOCK_M']) * triton.cdiv(2048, META['BLOCK_N']),)
@@ -472,8 +471,8 @@ def kernel(
     )
 
     # ── 4. Fused GEMM2 + Scatter Add ──
-    # Intermediate is [num_padded, 2048]
-    # W2 is [E, 7168, 2048]
+    # Intermediate is [num_padded, 2048] fp32
+    # W2 is [E, 7168, 2048] fp8
     # We scatter add directly to output [T, 7168]
     
     grid2 = lambda META: (triton.cdiv(num_padded, META['BLOCK_M']) * triton.cdiv(7168, META['BLOCK_N']),)
