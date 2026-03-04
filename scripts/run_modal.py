@@ -123,11 +123,11 @@ def main():
     import subprocess
     import json
 
-    print("Packing solution from source files...")
-    subprocess.run(
-        [sys.executable, str(PROJECT_ROOT / "scripts" / "pack_solution_simple.py")],
-        cwd=str(PROJECT_ROOT), check=True,
-    )
+    print("Packing solution manually bypassed! Already packed.")
+    # subprocess.run(
+    #     [sys.executable, str(PROJECT_ROOT / "scripts" / "pack_solution_simple.py")],
+    #     cwd=str(PROJECT_ROOT), check=True,
+    # )
 
     solution_path = PROJECT_ROOT / "solution.json"
     print("\nLoading solution...")

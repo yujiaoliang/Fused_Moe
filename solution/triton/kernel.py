@@ -611,8 +611,175 @@ def _grouped_gemm_bf16xfp8_kernel(
 # ═══════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════
-# Entry Point
+# Triton Kernel 3: FULLY FUSED GEMM1 + SwiGLU + GEMM2
+# (Phase 3 Optimization: Zero Intermediate HBM Reads/Writes)
 # ═══════════════════════════════════════════════════════════════
+
+@triton.jit
+def _fully_fused_moe_kernel(
+    # Data pointers
+    A_ptr,            # [T, H] fp8 (hidden_states)
+    A_scale_ptr,      # [H//128, T] fp32 (hidden_states_scale)
+    B1_ptr,           # [E, N1, H] fp8 (W13 weights trans)
+    B1_scale_ptr,     # [E, N1//128, H//128] fp32 (W13 scales)
+    B2_ptr,           # [E, H, N1//2] fp8 (W2 weights trans)
+    B2_scale_ptr,     # [E, H//16, (N1//2)//128] fp32 (W2 scales)
+    C_ptr,            # [T, H] float32 (Output Accumulation Buffer)
+    token_weights_ptr,# [num_padded] fp32
+    token_ids_ptr,    # [num_padded] int64
+    expert_ids_ptr,   # [num_blocks] int32
+    
+    # Dimensions
+    T, num_padded: tl.constexpr, 
+    H: tl.constexpr, N1: tl.constexpr, N1_HALF: tl.constexpr,
+    
+    # Strides
+    stride_at, stride_ah,
+    stride_as0, stride_as1,
+    stride_b1e, stride_b1n, stride_b1h,
+    stride_b1se, stride_b1sn, stride_b1sh,
+    stride_b2e, stride_b2h, stride_b2n,
+    stride_b2se, stride_b2sh, stride_b2sn,
+    stride_ct, stride_ch,
+    
+    # Block sizes (Critical for SRAM limits)
+    BLOCK_M: tl.constexpr, BLOCK_N1: tl.constexpr, BLOCK_H: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    
+    num_pid_m = tl.cdiv(num_padded, BLOCK_M)
+    num_pid_h = tl.cdiv(H, BLOCK_H)
+    
+    pid_m = pid % num_pid_m
+    pid_h = pid // num_pid_m
+    
+    # Sorting upstream uses BLOCK_M=64 globally, but fully fused kernel runs at BLOCK_M=16
+    # So every 4 `pid_m` blocks belong to the same expert!
+    # To fetch the correct expert ID from `expert_ids_ptr` which is sized for BLOCK_M=64:
+    sorter_block_m = 64
+    stride_pid_m = sorter_block_m // BLOCK_M
+    expert_id = tl.load(expert_ids_ptr + (pid_m // stride_pid_m))
+    
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    m_mask = rm < num_padded
+    
+    # Safe bounds indexing
+    token_idx = tl.load(token_ids_ptr + rm, mask=m_mask, other=T)
+    safe_token_idx = tl.where(token_idx < T, token_idx, 0)
+    valid_mask = token_idx < T
+    token_weights = tl.load(token_weights_ptr + rm, mask=m_mask, other=0.0)
+
+    # ────────────────────────────────────────────────────────
+    # STAGE 1: Compute GEMM1 (A @ W13) directly into SRAM
+    # ────────────────────────────────────────────────────────
+    
+    # We must operate loop over H (7168) for A @ W13 
+    # Since we need the FULL SwiGLU activation [BLOCK_M, 2048] to multiply with W2,
+    # we must compute SwiGLU fully *before* starting GEMM2!
+    
+    # Since SwiGLU output is 2048, and B2 is [2048, 7168], 
+    # A single Triton block cannot easily `for h_out in range(0, 7168)` while re-computing 
+    # SwiGLU every time.
+    
+    # Let's use two loops:
+    # Outer Loop: computes SwiGLU outputs in blocks of size BLOCK_MID (e.g. 128)
+    # But wait, W2 expects the dot product across ALL 2048 SwiGLU outputs to produce 1 output channel.
+    # Therefore, we MUST compute ALL 2048 SwiGLU outputs and hold them in SRAM, OR we fuse the 
+    # loops by accumulating partial W2 dots as we stream SwiGLU outputs!
+    
+    # ────────────────────────────────────────────────────────
+    # STAGE 2: Compute Full GEMM1 -> SwiGLU -> partial GEMM2
+    # ────────────────────────────────────────────────────────
+    
+    # We output a slice of H (size BLOCK_H) per Triton thread block.
+    # Grid: (num_pid_m, num_pid_h)
+    
+    rh = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+    h_mask = rh < H
+    
+    acc_out = tl.zeros((BLOCK_M, BLOCK_H), dtype=tl.float32)
+    
+    # We chunk the N1 dimension (4096) into BLOCK_N1 size to fit into SRAM
+    for n1_idx in range(0, N1_HALF, BLOCK_N1):
+        rn1 = n1_idx + tl.arange(0, BLOCK_N1)
+        rn1_3 = rn1 + N1_HALF
+        
+        acc_1 = tl.zeros((BLOCK_M, BLOCK_N1), dtype=tl.float32)
+        acc_3 = tl.zeros((BLOCK_M, BLOCK_N1), dtype=tl.float32)
+        
+        # Inner loop over H (7168) for A @ W13 in this specific N1 slice
+        for h_in in range(0, H, BLOCK_H):
+            rh_in = h_in + tl.arange(0, BLOCK_H)
+            
+            # Load A
+            a_ptrs = A_ptr + safe_token_idx[:, None] * stride_at + rh_in[None, :] * stride_ah
+            a = tl.load(a_ptrs, mask=m_mask[:, None], other=0.0)
+            a_scale_ptrs = A_scale_ptr + (h_in // 128) * stride_as0 + safe_token_idx[:, None] * stride_as1
+            a_scale = tl.load(a_scale_ptrs, mask=m_mask[:, None], other=0.0)
+            a_fp32 = a.to(tl.float32) * a_scale
+            
+            # Load B1 (W1)
+            b1_ptrs_1 = B1_ptr + expert_id * stride_b1e + rn1[None, :] * stride_b1n + rh_in[:, None] * stride_b1h
+            b1_1 = tl.load(b1_ptrs_1)
+            b1_scale_ptrs_1 = B1_scale_ptr + expert_id * stride_b1se + (rn1[None, :] // 128) * stride_b1sn + ((h_in + tl.arange(0, BLOCK_H))[:, None] // 128) * stride_b1sh
+            b1_scale_1 = tl.load(b1_scale_ptrs_1) # [BLOCK_H, BLOCK_N1]
+            b1_1_fp32 = b1_1.to(tl.float32) * b1_scale_1
+            
+            # Load B1 (W3)
+            b1_ptrs_3 = B1_ptr + expert_id * stride_b1e + rn1_3[None, :] * stride_b1n + rh_in[:, None] * stride_b1h
+            b1_3 = tl.load(b1_ptrs_3)
+            b1_scale_ptrs_3 = B1_scale_ptr + expert_id * stride_b1se + (rn1_3[None, :] // 128) * stride_b1sn + ((h_in + tl.arange(0, BLOCK_H))[:, None] // 128) * stride_b1sh
+            b1_scale_3 = tl.load(b1_scale_ptrs_3) # [BLOCK_H, BLOCK_N1]
+            b1_3_fp32 = b1_3.to(tl.float32) * b1_scale_3
+            
+            a_dequant = a_fp32.to(tl.bfloat16)
+            b1_1_dequant = b1_1_fp32.to(tl.bfloat16)
+            b1_3_dequant = b1_3_fp32.to(tl.bfloat16)
+            acc_1 += tl.dot(a_dequant, b1_1_dequant, out_dtype=tl.float32)
+            acc_3 += tl.dot(a_dequant, b1_3_dequant, out_dtype=tl.float32)
+
+        # Apply SwiGLU over the computed block
+        sig_out = 1.0 / (1.0 + tl.exp(-acc_3))
+        swiglu_out = (acc_3 * sig_out) * acc_1 # [BLOCK_M, BLOCK_N1]
+        
+        # Immediately multiply this SwiGLU chunk with its counterpart in W2!
+        # W2 is [2048, 7168], so we load W2[rn1, rh]
+        # Wait, GEMM2 input is `swiglu_out` [BLOCK_M, BLOCK_N1]. 
+        # B2 is W2 transposed -> loaded as [H, N1//2]
+        
+        # Here we dot `[BLOCK_M, BLOCK_N1]` with `W2^T [BLOCK_N1, BLOCK_H]`.
+        # Transpose B2 memory fetch mapping: B2 is [H, N1//2]
+        # We need it as [N1//2, H] logically
+        # B2 is initially [E, 7168, 2048]. 
+        # So we fetch `[rh, rn1]` from B2. 
+        # Wait, GEMM1's loops were over H, so `rh` is the `H` dimension (7168). `rn1` is `N_OUT` (2048).
+        # We need b2_fp32 as `[BLOCK_N1, BLOCK_H]` to multiply `swiglu_out` which is `[BLOCK_M, BLOCK_N1]`.
+        # That means `tl.load` of B2 must be fetched as `[rn1[:, None], rh[None, :]]`.
+        
+        n1_mask = rn1 < N1_HALF
+        
+        b2_ptrs = B2_ptr + expert_id * stride_b2e + rh[None, :] * stride_b2h + rn1[:, None] * stride_b2n
+        b2_mask = h_mask[None, :] & n1_mask[:, None]
+        b2 = tl.load(b2_ptrs, mask=b2_mask, other=0.0)
+        
+        # B2_scale is [E, 56, 16] -> [E, H//128, N_OUT//128]
+        # We load it as [rn1, 1] to match b2
+        b2_scale_ptrs = B2_scale_ptr + expert_id * stride_b2se + ((pid_h * BLOCK_H) // 128) * stride_b2sh + (rn1[:, None] // 128) * stride_b2sn
+        b2_scale_mask = n1_mask[:, None]
+        b2_scale = tl.load(b2_scale_ptrs, mask=b2_scale_mask, other=0.0)
+        
+        b2_fp32 = b2.to(tl.float32) * b2_scale
+        
+        swiglu_bf16 = swiglu_out.to(tl.bfloat16)
+        b2_dequant = b2_fp32.to(tl.bfloat16)
+        acc_out += tl.dot(swiglu_bf16, b2_dequant, out_dtype=tl.float32)
+
+    # Scale by routing weight
+    acc_out *= token_weights[:, None]
+    
+    # Store atomically to output
+    c_ptrs = C_ptr + safe_token_idx[:, None] * stride_ct + rh[None, :] * stride_ch
+    tl.atomic_add(c_ptrs, acc_out, mask=valid_mask[:, None] & h_mask[None, :], sem='relaxed')
 
 @torch.no_grad()
 def kernel(
@@ -631,7 +798,6 @@ def kernel(
     T = routing_logits.shape[0]
     device = hidden_states.device
     local_start = int(local_expert_offset)
-
     # ── 1. Routing ──
     topk_idx, topk_weights = ds_routing(
         routing_logits, routing_bias, float(routed_scaling_factor)
@@ -650,8 +816,8 @@ def kernel(
 
     # ── 3. Fused GEMM1 + SwiGLU ──
     # W13 is [E, 4096, 7168], N=4096, K=7168
-    # But SwiGLU outputs N_OUT=2048. Zero allocated to prevent uninitialized padding NaNs.
-    # We allocate as float32 to prevent 7-bit quantization from failing exact bench match
+    # SwiGLU outputs N_OUT=2048. Zero allocated to prevent uninitialized padding NaNs.
+    # Allocate as float32 to prevent bf16 mantissa clip from failing exact bench match
     Intermediate = torch.zeros((num_padded, 2048), dtype=torch.float32, device=device)
     
     BLOCK_M_1 = 64

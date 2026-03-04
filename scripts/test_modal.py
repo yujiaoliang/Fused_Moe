@@ -99,11 +99,11 @@ def main():
     import subprocess
 
     # Pack solution
-    print("Packing solution...")
-    subprocess.run(
-        [sys.executable, str(PROJECT_ROOT / "scripts" / "pack_solution_simple.py")],
-        cwd=str(PROJECT_ROOT), check=True,
-    )
+    print("Packing solution manually bypassed! Already packed.")
+    # subprocess.run(
+    #     [sys.executable, str(PROJECT_ROOT / "scripts" / "pack_solution_simple.py")],
+    #     cwd=str(PROJECT_ROOT), check=True,
+    # )
 
     solution_path = PROJECT_ROOT / "solution.json"
     solution_json = solution_path.read_text(encoding="utf-8")
@@ -113,3 +113,7 @@ def main():
     result = run_test.remote(solution_json)
     print("\n=== FULL RESULTS ===")
     print(result)
+
+if __name__ == "__main__":
+    with app.run():
+        main()

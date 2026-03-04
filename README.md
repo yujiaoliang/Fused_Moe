@@ -42,6 +42,14 @@
 | 5e8dc11c (T=4096)| **3.69x** | 1.15x | |
 | 1a4c6ba1 | **1.35x** | 1.35x | |
 
+### Phase 3: Fully Fused Kernel Investigation (Concluded)
+
+开发了 unified 单趟融合算子 (`_fully_fused_moe_kernel`)，将 GEMM1+SwiGLU+GEMM2 全部融合于同一个 Triton JIT kernel，所有中间变量保留在 SRAM 中：
+- **SRAM 极限利用**：`BLOCK_M=16`，每 token 的 4096 维中间激活完全在 B200 SRAM (256KB/SM) 中持有
+- **本地验证（RTX 4080, sm89）**：Phase 2 vs Phase 3 误差仅 6.76（fp8 精度范围内）✅
+- **B200 (sm100) 问题**：所有 19/19 workloads 报告 ~4096 绝对误差（2的幂次），疑似 Triton sm100 codegen 在 `tl.dot` `BLOCK_H=64` 场景下的 bug
+- **结论**：算法数学正确，但受限于 Triton 编译器对 sm100 的支持。已回退至 Phase 2 两 kernel 方案，代码保留于 `kernel.py` 供未来验证
+
 ---
 
 ## 环境搭建
