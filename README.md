@@ -2,7 +2,7 @@
 
 > **赛道:** Track A — Fused MoE
 > **目标硬件:** NVIDIA B200 (Blackwell, sm100)
-> **当前状态:** ✅ 19/19 PASSED｜最高 **12.14x** 加速｜large-T **7.0-7.4x**｜平均 **~10.1x**
+> **当前状态:** ✅ 19/19 PASSED｜最高 **12.56x** 加速｜large-T **6.8-7.3x**｜平均 **~10.2x**
 
 ---
 
@@ -18,29 +18,29 @@
 
 ### B200 Benchmark 结果（最新）
 
-Round 6 优化：GEMM2 中使用 post-dot B-scale（`tl.dot(a, b.to(f32))` + `acc += partial * b_scale`），消除 [BLOCK_K, BLOCK_N] dequant 乘法，替换为更小的 [BLOCK_M, BLOCK_N] post-dot scale。扩展 autotune 配置（GEMM1 增加 BLOCK_N=256，GEMM2 增加更高 num_stages + BLOCK_N=256）。中等规模 workload 提升 ~0.3-0.8x，平均从 ~9.6x 提升至 ~10.1x。
+Round 7 优化：`torch.compile(mode="reduce-overhead", dynamic=True)` 融合 routing ~14 个 PyTorch ops 的 dispatch overhead。Pre-allocated `output_fp32` buffer cache。CUDA Graph 尝试后回退（见下方分析）。平均 ~10.2x（在噪声范围内微小提升）。
 
-| Workload | Round 1 | Round 5 | Round 6 | 备注 |
-|----------|---------|---------|---------|------|
-| e05c6c03 (T=14) | 12.90x | 11.91x | **12.14x** | 🔥 peak |
-| 2e69caee | 12.21x | 11.54x | **11.97x** | +0.4x |
-| 1a4c6ba1 | 1.35x | 10.80x | **11.34x** | +0.5x |
-| b8f4f012 (T=7) | 12.02x | 10.93x | **11.06x** | |
-| a7c2bcfd (T=128)| 10.00x | 10.00x | **10.84x** | +0.8x |
-| 8cba5890 | 10.14x | 10.35x | **10.78x** | |
-| 5eadab1e | 10.06x | 9.98x | **10.76x** | +0.8x |
-| f7d6ac7c | 9.60x | 9.85x | **10.53x** | +0.7x |
-| 76010cb4 | 8.76x | 9.39x | **10.25x** | +0.9x |
-| 4822167c | 8.75x | 9.68x | **10.19x** | +0.5x |
-| eedc63b2 | 9.30x | 9.32x | **10.18x** | +0.9x |
-| 74d7ff04 | 9.02x | 9.68x | **10.10x** | |
-| 81955b1e | 8.94x | 9.71x | **10.10x** | |
-| fc378037 | 9.02x | 9.52x | **10.06x** | +0.5x |
-| 6230e838 | 8.97x | 9.88x | **10.05x** | |
-| 8f1ff9f1 | 8.80x | 8.95x | **10.02x** | +1.1x |
-| e626d3e6 | 9.18x | 9.35x | **9.98x** | +0.6x |
-| 58a34f27 (T=4096)| 4.14x | 7.46x | **7.43x** | large-T |
-| 5e8dc11c (T=4096)| 3.69x | 7.08x | **6.98x** | large-T |
+| Workload | Round 1 | Round 5 | Round 6 | Round 7 | 备注 |
+|----------|---------|---------|---------|---------|------|
+| e05c6c03 | 12.90x | 11.91x | 12.14x | **12.56x** | 🔥 peak |
+| 2e69caee | 12.21x | 11.54x | 11.97x | **12.05x** | |
+| b8f4f012 (T=7) | 12.02x | 10.93x | 11.06x | **11.67x** | |
+| 1a4c6ba1 | 1.35x | 10.80x | 11.34x | **11.09x** | |
+| 5eadab1e | 10.06x | 9.98x | 10.76x | **10.99x** | |
+| 8cba5890 | 10.14x | 10.35x | 10.78x | **10.89x** | |
+| a7c2bcfd (T=128)| 10.00x | 10.00x | 10.84x | **10.83x** | |
+| f7d6ac7c | 9.60x | 9.85x | 10.53x | **10.57x** | |
+| e626d3e6 | 9.18x | 9.35x | 9.98x | **10.17x** | |
+| 8f1ff9f1 | 8.80x | 8.95x | 10.02x | **10.06x** | |
+| 4822167c | 8.75x | 9.68x | 10.19x | **10.02x** | |
+| fc378037 | 9.02x | 9.52x | 10.06x | **10.02x** | |
+| 74d7ff04 | 9.02x | 9.68x | 10.10x | **10.00x** | |
+| 6230e838 | 8.97x | 9.88x | 10.05x | **9.98x** | |
+| eedc63b2 | 9.30x | 9.32x | 10.18x | **9.92x** | |
+| 76010cb4 | 8.76x | 9.39x | 10.25x | **9.86x** | |
+| 81955b1e | 8.94x | 9.71x | 10.10x | **9.86x** | |
+| 58a34f27 (T=4096)| 4.14x | 7.46x | 7.43x | **7.11x** | large-T |
+| 5e8dc11c (T=4096)| 3.69x | 7.08x | 6.98x | **6.73x** | large-T |
 
 ---
 
@@ -137,11 +137,13 @@ mlsys_note/
 │   ├── run_modal.py             # Modal B200 完整 benchmark
 │   ├── profile_modal.py         # Modal B200 NCU profiling
 │   ├── debug_modal.py           # Modal B200 调试（逐步对比 reference）
+│   ├── ncu_profile_modal.py     # Modal B200 torch.profiler 时间分解 + roofline 分析
 │   ├── pack_solution_simple.py  # 打包 solution.json
 │   ├── pack_solution.py         # 打包（需要 flashinfer_bench.agents）
 │   ├── run_local.py             # 本地 benchmark
 │   └── test_scaled_mm.py        # 测试 torch._scaled_mm API
 ├── config.toml                  # 配置（队名、赛道等）
+├── profiling_notes.md           # B200 profiling 分析、优化尝试记录、下一步方向
 ├── solution.json                # 打包后的提交文件
 └── mlsys26-contest/             # 比赛数据集（git submodule）
 ```
@@ -238,11 +240,23 @@ Step 5: 更大的 tile sizes (BM=128, BN=256) + multi-stage pipeline
 - [x] **FP8 Native Tensor Core Dot (GEMM1)** — `tl.dot(fp8, fp8)` + post-dot scale，Triton 3.6.0 已修复 sm100 codegen（2x 吞吐，large-T +3x，avg +1.9x）
 - [x] **GEMM2 Post-dot B-scale** — `tl.dot(a, b.to(f32))` + `acc += partial * b_scale`，消除 [BLOCK_K, BLOCK_N] dequant 乘法（中等规模 +0.3-0.8x，avg +0.5x）
 - [x] **Autotune 扩展** — GEMM1 增加 BLOCK_N=256 配置，GEMM2 增加 num_stages=5 和 BLOCK_N=256 配置
+- [x] **NCU Profiling** — B200 上使用 `torch.profiler` 做 per-kernel 时间分解 + analytical roofline 分析（见 `profiling_notes.md`）
+- [x] **torch.compile routing** — `torch.compile(mode="reduce-overhead", dynamic=True)` 融合 routing 中的 element-wise ops（微小提升 ~1-2%，在噪声范围内）
+- [x] **Pre-allocated buffer cache** — `output_fp32` 跨 call 复用，避免每次 `torch.zeros` 分配
 
-### 🟡 P1: 进一步优化
+### 🟡 P0: CPU Overhead 优化（当前瓶颈）
+
+> **关键发现（NCU Profiling）：** CPU overhead 占 wall time 的 56-73%（~600us），其中 routing ~300us（~30 PyTorch kernel launches）、sorting ~100us、Python framework ~170us。GEMM kernel 本身只占 13-21% of wall time。
+>
+> **结论：** 进一步优化 GEMM tile 效果有限，**必须减少 routing/sorting 的 kernel launch 数量**。
+
+- [ ] **Fuse routing into Triton kernel** — 将 ~14 个 PyTorch ops（sigmoid, topk×3, scatter, gather, masked_fill, etc.）融合为 1 个 Triton kernel，预期节省 ~300us（最高优先级，但 topk 在 Triton 中实现复杂）
+- [ ] **Fuse sorting into Triton kernel** — 替代 argsort + CPU sync（`.cpu().tolist()`），预期节省 ~100us
+- [ ] **GEMM2 tile tuning for T=512** — Profiling 显示 T=512 时 GEMM2 = 135us（2x higher than T=1024 的 60us），可能是 autotune 选择了次优配置
+
+### 🟡 P1: 进一步 GEMM 优化
 
 - [ ] **Persistent kernels** — 通过静态 dispatch 完全抵消 Triton run 时的 CPU 端 Python 开销
-- [ ] **NCU Profiling** — 分析 B200 上的 shared memory access 和 instruction latency bottleneck
 - [ ] **Phase 3 Fully Fused Kernel** — 算法已验证正确（本地 sm89），等 Triton 修复 sm100 上 `tl.dot` BLOCK_H=64 codegen 后重新测试
 
 ### 🟢 P2: 已完成的调试工具
@@ -266,6 +280,7 @@ Step 5: 更大的 tile sizes (BM=128, BN=256) + multi-stage pipeline
 | GEMM2 FP8 Online Quantize + Native Dot | 0/19, abs_err ~10K-26K | SwiGLU 输出动态范围大，fp8 (3bit mantissa) 量化误差在 2048 维 dot product 中级联放大 |
 | GEMM2 bf16 Intermediate + bf16×bf16 Dot | 3/19, rel_err ~50-1e9 | fp32 SwiGLU→bf16 截断在 GEMM2 的 16 次 K-iteration 中逐步累积，超出 tolerance |
 | GEMM2 FP8 Per-128-Block-Scale Quantize (Round 7) | 0/19, abs_err ~10K+ | 即使使用 per-128-element block scaling 适应局部动态范围，fp8 (3bit mantissa) 量化噪声仍然过大。三种变体均失败：(1) per-tensor fp8 cast → 全 NaN（SwiGLU 值 >448）; (2) PyTorch block-scale quant→dequant→fp32 GEMM2 → abs=10K+; (3) Triton block-scale quant + fp8×fp8 GEMM2 → abs=10K+。**结论：GEMM2 A-side 必须保持 fp32，无法使用 fp8×fp8 tensor cores** |
+| CUDA Graph for GEMM kernels (Round 7) | 19/19 但无提升 (~9.9x avg) | CUDA Graph 捕获 GEMM1+GEMM2+zero+copy 后 replay，pre-allocated persistent buffers。**但 GEMM 只有 2 次 Triton launch（~20-50us launch overhead），占 CPU overhead 的 <8%**。瓶颈是 routing 的 ~30 次 PyTorch kernel launch（~300us）。Graph 节省的 launch overhead 被 extra `.copy_()` 开销抵消 |
 
 ---
 

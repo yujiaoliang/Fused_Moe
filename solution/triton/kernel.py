@@ -37,7 +37,7 @@ GROUP_SIZE_M = 8  # L2 cache reuse grouping
 # Routing (PyTorch) — DeepSeek-V3 no-aux routing
 # ═══════════════════════════════════════════════════════════════
 
-def ds_routing(logits, bias, scale_factor):
+def _ds_routing_impl(logits, bias, scale_factor):
     """
     logits: [T, 256] f32,  bias: [256] bf16,  scale_factor: float
     returns: topk_idx [T, 8] int64, topk_weights [T, 8] f32
@@ -68,6 +68,13 @@ def ds_routing(logits, bias, scale_factor):
     topk_weights = topk_s / (topk_s.sum(dim=1, keepdim=True) + 1e-20) * scale_factor
 
     return topk_idx, topk_weights
+
+
+# torch.compile fuses ~14 PyTorch ops into fewer CUDA kernels, reducing dispatch overhead
+try:
+    ds_routing = torch.compile(_ds_routing_impl, mode="reduce-overhead", dynamic=True)
+except Exception:
+    ds_routing = _ds_routing_impl
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -419,6 +426,13 @@ def _fused_moe_gemm2_scatter_kernel(
     # Triton atomic_add into FP32 buffer
     tl.atomic_add(c_ptrs, out, mask=valid_mask[:, None] & n_mask[None, :], sem='relaxed')
 
+# ═══════════════════════════════════════════════════════════════
+# Pre-allocated buffer cache — reuse output_fp32/Intermediate
+# ═══════════════════════════════════════════════════════════════
+
+_buf_cache = {}
+
+
 @torch.no_grad()
 def kernel(
     routing_logits,           # [T, 256]          float32
@@ -445,18 +459,22 @@ def kernel(
     sorted_token_ids, block_expert_ids, sorted_weights, num_padded = \
         moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device)
 
-    # Accumulate into FP32 buffer to prevent low-bit `atomic_add` rounding error loss across experts
-    output_fp32 = torch.zeros((T, 7168), dtype=torch.float32, device=device)
-    
+    # ── 3. Pre-allocated FP32 accumulation buffer ──
+    bkey = T
+    if bkey in _buf_cache:
+        output_fp32 = _buf_cache[bkey]
+        output_fp32.zero_()
+    else:
+        output_fp32 = torch.zeros((T, 7168), dtype=torch.float32, device=device)
+        _buf_cache[bkey] = output_fp32
+
     if sorted_token_ids is None or num_padded == 0:
         output.copy_(output_fp32)
         return
 
-    # ── 3. Fused GEMM1 + SwiGLU ──
-    # W13 is [E, 4096, 7168], N=4096, K=7168
-    # SwiGLU outputs N_OUT=2048 as fp32 (bf16 precision insufficient — 6/19 PASSED)
+    # ── 4. Fused GEMM1 + SwiGLU ──
     Intermediate = torch.empty((num_padded, 2048), dtype=torch.float32, device=device)
-    
+
     grid1 = lambda META: (triton.cdiv(num_padded, META['BLOCK_M']) * triton.cdiv(2048, META['BLOCK_N']),)
 
     _fused_moe_gemm1_swiglu_kernel[grid1](
@@ -475,11 +493,7 @@ def kernel(
         stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
     )
 
-    # ── 4. Fused GEMM2 + Scatter Add ──
-    # Intermediate is [num_padded, 2048] fp32
-    # W2 is [E, 7168, 2048] fp8
-    # We scatter add directly to output [T, 7168]
-    
+    # ── 5. Fused GEMM2 + Scatter Add ──
     grid2 = lambda META: (triton.cdiv(num_padded, META['BLOCK_M']) * triton.cdiv(7168, META['BLOCK_N']),)
 
     _fused_moe_gemm2_scatter_kernel[grid2](
