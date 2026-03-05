@@ -128,8 +128,8 @@ mlsys_note/
 ├── solution/
 │   ├── triton/kernel.py         # ← Triton kernel（主力优化分支）
 │   └── cuda/
-│       ├── binding.py           # CUDA baseline：PyTorch/cuBLAS 参考实现（19/19 PASSED, ~2.2x avg）
-│       └── kernel.cu            # CUDA kernel 模板：fused GEMM1+SwiGLU, GEMM2+scatter（供队友优化）
+│       ├── binding.py           # CUDA baseline：PyTorch/cuBLAS 参考实现（19/19 PASSED）
+│       └── kernel.cu            # CUDA kernel 模板 + FA4 fast_sigmoid（供队友优化）
 ├── check_modal.py               # Modal B200 快速正确性检查
 ├── test_kernel.py               # 本地快速测试（直接对比 reference）
 ├── scripts/
@@ -138,7 +138,7 @@ mlsys_note/
 │   ├── profile_modal.py         # Modal B200 NCU profiling
 │   ├── debug_modal.py           # Modal B200 调试（逐步对比 reference）
 │   ├── ncu_profile_modal.py     # Modal B200 torch.profiler 时间分解 + roofline 分析
-│   ├── pack_solution_simple.py  # 打包 solution.json
+│   ├── pack_solution_simple.py  # 打包 solution.json（支持 --cuda 切换打包 CUDA baseline）
 │   ├── pack_solution.py         # 打包（需要 flashinfer_bench.agents）
 │   ├── run_local.py             # 本地 benchmark
 │   └── test_scaled_mm.py        # 测试 torch._scaled_mm API
@@ -179,16 +179,24 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 
 `solution/cuda/` 包含完整可运行的 CUDA 版本：
 
-- **`binding.py`** — PyTorch/cuBLAS 参考实现（19/19 PASSED, avg ~2.2x）
-  - 复用 Triton 版的 routing 逻辑
-  - Per-expert 循环：FP8 dequant → `torch.matmul` (cuBLAS) → SwiGLU → scatter-add
-  - 速度较慢（每 expert 物化 fp32 weights ~112MB），但数值完全正确
+- **`binding.py`** — PyTorch/cuBLAS 参考实现（19/19 PASSED）
+  - 已优化 routing（gather-first、bool mask、torch.compile）
+  - Per-expert 循环：FP8 dequant(fp32) → `torch.matmul` (cuBLAS) → SwiGLU → scatter-add
+  - Pre-allocated buffer cache
+  - 精度优于 Triton 版（abs ~0-2K vs ~2K-4K），速度受限于每 expert ~112MB 权重物化
 
 - **`kernel.cu`** — Fused CUDA kernel 模板
-  - `dequant_fp8_blockscale_kernel` — 元素级 FP8→FP32
-  - `gemm1_swiglu_kernel` — Tiled GEMM1 + SwiGLU（BM=64, BN=64, BK=32, 4x4 register tiling）
+  - `fast_sigmoid()` — **FA4 启发**：Padé 有理逼近替代 SFU `expf()`（B200 上 SFU 吞吐没跟上 Tensor Core 增长）
+  - `gemm1_swiglu_kernel` — Tiled GEMM1 + SwiGLU（BM=64, BN=64, BK=32, 4×4 register tiling）
   - `gemm2_scatter_kernel` — Tiled GEMM2 + weighted atomicAdd scatter
   - `extern "C"` launch wrappers（ctypes/pybind11 接口）
+
+### 测试 CUDA Baseline
+
+```bash
+# 无需手动 copy 文件！--cuda 自动打包 solution/cuda/binding.py
+python scripts/pack_solution_simple.py --cuda && python check_modal.py
+```
 
 ### CUDA 优化路径
 
@@ -199,9 +207,6 @@ Step 3: CUTLASS 3.x sm100a 模板 — TMEM, TMA, wgmma
 Step 4: Persistent kernel — 消除 per-expert launch overhead
 Step 5: 更大的 tile sizes (BM=128, BN=256) + multi-stage pipeline
 ```
-
-> **注意:** benchmark 框架的 CUDA builder (TVMFFIBuilder) 只编译 `.cu` 文件，忽略 `.py`。
-> 测试 binding.py 基线需临时复制到 `solution/triton/` 并使用 `language = "triton"` 打包。
 
 ### 关键约束
 
