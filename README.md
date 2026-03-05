@@ -125,7 +125,11 @@ python test_kernel.py
 
 ```
 mlsys_note/
-├── solution/triton/kernel.py    # ← 主要编辑的文件（Triton kernel）
+├── solution/
+│   ├── triton/kernel.py         # ← Triton kernel（主力优化分支）
+│   └── cuda/
+│       ├── binding.py           # CUDA baseline：PyTorch/cuBLAS 参考实现（19/19 PASSED, ~2.2x avg）
+│       └── kernel.cu            # CUDA kernel 模板：fused GEMM1+SwiGLU, GEMM2+scatter（供队友优化）
 ├── check_modal.py               # Modal B200 快速正确性检查
 ├── test_kernel.py               # 本地快速测试（直接对比 reference）
 ├── scripts/
@@ -166,6 +170,36 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
    - `_fused_moe_gemm2_scatter_kernel`（`@triton.autotune` 自动调参，BLOCK_K=128）
    - Post-dot B-scale：`tl.dot(a, b.to(f32))` + `acc += partial * b_scale`，减少标量乘法并提升 TF32 精度
    - 使用 Triton `tl.atomic_add` 直接将更新写入最终的 fp32 buffer，避免低精度 rounding error，随后复制至 `bfloat16` output。
+
+---
+
+## CUDA Baseline（队友优化起点）
+
+`solution/cuda/` 包含完整可运行的 CUDA 版本：
+
+- **`binding.py`** — PyTorch/cuBLAS 参考实现（19/19 PASSED, avg ~2.2x）
+  - 复用 Triton 版的 routing 逻辑
+  - Per-expert 循环：FP8 dequant → `torch.matmul` (cuBLAS) → SwiGLU → scatter-add
+  - 速度较慢（每 expert 物化 fp32 weights ~112MB），但数值完全正确
+
+- **`kernel.cu`** — Fused CUDA kernel 模板
+  - `dequant_fp8_blockscale_kernel` — 元素级 FP8→FP32
+  - `gemm1_swiglu_kernel` — Tiled GEMM1 + SwiGLU（BM=64, BN=64, BK=32, 4x4 register tiling）
+  - `gemm2_scatter_kernel` — Tiled GEMM2 + weighted atomicAdd scatter
+  - `extern "C"` launch wrappers（ctypes/pybind11 接口）
+
+### CUDA 优化路径
+
+```
+Step 1: 用 kernel.cu 的 fused kernel 替换 binding.py 的 per-expert PyTorch 循环
+Step 2: 消除 fp32 weight 物化 — 在 GEMM tile 内在线 dequant
+Step 3: CUTLASS 3.x sm100a 模板 — TMEM, TMA, wgmma
+Step 4: Persistent kernel — 消除 per-expert launch overhead
+Step 5: 更大的 tile sizes (BM=128, BN=256) + multi-stage pipeline
+```
+
+> **注意:** benchmark 框架的 CUDA builder (TVMFFIBuilder) 只编译 `.cu` 文件，忽略 `.py`。
+> 测试 binding.py 基线需临时复制到 `solution/triton/` 并使用 `language = "triton"` 打包。
 
 ### 关键约束
 
@@ -231,6 +265,7 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 | Phase 3 Fully Fused Kernel | 0/19, abs_err ~4096 | Triton sm100 codegen bug：`tl.dot` BLOCK_H=64 场景下的精度问题（本地 sm89 正确） |
 | GEMM2 FP8 Online Quantize + Native Dot | 0/19, abs_err ~10K-26K | SwiGLU 输出动态范围大，fp8 (3bit mantissa) 量化误差在 2048 维 dot product 中级联放大 |
 | GEMM2 bf16 Intermediate + bf16×bf16 Dot | 3/19, rel_err ~50-1e9 | fp32 SwiGLU→bf16 截断在 GEMM2 的 16 次 K-iteration 中逐步累积，超出 tolerance |
+| GEMM2 FP8 Per-128-Block-Scale Quantize (Round 7) | 0/19, abs_err ~10K+ | 即使使用 per-128-element block scaling 适应局部动态范围，fp8 (3bit mantissa) 量化噪声仍然过大。三种变体均失败：(1) per-tensor fp8 cast → 全 NaN（SwiGLU 值 >448）; (2) PyTorch block-scale quant→dequant→fp32 GEMM2 → abs=10K+; (3) Triton block-scale quant + fp8×fp8 GEMM2 → abs=10K+。**结论：GEMM2 A-side 必须保持 fp32，无法使用 fp8×fp8 tensor cores** |
 
 ---
 
