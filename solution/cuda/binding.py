@@ -1,7 +1,7 @@
 """
 CUDA MoE Kernel — Optimized PyTorch/cuBLAS baseline for Track A.
 
-Optimizations over v1 baseline (~2.2x):
+Optimizations:
   1. Gather-first routing: normalize on [T,8] instead of [T,256]
   2. Bool group mask: avoid float→bool temporary allocation
   3. In-place masked_fill_ to avoid copy
@@ -14,7 +14,7 @@ Architecture:
   2. Per-expert loop: dequant(fp32) → cuBLAS matmul → SwiGLU → matmul → scatter-add
   3. Cast output FP32 → BF16
 
-Testing: Copy to solution/triton/kernel.py, set language="triton", pack and run.
+Testing: python scripts/pack_solution_simple.py --cuda && python check_modal.py
 """
 
 import torch
@@ -55,7 +55,6 @@ def _ds_routing_impl(logits, bias, scale_factor):
     sb.masked_fill_(~s_mask, neg_inf)
     _, topk_idx = torch.topk(sb, k=TOP_K, dim=1, largest=True, sorted=False)
 
-    # Gather-first normalize on [T, 8] — 32x fewer elements
     topk_s = torch.gather(s, 1, topk_idx)
     topk_weights = topk_s / (topk_s.sum(dim=1, keepdim=True) + 1e-20) * scale_factor
 
@@ -69,7 +68,7 @@ except Exception:
 
 
 # ═══════════════════════════════════════════════════════════════
-# FP8 Block-Scale Dequantization — fp32 output (precision required)
+# FP8 Block-Scale Dequantization
 # ═══════════════════════════════════════════════════════════════
 
 def dequant_hidden_states(hs_fp8, hs_scale):
@@ -78,14 +77,10 @@ def dequant_hidden_states(hs_fp8, hs_scale):
     return (hs_fp8.float().view(T, 56, 128) * hs_scale.T.unsqueeze(2)).reshape(T, H)
 
 
-def dequant_gemm1_weight(w_fp8, w_scale):
-    """[4096, 7168] fp8 + [32, 56] fp32 → [4096, 7168] fp32"""
-    return (w_fp8.float().view(32, 128, 56, 128) * w_scale[:, None, :, None]).reshape(4096, H)
-
-
-def dequant_gemm2_weight(w_fp8, w_scale):
-    """[7168, 2048] fp8 + [56, 16] fp32 → [7168, 2048] fp32"""
-    return (w_fp8.float().view(56, 128, 16, 128) * w_scale[:, None, :, None]).reshape(H, I_SIZE)
+def dequant_weight(w_fp8, w_scale, out_rows, out_cols, scale_rows, scale_cols):
+    """Generic fp8 block-scale dequant → fp32"""
+    return (w_fp8.float().view(scale_rows, 128, scale_cols, 128)
+            * w_scale[:, None, :, None]).reshape(out_rows, out_cols)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -110,7 +105,7 @@ def kernel(
     gemm2_weights_scale,      # [32, 56, 16]      float32
     local_expert_offset,      # int32 scalar
     routed_scaling_factor,    # float32 scalar
-    output,                   # [T, 7168]         bfloat16  (destination-passing)
+    output,                   # [T, 7168]         bfloat16
 ):
     T = routing_logits.shape[0]
     device = hidden_states.device
@@ -171,16 +166,16 @@ def kernel(
         A = hs_fp32[tok_ids]  # [cnt, 7168] fp32
 
         # ── GEMM1: A @ W13.T → [cnt, 4096] ──
-        W13 = dequant_gemm1_weight(gemm1_weights[e], gemm1_weights_scale[e])
-        gemm1_out = torch.matmul(A, W13.T)  # fp32 × fp32 → fp32
+        W13 = dequant_weight(gemm1_weights[e], gemm1_weights_scale[e], 4096, H, 32, 56)
+        gemm1_out = torch.matmul(A, W13.T)
 
-        # ── SwiGLU: silu(W3_out) * W1_out ──
+        # ── SwiGLU ──
         W1_out = gemm1_out[:, :I_SIZE]
         W3_out = gemm1_out[:, I_SIZE:]
         intermediate = F.silu(W3_out) * W1_out
 
         # ── GEMM2: intermediate @ W2.T → [cnt, 7168] ──
-        W2 = dequant_gemm2_weight(gemm2_weights[e], gemm2_weights_scale[e])
+        W2 = dequant_weight(gemm2_weights[e], gemm2_weights_scale[e], H, I_SIZE, 56, 16)
         gemm2_out = torch.matmul(intermediate, W2.T)
 
         # ── Weighted scatter-add ──
