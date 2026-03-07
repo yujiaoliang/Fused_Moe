@@ -158,104 +158,100 @@ def ds_routing(logits, bias, scale_factor):
 
 
 # ═══════════════════════════════════════════════════════════════
-# Token Sorting (PyTorch)
+# Token Sorting (Triton)
 # ═══════════════════════════════════════════════════════════════
 
-def moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device):
-    """
-    Sort tokens by expert, filter to local experts, pad to BLOCK_M.
+@triton.jit
+def triton_sort_and_scatter_kernel(
+    topk_idx_ptr,       # [T, TOP_K]
+    topk_wts_ptr,       # [T, TOP_K]
+    sorted_tokens_ptr,  # [MAX_PADDED]
+    sorted_weights_ptr, # [MAX_PADDED]
+    block_offsets_ptr,  # [E_LOCAL + 1] -> 33
+    total_blocks_ptr,   # [1]
+    counts_ptr,         # [E_LOCAL] workspace
+    local_start: tl.constexpr,
+    T,                  # scalar
+    TOP_K: tl.constexpr,
+    E_LOCAL: tl.constexpr, 
+    BLOCK_M: tl.constexpr,
+    MAX_PADDED,         # scalar
+):
+    tid = tl.arange(0, 256)
+    
+    # 0. Clear target buffers
+    offset = 0
+    while offset < MAX_PADDED:
+        idx = offset + tid
+        mask = idx < MAX_PADDED
+        tl.store(sorted_tokens_ptr + idx, T, mask=mask)
+        tl.store(sorted_weights_ptr + idx, 0.0, mask=mask)
+        offset += 256
+    tl.debug_barrier()
 
-    Returns:
-        sorted_token_ids [num_padded] int64 — token index for gather
-        block_expert_ids [num_blocks] int32 — expert for each M-block
-        sorted_weights   [num_padded] f32   — routing weight per slot
-        num_padded       int                — total padded length
-    Returns (None, ...) if no local experts selected.
-    """
-    # Flatten [T, TOP_K] → [T*TOP_K]
-    all_token_ids = torch.arange(T, device=device).unsqueeze(1).expand(T, TOP_K).reshape(-1)
-    all_expert_ids = topk_idx.reshape(-1)
-    all_weights = topk_weights.reshape(-1)
-
-    # Filter to local experts
-    local_end = local_start + E_LOCAL
-    mask = (all_expert_ids >= local_start) & (all_expert_ids < local_end)
-    loc_tokens = all_token_ids[mask]
-    loc_experts = (all_expert_ids[mask] - local_start).to(torch.int32)
-    loc_weights = all_weights[mask]
-
-    if loc_tokens.numel() == 0:
-        return None, None, None, 0
-
-    # Sort by expert
-    sort_idx = loc_experts.argsort(stable=True)
-    loc_tokens = loc_tokens[sort_idx]
-    loc_experts = loc_experts[sort_idx]
-    loc_weights = loc_weights[sort_idx]
-
-    # Count tokens per expert
-    counts = torch.zeros(E_LOCAL, dtype=torch.int32, device=device)
-    counts.scatter_add_(0, loc_experts.long(), torch.ones_like(loc_experts, dtype=torch.int32))
-
-    if loc_tokens.numel() < 1024:
-        # CPU path: single .cpu().tolist() sync + fast Python loop
-        # Faster for small T (covers T≤128, 16/19 workloads) — avoids ~25 GPU kernel launches
-        counts_cpu = counts.cpu().tolist()
-        # Pre-allocate padding buffers to avoid per-expert torch.full/torch.zeros
-        max_padding = E_LOCAL * BLOCK_M  # worst case
-        pad_token_buf = torch.full((max_padding,), T, device=device, dtype=torch.int64)
-        pad_weight_buf = torch.zeros(max_padding, device=device)
-        pad_offset = 0
-        padded_tokens_list = []
-        padded_weights_list = []
-        block_experts_list = []
-        offset = 0
-        for e in range(E_LOCAL):
-            cnt = counts_cpu[e]
-            if cnt == 0:
-                continue
-            num_blocks = (cnt + BLOCK_M - 1) // BLOCK_M
-            pad_cnt = num_blocks * BLOCK_M - cnt
-            padded_tokens_list.append(loc_tokens[offset:offset + cnt])
-            padded_weights_list.append(loc_weights[offset:offset + cnt])
-            if pad_cnt > 0:
-                padded_tokens_list.append(pad_token_buf[pad_offset:pad_offset + pad_cnt])
-                padded_weights_list.append(pad_weight_buf[pad_offset:pad_offset + pad_cnt])
-                pad_offset += pad_cnt
-            block_experts_list.extend([e] * num_blocks)
-            offset += cnt
-        sorted_token_ids = torch.cat(padded_tokens_list)
-        sorted_weights = torch.cat(padded_weights_list)
-        block_expert_ids = torch.tensor(block_experts_list, device=device, dtype=torch.int32)
-        num_padded = sorted_token_ids.shape[0]
-    else:
-        # GPU path: vectorized cumsum + scatter (faster for large T)
-        padded_counts = ((counts + BLOCK_M - 1) // BLOCK_M) * BLOCK_M
-        offsets = torch.cumsum(padded_counts, dim=0)
-        total = offsets[-1].item()  # ONE sync point
-        starts = offsets - padded_counts
-
-        # Compute within-expert offsets for scatter
-        cum_actual = torch.cumsum(counts, dim=0)
-        cum_shifted = torch.cat([torch.zeros(1, dtype=torch.int32, device=device), cum_actual[:-1]])
-        arange = torch.arange(loc_tokens.numel(), device=device, dtype=torch.int32)
-        within_offset = arange - cum_shifted[loc_experts.long()]
-        dest_idx = starts[loc_experts.long()] + within_offset
-
-        # Scatter tokens and weights into padded buffer
-        sorted_token_ids = torch.full((total,), T, device=device, dtype=torch.int64)
-        sorted_token_ids[dest_idx.long()] = loc_tokens
-        sorted_weights = torch.zeros(total, device=device)
-        sorted_weights[dest_idx.long()] = loc_weights
-
-        # Block expert IDs via repeat_interleave
-        blocks_per_expert = (padded_counts // BLOCK_M).long()
-        block_expert_ids = torch.repeat_interleave(
-            torch.arange(E_LOCAL, device=device, dtype=torch.int32),
-            blocks_per_expert)
-        num_padded = total
-
-    return sorted_token_ids, block_expert_ids, sorted_weights, num_padded
+    # 1. Initialize counts
+    e_idx = tl.arange(0, 32)
+    e_mask = e_idx < E_LOCAL
+    tl.store(counts_ptr + e_idx, 0, mask=e_mask)
+    tl.debug_barrier()
+    
+    N = T * TOP_K
+    
+    # 2. Histogram
+    offset = 0
+    while offset < N:
+        idx = offset + tid
+        mask = idx < N
+        exp = tl.load(topk_idx_ptr + idx, mask=mask, other=-1)
+        is_local = (exp >= local_start) & (exp < local_start + E_LOCAL)
+        local_exp = exp - local_start
+        ptr = counts_ptr + tl.where(is_local, local_exp, 0)
+        tl.atomic_add(ptr, 1, mask=is_local, sem='relaxed')
+        offset += 256
+    tl.debug_barrier()
+    
+    # 3. Prefix Sum and Block Offsets
+    cnts = tl.load(counts_ptr + e_idx, mask=e_mask, other=0)
+    blocks = (cnts + (BLOCK_M - 1)) // BLOCK_M
+    padded_cnts = blocks * BLOCK_M
+    
+    inc_sum = tl.cumsum(padded_cnts, axis=0)
+    offsets = inc_sum - padded_cnts
+    
+    total_blocks = tl.sum(blocks, axis=0)
+    
+    block_offs = offsets // BLOCK_M
+    tl.store(block_offsets_ptr + e_idx, block_offs, mask=e_mask)
+    
+    tl.store(block_offsets_ptr + E_LOCAL, total_blocks)
+    tl.store(total_blocks_ptr, total_blocks)
+        
+    tl.store(counts_ptr + e_idx, offsets, mask=e_mask)
+    tl.debug_barrier()
+    
+    # 4. Scatter
+    offset = 0
+    while offset < N:
+        idx = offset + tid
+        mask = idx < N
+        exp = tl.load(topk_idx_ptr + idx, mask=mask, other=-1)
+        wgt = tl.load(topk_wts_ptr + idx, mask=mask, other=0.0)
+        
+        is_local = (exp >= local_start) & (exp < local_start + E_LOCAL)
+        local_exp = exp - local_start
+        
+        ptr = counts_ptr + tl.where(is_local, local_exp, 0)
+        dest = tl.atomic_add(ptr, 1, mask=is_local, sem='relaxed')
+        
+        tok_id = idx // TOP_K
+        
+        out_tok_ptr = sorted_tokens_ptr + tl.where(is_local, dest, 0)
+        out_wgt_ptr = sorted_weights_ptr + tl.where(is_local, dest, 0)
+        
+        tl.store(out_tok_ptr, tok_id, mask=is_local)
+        tl.store(out_wgt_ptr, wgt, mask=is_local)
+        
+        offset += 256
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -291,10 +287,11 @@ def _fused_moe_gemm1_swiglu_kernel(
     C_ptr,            # [num_padded, N//2] fp32 (intermediate SwiGLU output)
     B_scale_ptr,      # [E, N//128, H//128] fp32 (weight scales)
     token_ids_ptr,    # [num_padded] int64 (sorted token indices)
-    expert_ids_ptr,   # [num_blocks] int32 (expert for each M-block)
+    block_offsets_ptr,# [E_LOCAL + 1] int32 (starting M-block for each expert)
+    total_blocks_ptr, # [1] int32
     
     # Dimensions
-    num_padded, T, H: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    MAX_PID_M: tl.constexpr, T: tl.constexpr, H: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
     
     # Strides
     stride_at, stride_ah,
@@ -316,7 +313,7 @@ def _fused_moe_gemm1_swiglu_kernel(
     pid = tl.program_id(0)
     # We want to output N_OUT = N // 2 channels (2048)
     N_OUT = N // 2
-    num_pid_m = tl.cdiv(num_padded, BLOCK_M)
+    num_pid_m = MAX_PID_M
     num_pid_n = tl.cdiv(N_OUT, BLOCK_N)
     
     # Grouped Swizzle
@@ -325,10 +322,19 @@ def _fused_moe_gemm1_swiglu_kernel(
     first_pid_m = group_id * GROUP_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
     pid_m = first_pid_m + (pid % group_size_m)
+    
+    total_blocks = tl.load(total_blocks_ptr)
+    if pid_m >= total_blocks:
+        return
+        
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Load expert ID for this M block
-    expert_id = tl.load(expert_ids_ptr + pid_m)
+    # Find the expert_id mapping for this pid_m
+    e_idx = tl.arange(0, 32)
+    b_start = tl.load(block_offsets_ptr + e_idx)
+    b_end = tl.load(block_offsets_ptr + e_idx + 1)
+    valid = (b_start <= pid_m) & (pid_m < b_end)
+    expert_id = tl.argmax(valid.to(tl.int32), axis=0)
     
     # Offsets for M (tokens) and N (output channels)
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
@@ -338,8 +344,8 @@ def _fused_moe_gemm1_swiglu_kernel(
     rn_1 = rn
     rn_3 = rn + N_OUT
     
-    # Load token indices
-    token_idx = tl.load(token_ids_ptr + rm, mask=rm < num_padded, other=T)
+    # Load token indices (buffer initialized to T, so no out-of-bounds error)
+    token_idx = tl.load(token_ids_ptr + rm)
     # Mask out padding tokens (T is the pad index)
     m_mask = token_idx < T
 
@@ -396,7 +402,7 @@ def _fused_moe_gemm1_swiglu_kernel(
     
     # Store to C as fp32 (bf16 causes too much precision loss — 6/19 PASSED)
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, swiglu_out, mask=m_mask[:, None])
+    tl.store(c_ptrs, swiglu_out)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -433,10 +439,11 @@ def _fused_moe_gemm2_scatter_kernel(
     B_scale_ptr,      # [E, N//128, K//128] fp32 (W2 block scales)
     token_weights_ptr,# [num_padded] fp32 (routing weights for each slot)
     token_ids_ptr,    # [num_padded] int64 (original token indices to scatter to)
-    expert_ids_ptr,   # [num_blocks] int32 (expert for each M-block)
+    block_offsets_ptr,# [E_LOCAL + 1] int32
+    total_blocks_ptr, # [1] int32
     
     # Dimensions
-    T, num_padded: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    T_val, MAX_PID_M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
     
     # Strides
     stride_am, stride_ak,
@@ -449,7 +456,7 @@ def _fused_moe_gemm2_scatter_kernel(
     GROUP_M: tl.constexpr
 ):
     pid = tl.program_id(0)
-    num_pid_m = tl.cdiv(num_padded, BLOCK_M)
+    num_pid_m = MAX_PID_M
     num_pid_n = tl.cdiv(N, BLOCK_N)
     
     # Grouped Swizzle
@@ -458,33 +465,39 @@ def _fused_moe_gemm2_scatter_kernel(
     first_pid_m = group_id * GROUP_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
     pid_m = first_pid_m + (pid % group_size_m)
+    
+    total_blocks = tl.load(total_blocks_ptr)
+    if pid_m >= total_blocks:
+        return
+        
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Load expert ID
-    expert_id = tl.load(expert_ids_ptr + pid_m)
+    # Find the expert_id mapping for this pid_m
+    e_idx = tl.arange(0, 32)
+    b_start = tl.load(block_offsets_ptr + e_idx)
+    b_end = tl.load(block_offsets_ptr + e_idx + 1)
+    valid = (b_start <= pid_m) & (pid_m < b_end)
+    expert_id = tl.argmax(valid.to(tl.int32), axis=0)
     
     # Offsets
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     
     # Masks
-    m_mask = rm < num_padded
     n_mask = rn < N
     
     # Load routing token IDs and Weights
-    token_idx = tl.load(token_ids_ptr + rm, mask=m_mask, other=T)
-    # T is the pad token. So actual valid tokens have index < T
-    valid_mask = token_idx < T
+    token_idx = tl.load(token_ids_ptr + rm)
+    # T_val is the pad token. So actual valid tokens have index < T_val
+    valid_mask = token_idx < T_val
     
-    token_weights = tl.load(token_weights_ptr + rm, mask=m_mask, other=0.0)
+    token_weights = tl.load(token_weights_ptr + rm)
 
     # Accumulator
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
 
-    safe_rm = tl.where(rm < num_padded, rm, 0)
-
-    # Hoist loop-invariant pointer bases outside K-loop (16 iterations)
-    a_base = A_ptr + safe_rm[:, None] * stride_am
+    # Loop invariant bases
+    a_base = A_ptr + rm[:, None] * stride_am
     b_base = B_ptr + expert_id * stride_be + rn[None, :] * stride_bn
     b_scale_base = B_scale_ptr + expert_id * stride_bse + (rn[None, :] // 128) * stride_bsn
 
@@ -492,7 +505,7 @@ def _fused_moe_gemm2_scatter_kernel(
         rk = k + tl.arange(0, BLOCK_K)
 
         # Load A: fp32 from Intermediate buffer
-        a = tl.load(a_base + rk[None, :] * stride_ak, mask=m_mask[:, None], other=0.0)
+        a = tl.load(a_base + rk[None, :] * stride_ak)
 
         # Load B: fp8 (N=7168 always divisible by BLOCK_N, no mask needed)
         b = tl.load(b_base + rk[:, None] * stride_bk)
@@ -508,7 +521,7 @@ def _fused_moe_gemm2_scatter_kernel(
 
     # Scatter Add directly to output tensor C[T, N]
     # Cap token_idx to 0 to prevent out-of-bounds pointer crashes even when masked
-    safe_token_idx = tl.where(token_idx < T, token_idx, 0)
+    safe_token_idx = tl.where(token_idx < T_val, token_idx, 0)
     c_ptrs = C_ptr + safe_token_idx[:, None] * stride_ct + rn[None, :] * stride_cn
     
     # Triton atomic_add into FP32 buffer
@@ -519,7 +532,7 @@ def _fused_moe_gemm2_scatter_kernel(
 # ═══════════════════════════════════════════════════════════════
 
 _buf_cache = {}
-
+_sort_cache = {}
 
 @torch.no_grad()
 def kernel(
@@ -538,32 +551,48 @@ def kernel(
     T = routing_logits.shape[0]
     device = hidden_states.device
     local_start = int(local_expert_offset)
+    
     # ── 1. Routing ──
     topk_idx, topk_weights = ds_routing(
         routing_logits, routing_bias, float(routed_scaling_factor)
     )
 
-    # ── 2. Token sorting ──
-    sorted_token_ids, block_expert_ids, sorted_weights, num_padded = \
-        moe_sort_tokens(topk_idx, topk_weights, local_start, BLOCK_M, T, device)
-
-    # ── 3. Pre-allocated FP32 accumulation buffer ──
+    # ── 2. Pre-allocated Buffer Caches ──
+    MAX_PADDED = T * TOP_K + E_LOCAL * BLOCK_M
+    MAX_PID_M = MAX_PADDED // BLOCK_M
     bkey = T
+    
     if bkey in _buf_cache:
-        output_fp32 = _buf_cache[bkey]
+        output_fp32, Intermediate = _buf_cache[bkey]
         output_fp32.zero_()
     else:
         output_fp32 = torch.zeros((T, 7168), dtype=torch.float32, device=device)
-        _buf_cache[bkey] = output_fp32
+        # Allocate Intermediate to hold ALL max padded blocks!
+        Intermediate = torch.empty((MAX_PADDED, 2048), dtype=torch.float32, device=device)
+        _buf_cache[bkey] = (output_fp32, Intermediate)
+        
+    if bkey in _sort_cache:
+        sorted_token_ids, sorted_weights, block_offsets, total_blocks, counts_workspace = _sort_cache[bkey]
+    else:
+        sorted_token_ids = torch.empty((MAX_PADDED,), dtype=torch.int64, device=device)
+        sorted_weights = torch.empty((MAX_PADDED,), dtype=torch.float32, device=device)
+        block_offsets = torch.empty((E_LOCAL + 1,), dtype=torch.int32, device=device)
+        total_blocks = torch.empty((1,), dtype=torch.int32, device=device)
+        counts_workspace = torch.empty((E_LOCAL,), dtype=torch.int32, device=device)
+        _sort_cache[bkey] = (sorted_token_ids, sorted_weights, block_offsets, total_blocks, counts_workspace)
 
-    if sorted_token_ids is None or num_padded == 0:
-        output.copy_(output_fp32)
-        return
+    # ── 3. Token sorting (Pure Triton) ──
+    triton_sort_and_scatter_kernel[(1,)](
+        topk_idx, topk_weights,
+        sorted_token_ids, sorted_weights,
+        block_offsets, total_blocks, counts_workspace,
+        local_start, T, TOP_K, E_LOCAL, BLOCK_M, MAX_PADDED,
+        num_warps=8
+    )
 
     # ── 4. Fused GEMM1 + SwiGLU ──
-    Intermediate = torch.empty((num_padded, 2048), dtype=torch.float32, device=device)
-
-    grid1 = lambda META: (triton.cdiv(num_padded, META['BLOCK_M']) * triton.cdiv(2048, META['BLOCK_N']),)
+    # Launch with MAX_PID_M, kernels will immediately return if pid_m >= total_blocks
+    grid1 = lambda META: (MAX_PID_M * triton.cdiv(2048, META['BLOCK_N']),)
 
     _fused_moe_gemm1_swiglu_kernel[grid1](
         A_ptr=hidden_states,
@@ -572,8 +601,9 @@ def kernel(
         C_ptr=Intermediate,
         B_scale_ptr=gemm1_weights_scale,
         token_ids_ptr=sorted_token_ids,
-        expert_ids_ptr=block_expert_ids,
-        num_padded=num_padded, T=T, H=7168, N=4096, K=7168,
+        block_offsets_ptr=block_offsets,
+        total_blocks_ptr=total_blocks,
+        MAX_PID_M=MAX_PID_M, T=T, H=7168, N=4096, K=7168,
         stride_at=hidden_states.stride(0), stride_ah=hidden_states.stride(1),
         stride_as0=hidden_states_scale.stride(0), stride_as1=hidden_states_scale.stride(1),
         stride_be=gemm1_weights.stride(0), stride_bn=gemm1_weights.stride(1), stride_bh=gemm1_weights.stride(2),
@@ -582,7 +612,7 @@ def kernel(
     )
 
     # ── 5. Fused GEMM2 + Scatter Add ──
-    grid2 = lambda META: (triton.cdiv(num_padded, META['BLOCK_M']) * triton.cdiv(7168, META['BLOCK_N']),)
+    grid2 = lambda META: (MAX_PID_M * triton.cdiv(7168, META['BLOCK_N']),)
 
     _fused_moe_gemm2_scatter_kernel[grid2](
         A_ptr=Intermediate,
@@ -591,8 +621,9 @@ def kernel(
         B_scale_ptr=gemm2_weights_scale,
         token_weights_ptr=sorted_weights,
         token_ids_ptr=sorted_token_ids,
-        expert_ids_ptr=block_expert_ids,
-        T=T, num_padded=num_padded, N=7168, K=2048,
+        block_offsets_ptr=block_offsets,
+        total_blocks_ptr=total_blocks,
+        T_val=T, MAX_PID_M=MAX_PID_M, N=7168, K=2048,
         stride_am=Intermediate.stride(0), stride_ak=Intermediate.stride(1),
         stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1), stride_bk=gemm2_weights.stride(2),
         stride_ct=output_fp32.stride(0), stride_cn=output_fp32.stride(1),
