@@ -18,29 +18,25 @@
 
 ### B200 Benchmark 结果（最新）
 
-Round 7 优化：`torch.compile(mode="reduce-overhead", dynamic=True)` 融合 routing ~14 个 PyTorch ops 的 dispatch overhead。Pre-allocated `output_fp32` buffer cache。CUDA Graph 尝试后回退（见下方分析）。平均 ~10.2x（在噪声范围内微小提升）。
+Round 8 优化：完全重写 `triton_ds_routing_kernel`（Pure Triton 实现 Sigmoid、Group Top-2、Global Top-8），消除了 Python 端调用 PyTorch `torch.topk` 等 ~15 个算子的惊人 300us CPU 调度开销！峰值性能从 12.56x 跃升至 **16.73x**。大 T 的 workload 也水涨船高提升至 **7.9x**。
 
-| Workload | Round 1 | Round 5 | Round 6 | Round 7 | 备注 |
+| Workload | Round 5 | Round 6 | Round 7 | Round 8 | 备注 |
 |----------|---------|---------|---------|---------|------|
-| e05c6c03 | 12.90x | 11.91x | 12.14x | **12.56x** | 🔥 peak |
-| 2e69caee | 12.21x | 11.54x | 11.97x | **12.05x** | |
-| b8f4f012 (T=7) | 12.02x | 10.93x | 11.06x | **11.67x** | |
-| 1a4c6ba1 | 1.35x | 10.80x | 11.34x | **11.09x** | |
-| 5eadab1e | 10.06x | 9.98x | 10.76x | **10.99x** | |
-| 8cba5890 | 10.14x | 10.35x | 10.78x | **10.89x** | |
-| a7c2bcfd (T=128)| 10.00x | 10.00x | 10.84x | **10.83x** | |
-| f7d6ac7c | 9.60x | 9.85x | 10.53x | **10.57x** | |
-| e626d3e6 | 9.18x | 9.35x | 9.98x | **10.17x** | |
-| 8f1ff9f1 | 8.80x | 8.95x | 10.02x | **10.06x** | |
-| 4822167c | 8.75x | 9.68x | 10.19x | **10.02x** | |
-| fc378037 | 9.02x | 9.52x | 10.06x | **10.02x** | |
-| 74d7ff04 | 9.02x | 9.68x | 10.10x | **10.00x** | |
-| 6230e838 | 8.97x | 9.88x | 10.05x | **9.98x** | |
-| eedc63b2 | 9.30x | 9.32x | 10.18x | **9.92x** | |
-| 76010cb4 | 8.76x | 9.39x | 10.25x | **9.86x** | |
-| 81955b1e | 8.94x | 9.71x | 10.10x | **9.86x** | |
-| 58a34f27 (T=4096)| 4.14x | 7.46x | 7.43x | **7.11x** | large-T |
-| 5e8dc11c (T=4096)| 3.69x | 7.08x | 6.98x | **6.73x** | large-T |
+| e05c6c03 | 11.91x | 12.14x | 12.56x | **16.73x** | 🔥 peak |
+| 2e69caee | 11.54x | 11.97x | 12.05x | **16.11x** | T=7 |
+| b8f4f012 (T=7) | 10.93x | 11.06x | 11.67x | **15.34x** | |
+| a7c2bcfd (T=128)| 10.00x | 10.84x | 10.83x | **13.62x** | |
+| 8cba5890 | 10.35x | 10.78x | 10.89x | **13.55x** | |
+| 5eadab1e | 9.98x | 10.76x | 10.99x | **13.32x** | |
+| 1a4c6ba1 | 10.80x | 11.34x | 11.09x | **13.06x** | |
+| eedc63b2 | 9.32x | 10.18x | 9.92x | **12.23x** | |
+| e626d3e6 | 9.35x | 9.98x | 10.17x | **12.12x** | |
+| 74d7ff04 | 9.68x | 10.10x | 10.00x | **11.99x** | |
+| 6230e838 | 9.88x | 10.05x | 9.98x | **11.96x** | |
+| 4822167c | 9.68x | 10.19x | 10.02x | **11.95x** | |
+| 8f1ff9f1 | 8.95x | 10.02x | 10.06x | **11.95x** | |
+| 58a34f27 (T=4096)| 7.46x | 7.43x | 7.11x | **7.91x** | large-T |
+| 5e8dc11c (T=4096)| 7.08x | 6.98x | 6.73x | **7.33x** | large-T |
 
 ---
 
@@ -175,7 +171,7 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 
 ---
 
-## CUDA Baseline（队友优化起点）
+## CUDA Baseline
 
 `solution/cuda/` 包含完整可运行的 CUDA 版本：
 
@@ -198,15 +194,19 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 python scripts/pack_solution_simple.py --cuda && python check_modal.py
 ```
 
-### CUDA 优化路径
+### ❌ CUDA 优化路径 (已废弃)
 
-```
-Step 1: 用 kernel.cu 的 fused kernel 替换 binding.py 的 per-expert PyTorch 循环
-Step 2: 消除 fp32 weight 物化 — 在 GEMM tile 内在线 dequant
-Step 3: CUTLASS 3.x sm100a 模板 — TMEM, TMA, wgmma
-Step 4: Persistent kernel — 消除 per-expert launch overhead
-Step 5: 更大的 tile sizes (BM=128, BN=256) + multi-stage pipeline
-```
+> **[2026-03] 🚨 避坑警告：** 这条优化路径在理论上是追求极致性能的完美选择，但**在比赛中不可行**！
+> 
+> 实测发现，`flashinfer-bench` 官方提供的 Track A (B200) 线上评测容器**故意剥离了完整的 CUDA 工具链（缺少 `CUDA_HOME` 和 `nvcc`）。** 
+> 
+> 官方框架不支持在运行时动态编译 `torch.utils.cpp_extension` 或原生 `.cu` 文件。你只能提交纯 Python/Triton 代码。因此，用 C++ 去消除 PyTorch `ds_routing` 调度开销的方案被官方生态“封死”了，我们**必须强制使用纯 Triton 实现端到端的 Fused MoE。**
+
+~~Step 1: 用 kernel.cu 的 fused kernel 替换 binding.py 的 per-expert PyTorch 循环~~ (Blocked by Modal Environment)
+~~Step 2: 消除 fp32 weight 物化 — 在 GEMM tile 内在线 dequant~~
+~~Step 3: CUTLASS 3.x sm100a 模板 — TMEM, TMA, wgmma~~
+~~Step 4: Persistent kernel — 消除 per-expert launch overhead~~
+~~Step 5: 更大的 tile sizes (BM=128, BN=256) + multi-stage pipeline~~
 
 ### 关键约束
 
@@ -286,6 +286,7 @@ Step 5: 更大的 tile sizes (BM=128, BN=256) + multi-stage pipeline
 | GEMM2 bf16 Intermediate + bf16×bf16 Dot | 3/19, rel_err ~50-1e9 | fp32 SwiGLU→bf16 截断在 GEMM2 的 16 次 K-iteration 中逐步累积，超出 tolerance |
 | GEMM2 FP8 Per-128-Block-Scale Quantize (Round 7) | 0/19, abs_err ~10K+ | 即使使用 per-128-element block scaling 适应局部动态范围，fp8 (3bit mantissa) 量化噪声仍然过大。三种变体均失败：(1) per-tensor fp8 cast → 全 NaN（SwiGLU 值 >448）; (2) PyTorch block-scale quant→dequant→fp32 GEMM2 → abs=10K+; (3) Triton block-scale quant + fp8×fp8 GEMM2 → abs=10K+。**结论：GEMM2 A-side 必须保持 fp32，无法使用 fp8×fp8 tensor cores** |
 | CUDA Graph for GEMM kernels (Round 7) | 19/19 但无提升 (~9.9x avg) | CUDA Graph 捕获 GEMM1+GEMM2+zero+copy 后 replay，pre-allocated persistent buffers。**但 GEMM 只有 2 次 Triton launch（~20-50us launch overhead），占 CPU overhead 的 <8%**。瓶颈是 routing 的 ~30 次 PyTorch kernel launch（~300us）。Graph 节省的 launch overhead 被 extra `.copy_()` 开销抵消 |
+| 自定义 C++ 扩展消除 CPU 调度开销 (`route_sort.cu`) | 在 Modal 评测环境失败 | 编写了纯 C++ 的 Routing 和 Sorting CUDA kernels，本地测试正确无误。但在 Modal B200 测评环境上执行失败：因为该官方评测沙盒专门去除了 `CUDA_HOME` 和 `nvcc` 工具链，强迫参赛者使用纯 Python/Triton。**结论：只能在 Triton Runtime 内手工用指令实现全部业务逻辑。** |
 
 ---
 

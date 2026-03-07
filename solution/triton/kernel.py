@@ -34,47 +34,127 @@ GROUP_SIZE_M = 8  # L2 cache reuse grouping
 
 
 # ═══════════════════════════════════════════════════════════════
-# Routing (PyTorch) — DeepSeek-V3 no-aux routing
+# Triton Routing Kernel — DeepSeek-V3 no-aux routing
 # ═══════════════════════════════════════════════════════════════
 
-def _ds_routing_impl(logits, bias, scale_factor):
+@triton.jit
+def triton_ds_routing_kernel(
+    logits_ptr,      # [T, E_GLOBAL] f32
+    bias_ptr,        # [E_GLOBAL] bf16
+    topk_idx_ptr,    # [T, TOP_K] int64
+    topk_wts_ptr,    # [T, TOP_K] f32
+    scale_factor,    # float32
+    T,               # Dynamic batch size
+    E_GLOBAL: tl.constexpr,
+    TOP_K: tl.constexpr, 
+    TOPK_GROUP: tl.constexpr, 
+    N_GROUP: tl.constexpr,
+):
     """
-    logits: [T, 256] f32,  bias: [256] bf16,  scale_factor: float
-    returns: topk_idx [T, 8] int64, topk_weights [T, 8] f32
+    Computes sigmoid, group top-K masking, and global top-K routing.
+    1 block per token. Block size = E_GLOBAL (256 threads).
+    """
+    pid = tl.program_id(0)
+    if pid >= T:
+        return
+
+    # Thread index corresponds to expert index
+    tid = tl.arange(0, 256)
+    
+    # Load logits and bias
+    l_ptr = logits_ptr + pid * 256 + tid
+    b_ptr = bias_ptr + tid
+    logit = tl.load(l_ptr)
+    bias = tl.load(b_ptr).to(tl.float32)
+
+    s = 1.0 / (1.0 + tl.exp(-(logit)))
+    sb = s + bias
+
+    # Group configuration
+    G_SIZE = 32  # 256 // 8
+    
+    # Shape manipulation: [N_GROUP, G_SIZE]
+    group_sb = tl.reshape(sb, (8, 32))
+    
+    # Find max in each group
+    max1 = tl.max(group_sb, axis=1)
+    
+    # Mask out max1 to find max2
+    group_sb_no_max1 = tl.where(group_sb < max1[:, None], group_sb, -float('inf'))
+    max2 = tl.max(group_sb_no_max1, axis=1)
+    
+    # Group scores
+    g_scores = max1 + max2
+    
+    # Find Top-4 groups out of N_GROUP (8)
+    g_mask = tl.zeros((8,), dtype=tl.int32)
+    curr_g_scores = g_scores
+    for _ in tl.static_range(4):
+        best_g_idx = tl.argmax(curr_g_scores, axis=0)
+        idx_vec = tl.arange(0, 8)
+        g_mask = tl.where(idx_vec == best_g_idx, 1, g_mask)
+        curr_g_scores = tl.where(idx_vec == best_g_idx, -float('inf'), curr_g_scores)
+        
+    # Expand group mask to element-level shape [E_GLOBAL]
+    # g_mask is [8], we need [256]. We can broadcast and reshape
+    g_mask_2d = g_mask[:, None] * tl.full((1, 32), 1, dtype=tl.int32)
+    s_mask = tl.reshape(g_mask_2d, (256,))
+    
+    # Masked elements become -inf
+    sb_masked = tl.where(s_mask, sb, -float('inf'))
+    
+    # Find Global Top-K (8) out of E_GLOBAL (256)
+    curr_sb = sb_masked
+    topk_wgts_sum = 0.0
+    
+    for k in tl.static_range(8):
+        # Find max and argmax
+        best_idx = tl.argmax(curr_sb, axis=0)
+        
+        # Save to output pointers
+        out_idx_ptr = topk_idx_ptr + pid * 8 + k
+        out_wts_ptr = topk_wts_ptr + pid * 8 + k
+        
+        is_best = tid == best_idx
+        best_s = tl.sum(tl.where(is_best, s, 0.0), axis=0)
+        
+        tl.store(out_idx_ptr, best_idx.to(tl.int64))
+        tl.store(out_wts_ptr, best_s)  # Temporarily store unnormalized weight
+        topk_wgts_sum += best_s
+        
+        # Mask out for next iteration
+        curr_sb = tl.where(is_best, -float('inf'), curr_sb)
+        
+    # Normalize weights
+    k_tid = tl.arange(0, 16)
+    k_mask = k_tid < 8
+    out_wts_ptrs = topk_wts_ptr + pid * 8 + k_tid
+    wts = tl.load(out_wts_ptrs, mask=k_mask)
+    norm_wts = (wts / (topk_wgts_sum + 1e-20)) * scale_factor
+    tl.store(out_wts_ptrs, norm_wts, mask=k_mask)
+
+
+def ds_routing(logits, bias, scale_factor):
+    """
+    Launch wrapper for Triton routing kernel.
     """
     T = logits.shape[0]
-    s = torch.sigmoid(logits.float())                          # [T, 256]
-    b = bias.float().reshape(-1)
-    sb = s + b
-
-    gs = E_GLOBAL // N_GROUP  # 32
-    sb_g = sb.view(T, N_GROUP, gs)
-    top2, _ = torch.topk(sb_g, k=2, dim=2, largest=True, sorted=False)
-    g_scores = top2.sum(dim=2)                                 # [T, 8]
-
-    _, g_idx = torch.topk(g_scores, k=TOPK_GROUP, dim=1,
-                          largest=True, sorted=False)
-    g_mask = torch.zeros(T, N_GROUP, dtype=torch.bool, device=logits.device)
-    g_mask.scatter_(1, g_idx, True)
-    s_mask = g_mask.unsqueeze(2).expand(T, N_GROUP, gs).reshape(T, E_GLOBAL)
-
-    neg_inf = torch.finfo(torch.float32).min
-    sb.masked_fill_(~s_mask, neg_inf)
-    _, topk_idx = torch.topk(sb, k=TOP_K, dim=1,
-                             largest=True, sorted=False)       # [T, 8]
-
-    # Gather first, normalize on [T, 8] instead of [T, 256] — 32x fewer elements
-    topk_s = torch.gather(s, 1, topk_idx)                      # [T, 8]
-    topk_weights = topk_s / (topk_s.sum(dim=1, keepdim=True) + 1e-20) * scale_factor
-
+    device = logits.device
+    
+    topk_idx = torch.empty((T, TOP_K), dtype=torch.int64, device=device)
+    topk_weights = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
+    
+    # 1 block per token. Number of threads is implicitly inferred by E_GLOBAL (256) -> need block size to cover it
+    grid = (T, )
+    
+    triton_ds_routing_kernel[grid](
+        logits, bias, topk_idx, topk_weights, float(scale_factor),
+        T=T, E_GLOBAL=256, TOP_K=8, 
+        TOPK_GROUP=4, N_GROUP=8,
+        num_warps=8 # E_GLOBAL is 256, 8 warps = 256 threads
+    )
+    
     return topk_idx, topk_weights
-
-
-# torch.compile fuses ~14 PyTorch ops into fewer CUDA kernels, reducing dispatch overhead
-try:
-    ds_routing = torch.compile(_ds_routing_impl, mode="reduce-overhead", dynamic=True)
-except Exception:
-    ds_routing = _ds_routing_impl
 
 
 # ═══════════════════════════════════════════════════════════════
