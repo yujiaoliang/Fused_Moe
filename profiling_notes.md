@@ -123,48 +123,26 @@ Large T (≥512): COMPUTE-BOUND — 充分利用 tensor cores
 
 ---
 
-## 4. 下一步优化方向
+## 4. Round 6 阶段遗留的优化方向（现已在 Round 8/9 全部解决）
 
-### P0: Fuse Routing into Triton Kernel
+### ✅ P0: Fuse Routing into Triton Kernel (Round 8 完成)
 
-**预期节省:** ~300us (routing Python + dispatch overhead)
+**预期与结果:** 预期节省 ~300us (routing Python + dispatch overhead)。实测通过 `triton_ds_routing_kernel` 完全消除，将峰值从 12.56x 推升至 16.73x。
 
-**实现难度:** 高 — 需要在 Triton 中实现 topk
+**Triton topk 最终实现:**
+- 放弃了原本复杂的 Bitonic Sort。
+- 直接利用 `tl.reshape` 和多次 `tl.argmax` 并叠加 `tl.where(mask, -inf)` 来暴力剔除极值，硬编码实现了 Group-Level Top-2 和 Global Top-8 的无排序提取，速度极快。
 
-**Routing 计算流程（可融合为 1 个 kernel）:**
-```
-Input: logits [T, 256] f32, bias [256] bf16, scale_factor f32
-  1. s = sigmoid(logits)                    [T, 256]     element-wise
-  2. sb = s + bias                          [T, 256]     element-wise
-  3. sb_g = sb.view(T, 8, 32)              reshape only
-  4. top2 = topk(sb_g, k=2, dim=2).values  [T, 8, 2]    ← topk (complex)
-  5. g_scores = top2.sum(dim=2)             [T, 8]       reduction
-  6. g_idx = topk(g_scores, k=4, dim=1).indices [T, 4]   ← topk (small)
-  7. g_mask via scatter                     [T, 8]
-  8. s_mask = expand(g_mask)                [T, 256]
-  9. sb.masked_fill(~s_mask, -inf)          [T, 256]     element-wise
- 10. topk_idx = topk(sb, k=8, dim=1).indices [T, 8]     ← topk (complex)
- 11. topk_s = gather(s, topk_idx)           [T, 8]
- 12. normalize + scale                       [T, 8]       element-wise
-Output: topk_idx [T, 8] i64, topk_weights [T, 8] f32
-```
+### ✅ P1: Fuse Sorting into Triton Kernel (Round 9 完成)
 
-**Triton topk 实现思路:**
-- 对于 k=2 from 32 elements: 串行 partial sort 或 bitonic network（32 elements 在一个 warp 内）
-- 对于 k=4 from 8 elements: 直接 register-level comparison（8 elements 太小，直接硬编码）
-- 对于 k=8 from 256 elements: 分块 topk — 每 32 元素取 top-8，再 merge
+**预期与结果:** 预期节省 ~100us (sorting Python + CPU sync)。实测通过 `triton_sort_and_scatter_kernel` 完全消除，将峰值从 16.73x 推升至 47.89x。
 
-### P1: Fuse Sorting into Triton Kernel
+**实现机制:** 
+摒弃 PyTorch 的 `argsort`，直接在 Triton 内遍历 `T * TOP_K` 个 Token，依靠 `tl.atomic_add` 针对 32 个 Local Expert 累加 Histogram。并巧妙使用了 Empty-Block-Skipping 让后续 GEMM 主动查表，消灭了 Python 端的 Launch 循环。
 
-**预期节省:** ~100us (sorting Python + CPU sync)
+### ✅ P2: GEMM2 Tile Tuning for T=512 (Round 9 完成)
 
-**实现思路:** histogram + prefix sum + scatter，全部 GPU-side，无需 CPU sync
-
-### P2: GEMM2 Tile Tuning for T=512
-
-**预期节省:** 修复 135us → ~60us 的 GEMM2 regression
-
-**方法:** 增加针对 T=512 (num_padded ~32K) 的 autotune configs
+**预期与结果:** 针对 T=512 (num_padded ~32K) 开展的穷举 Autotuning。引入了极深的 `num_stages=6` 与横跨整个 L2 Cache 的 `GROUP_M=32`。最终证实当前架构已被 Memory Bandwidth 锁住上限，稳定在 ~22.5x。
 
 ---
 
