@@ -1,5 +1,5 @@
 # FlashInfer Competition
-solution.json
+# solution.json
 
 # CUDA build artifacts
 *.o
@@ -218,3 +218,6 @@ __marimo__/
 
 
 mlsys26-contest/
+
+
+*_yjl_.txt

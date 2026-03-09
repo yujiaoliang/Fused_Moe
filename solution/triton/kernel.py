@@ -1,4 +1,4 @@
-"""
+﻿"""
 Fused MoE Kernel — Track A (FlashInfer AI Kernel Generation Contest)
 
 FP8 block-scale MoE with DeepSeek-V3 no-aux routing.
@@ -59,7 +59,7 @@ def triton_ds_routing_kernel(
         return
 
     # Thread index corresponds to expert index
-    tid = tl.arange(0, 256)
+    tid = tl.arange(0, E_GLOBAL)
     
     # Load logits and bias
     l_ptr = logits_ptr + pid * 256 + tid
@@ -89,16 +89,16 @@ def triton_ds_routing_kernel(
     # Find Top-4 groups out of N_GROUP (8)
     g_mask = tl.zeros((8,), dtype=tl.int32)
     curr_g_scores = g_scores
+    idx_vec = tl.arange(0, N_GROUP)
     for _ in tl.static_range(4):
         best_g_idx = tl.argmax(curr_g_scores, axis=0)
-        idx_vec = tl.arange(0, 8)
         g_mask = tl.where(idx_vec == best_g_idx, 1, g_mask)
         curr_g_scores = tl.where(idx_vec == best_g_idx, -float('inf'), curr_g_scores)
         
     # Expand group mask to element-level shape [E_GLOBAL]
     # g_mask is [8], we need [256]. We can broadcast and reshape
     g_mask_2d = g_mask[:, None] * tl.full((1, 32), 1, dtype=tl.int32)
-    s_mask = tl.reshape(g_mask_2d, (256,))
+    s_mask = tl.reshape(g_mask_2d, (256,)) !=0
     
     # Masked elements become -inf
     sb_masked = tl.where(s_mask, sb, -float('inf'))
@@ -118,7 +118,7 @@ def triton_ds_routing_kernel(
         is_best = tid == best_idx
         best_s = tl.sum(tl.where(is_best, s, 0.0), axis=0)
         
-        tl.store(out_idx_ptr, best_idx.to(tl.int64))
+        tl.store(out_idx_ptr, best_idx.to(tl.int32))
         tl.store(out_wts_ptr, best_s)  # Temporarily store unnormalized weight
         topk_wgts_sum += best_s
         
@@ -134,15 +134,17 @@ def triton_ds_routing_kernel(
     tl.store(out_wts_ptrs, norm_wts, mask=k_mask)
 
 
-def ds_routing(logits, bias, scale_factor):
+def ds_routing(logits, bias, scale_factor, topk_idx=None, topk_weights=None):
     """
     Launch wrapper for Triton routing kernel.
     """
     T = logits.shape[0]
     device = logits.device
     
-    topk_idx = torch.empty((T, TOP_K), dtype=torch.int64, device=device)
-    topk_weights = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
+    if topk_idx is None:
+        topk_idx = torch.empty((T, TOP_K), dtype=torch.int32, device=device)
+    if topk_weights is None:
+        topk_weights = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
     
     # 1 block per token. Number of threads is implicitly inferred by E_GLOBAL (256) -> need block size to cover it
     grid = (T, )
@@ -178,18 +180,8 @@ def triton_sort_and_scatter_kernel(
     MAX_PADDED,         # scalar
 ):
     tid = tl.arange(0, 256)
-    
-    # 0. Clear target buffers
-    offset = 0
-    while offset < MAX_PADDED:
-        idx = offset + tid
-        mask = idx < MAX_PADDED
-        tl.store(sorted_tokens_ptr + idx, T, mask=mask)
-        tl.store(sorted_weights_ptr + idx, 0.0, mask=mask)
-        offset += 256
-    tl.debug_barrier()
 
-    # 1. Initialize counts
+    # 0. Initialize counts
     e_idx = tl.arange(0, 32)
     e_mask = e_idx < E_LOCAL
     tl.store(counts_ptr + e_idx, 0, mask=e_mask)
@@ -197,7 +189,7 @@ def triton_sort_and_scatter_kernel(
     
     N = T * TOP_K
     
-    # 2. Histogram
+    # 1. Histogram
     offset = 0
     while offset < N:
         idx = offset + tid
@@ -210,7 +202,7 @@ def triton_sort_and_scatter_kernel(
         offset += 256
     tl.debug_barrier()
     
-    # 3. Prefix Sum and Block Offsets
+    # 2. Prefix Sum and Block Offsets
     cnts = tl.load(counts_ptr + e_idx, mask=e_mask, other=0)
     blocks = (cnts + (BLOCK_M - 1)) // BLOCK_M
     padded_cnts = blocks * BLOCK_M
@@ -227,6 +219,17 @@ def triton_sort_and_scatter_kernel(
     tl.store(total_blocks_ptr, total_blocks)
         
     tl.store(counts_ptr + e_idx, offsets, mask=e_mask)
+    tl.debug_barrier()
+    
+    # 3. Initialize only the effective padded range.
+    num_padded = total_blocks * BLOCK_M
+    offset = 0
+    while offset < num_padded:
+        idx = offset + tid
+        mask = idx < num_padded
+        tl.store(sorted_tokens_ptr + idx, T, mask=mask)
+        tl.store(sorted_weights_ptr + idx, 0.0, mask=mask)
+        offset += 256
     tl.debug_barrier()
     
     # 4. Scatter
@@ -286,7 +289,7 @@ def triton_sort_and_scatter_kernel(
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=3),
     ],
-    key=['num_padded', 'N', 'K'],
+    key=['MAX_PID_M', 'N', 'K'],
     restore_value=['C_ptr'],
 )
 @triton.jit
@@ -324,8 +327,14 @@ def _fused_moe_gemm1_swiglu_kernel(
     pid = tl.program_id(0)
     # We want to output N_OUT = N // 2 channels (2048)
     N_OUT = N // 2
-    num_pid_m = MAX_PID_M
     num_pid_n = tl.cdiv(N_OUT, BLOCK_N)
+
+    total_blocks = tl.load(total_blocks_ptr)
+    if total_blocks <= 0:
+        return
+    if pid >= total_blocks * num_pid_n:
+        return
+    num_pid_m = total_blocks
     
     # Grouped Swizzle
     num_pid_in_group = GROUP_M * num_pid_n
@@ -333,10 +342,6 @@ def _fused_moe_gemm1_swiglu_kernel(
     first_pid_m = group_id * GROUP_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
     pid_m = first_pid_m + (pid % group_size_m)
-    
-    total_blocks = tl.load(total_blocks_ptr)
-    if pid_m >= total_blocks:
-        return
         
     pid_n = (pid % num_pid_in_group) // group_size_m
 
@@ -449,7 +454,7 @@ def _fused_moe_gemm1_swiglu_kernel(
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=4),
         triton.Config({'BLOCK_M': 64, 'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=4),
     ],
-    key=['num_padded', 'N', 'K'],
+    key=['MAX_PID_M', 'N', 'K'],
     restore_value=['C_ptr'],
 )
 @triton.jit
@@ -478,8 +483,14 @@ def _fused_moe_gemm2_scatter_kernel(
     GROUP_M: tl.constexpr
 ):
     pid = tl.program_id(0)
-    num_pid_m = MAX_PID_M
     num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    total_blocks = tl.load(total_blocks_ptr)
+    if total_blocks <= 0:
+        return
+    if pid >= total_blocks * num_pid_n:
+        return
+    num_pid_m = total_blocks
     
     # Grouped Swizzle
     num_pid_in_group = GROUP_M * num_pid_n
@@ -487,10 +498,6 @@ def _fused_moe_gemm2_scatter_kernel(
     first_pid_m = group_id * GROUP_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
     pid_m = first_pid_m + (pid % group_size_m)
-    
-    total_blocks = tl.load(total_blocks_ptr)
-    if pid_m >= total_blocks:
-        return
         
     pid_n = (pid % num_pid_in_group) // group_size_m
 
@@ -555,6 +562,18 @@ def _fused_moe_gemm2_scatter_kernel(
 
 _buf_cache = {}
 _sort_cache = {}
+_host_scalar_cache = {}
+
+
+def _cached_host_scalar(x, cast_fn):
+    if torch.is_tensor(x):
+        key = (x.data_ptr(), str(x.device), str(x.dtype), cast_fn.__name__)
+        if key in _host_scalar_cache:
+            return _host_scalar_cache[key]
+        v = cast_fn(x.item())
+        _host_scalar_cache[key] = v
+        return v
+    return cast_fn(x)
 
 @torch.no_grad()
 def kernel(
@@ -568,47 +587,64 @@ def kernel(
     gemm2_weights_scale,      # [32, 56, 16]      float32
     local_expert_offset,      # int32 scalar
     routed_scaling_factor,    # float32 scalar
-    output,                   # [T, 7168]         bfloat16  (destination-passing, last)
+    output=None,              # [T, 7168] bfloat16 (optional destination-passing)
 ):
     T = routing_logits.shape[0]
     device = hidden_states.device
-    local_start = int(local_expert_offset)
-    
-    # ── 1. Routing ──
-    topk_idx, topk_weights = ds_routing(
-        routing_logits, routing_bias, float(routed_scaling_factor)
-    )
+    local_start = _cached_host_scalar(local_expert_offset, int)
+    scale_factor = _cached_host_scalar(routed_scaling_factor, float)
 
-    # ── 2. Pre-allocated Buffer Caches ──
+    # 1. Pre-allocated Buffer Caches
     MAX_PADDED = T * TOP_K + E_LOCAL * BLOCK_M
     MAX_PID_M = MAX_PADDED // BLOCK_M
     bkey = T
-    
+
     if bkey in _buf_cache:
         output_fp32, Intermediate = _buf_cache[bkey]
         output_fp32.zero_()
     else:
         output_fp32 = torch.zeros((T, 7168), dtype=torch.float32, device=device)
-        # Allocate Intermediate to hold ALL max padded blocks!
         Intermediate = torch.empty((MAX_PADDED, 2048), dtype=torch.float32, device=device)
         _buf_cache[bkey] = (output_fp32, Intermediate)
-        
+
     if bkey in _sort_cache:
-        sorted_token_ids, sorted_weights, block_offsets, total_blocks, counts_workspace = _sort_cache[bkey]
+        topk_idx_ws, topk_wts_ws, sorted_token_ids, sorted_weights, block_offsets, total_blocks, counts_workspace = _sort_cache[bkey]
     else:
+        topk_idx_ws = torch.empty((T, TOP_K), dtype=torch.int32, device=device)
+        topk_wts_ws = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
         sorted_token_ids = torch.empty((MAX_PADDED,), dtype=torch.int64, device=device)
         sorted_weights = torch.empty((MAX_PADDED,), dtype=torch.float32, device=device)
         block_offsets = torch.empty((E_LOCAL + 1,), dtype=torch.int32, device=device)
         total_blocks = torch.empty((1,), dtype=torch.int32, device=device)
         counts_workspace = torch.empty((E_LOCAL,), dtype=torch.int32, device=device)
-        _sort_cache[bkey] = (sorted_token_ids, sorted_weights, block_offsets, total_blocks, counts_workspace)
+        _sort_cache[bkey] = (
+            topk_idx_ws, topk_wts_ws,
+            sorted_token_ids, sorted_weights,
+            block_offsets, total_blocks, counts_workspace,
+        )
 
-    # ── 3. Token sorting (Pure Triton) ──
+
+    ds_routing(
+        routing_logits,
+        routing_bias,
+        scale_factor,
+        topk_idx=topk_idx_ws,
+        topk_weights=topk_wts_ws,
+    )
     triton_sort_and_scatter_kernel[(1,)](
-        topk_idx, topk_weights,
-        sorted_token_ids, sorted_weights,
-        block_offsets, total_blocks, counts_workspace,
-        local_start, T, TOP_K, E_LOCAL, BLOCK_M, MAX_PADDED,
+        topk_idx_ws,
+        topk_wts_ws,
+        sorted_token_ids,
+        sorted_weights,
+        block_offsets,
+        total_blocks,
+        counts_workspace,
+        local_start,
+        T,
+        TOP_K,
+        E_LOCAL,
+        BLOCK_M,
+        MAX_PADDED,
         num_warps=8
     )
 
@@ -652,5 +688,7 @@ def kernel(
         stride_bse=gemm2_weights_scale.stride(0), stride_bsn=gemm2_weights_scale.stride(1), stride_bsk=gemm2_weights_scale.stride(2),
     )
 
-    # Final cast to bfloat16
+    if output is None:
+        return output_fp32.to(torch.bfloat16)
     output.copy_(output_fp32)
+    return output
