@@ -132,3 +132,31 @@ Stopping app - local entrypoint completed.
 ✓ App completed. View run at https://modal.com/apps/jiaoliangyu968/main/ap-18ebzVjg2AzpsDJekZi9oV
 ```
 没有trace信息，定位中。。。
+
+
+### 0308_log
+按 `README` 的 P0/P1 方向（[README.md:258](d:/mlsys2026/mlsys_note/README.md:258), [README.md:268](d:/mlsys2026/mlsys_note/README.md:268)）对照你当前实现，我建议优先看这 6 个点：
+
+1. 去掉热路径里的 GPU→CPU 标量同步  
+代码里有 `int(local_expert_offset)` 和 `float(routed_scaling_factor)`（[kernel.py:565](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:565), [kernel.py:569](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:569)）。  
+把它们改成 device scalar 传入 Triton（pointer load），可进一步压低小 batch 的 CPU overhead。
+
+2. `sort` 目前是单 CTA，改成多 CTA 两阶段  
+现在 `triton_sort_and_scatter_kernel` 只 launch `(1,)`（[kernel.py:597](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:597)），并在 kernel 内串行扫 `N=T*TOP_K`（[kernel.py:198](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:198), [kernel.py:230](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:230)）。  
+可改成 `histogram -> scan -> scatter` 的多 block 版本，能更好覆盖 T=512/4096。
+
+3. 预计算 `block -> expert` 映射，避免 GEMM 内反复 `argmax`  
+GEMM1/GEMM2 每个 program 都在扫 32 个 expert 边界找 `expert_id`（[kernel.py:337](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:337), [kernel.py:489](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:489)）。  
+在 sorting 阶段直接产出 `block_expert_ids`，GEMM 里直接 load，一般是低风险且稳定收益。
+
+4. 修正 autotune key，让 GEMM2 真正按 T 选配置  
+autotune key 写了 `num_padded`（[kernel.py:444](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:444)），但 kernel 参数里没有这个字段（[kernel.py:448](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:448)）。  
+建议改成 `MAX_PID_M` 或显式传 `num_padded`，对应 README 里提到的 `T=512` GEMM2 回归问题。
+
+5. 索引类型从 `int64` 降到 `int32/int16`  
+`topk_idx`、`sorted_token_ids` 目前是 `int64`（[kernel.py:142](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:142), [kernel.py:589](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:589)），但 token/expert 范围很小。  
+降位宽可减少 sorting + GEMM 的访存带宽压力。
+
+6. `exp` 密集路径可尝试 fast sigmoid 近似  
+routing 和 SwiGLU 都在用 `tl.exp`（[kernel.py:68](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:68), [kernel.py:405](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:405)）。  
+可按 README/CUDA baseline 思路试 Pade 近似，重点验证误差门限。

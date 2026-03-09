@@ -568,7 +568,7 @@ def kernel(
     gemm2_weights_scale,      # [32, 56, 16]      float32
     local_expert_offset,      # int32 scalar
     routed_scaling_factor,    # float32 scalar
-    output,                   # [T, 7168]         bfloat16  (destination-passing, last)
+    output=None,              # [T, 7168] bfloat16 (optional destination-passing)
 ):
     T = routing_logits.shape[0]
     device = hidden_states.device
@@ -652,5 +652,8 @@ def kernel(
         stride_bse=gemm2_weights_scale.stride(0), stride_bsn=gemm2_weights_scale.stride(1), stride_bsk=gemm2_weights_scale.stride(2),
     )
 
-    # Final cast to bfloat16
+    # Final cast to bfloat16. Support both destination-passing and return-style APIs.
+    if output is None:
+        return output_fp32.to(torch.bfloat16)
     output.copy_(output_fp32)
+    return output
