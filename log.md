@@ -147,26 +147,56 @@ key=['num_padded', ...] 改为 key=['MAX_PID_M', ...]。—— 无明显优化
 3. 消除两个d2h。 —— 省掉了两个d2h大约14us的耗时
 
 
-1. 去掉热路径里的 GPU→CPU 标量同步  
-代码里有 `int(local_expert_offset)` 和 `float(routed_scaling_factor)`（[kernel.py:565](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:565), [kernel.py:569](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:569)）。  
-把它们改成 device scalar 传入 Triton（pointer load），可进一步压低小 batch 的 CPU overhead。
+4. - Motivation: `num_padded` is highly sensitive to expert-wise token fragmentation. Fixed `BLOCK_M=64` can over-pad small batches.
+- Change: introduce runtime selection for token block size:
+  - `BLOCK_M_SMALL = 32`
+  - `BLOCK_M_LARGE = 64`
+  - `SMALL_BATCH_TOPK_TOKENS = 512`
+  - rule: if `T * TOP_K <= 512`, use `BLOCK_M=32`; else use `BLOCK_M=64`.
+- Implementation details:
+  - Added `_select_block_m(num_topk_tokens)`.
+  - Sort path now uses selected `block_m` (instead of fixed `BLOCK_M`).
+  - `MAX_PADDED` / `MAX_PID_M` are computed from selected `block_m`.
+  - Workspace cache key changed from `bkey=T` to `bkey=(T, block_m)`.
+  - GEMM1/GEMM2 launches now pass `BLOCK_M=block_m` explicitly.
+  - GEMM autotune configs no longer hardcode `BLOCK_M`; key now includes `BLOCK_M`.
+- Expected effect:
+  - Small batches: lower padding waste, reduce useless FLOPs.
+  - Medium/large batches: keep existing 64-tile behavior for throughput.
 
-2. `sort` 目前是单 CTA，改成多 CTA 两阶段  
-现在 `triton_sort_and_scatter_kernel` 只 launch `(1,)`（[kernel.py:597](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:597)），并在 kernel 内串行扫 `N=T*TOP_K`（[kernel.py:198](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:198), [kernel.py:230](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:230)）。  
-可改成 `histogram -> scan -> scatter` 的多 block 版本，能更好覆盖 T=512/4096。
+### 2026-03-10 cuda graph experiment
 
-3. 预计算 `block -> expert` 映射，避免 GEMM 内反复 `argmax`  
-GEMM1/GEMM2 每个 program 都在扫 32 个 expert 边界找 `expert_id`（[kernel.py:337](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:337), [kernel.py:489](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:489)）。  
-在 sorting 阶段直接产出 `block_expert_ids`，GEMM 里直接 load，一般是低风险且稳定收益。
+- Added a CUDA Graph wrapper on top of kernel execution path in `solution/triton/kernel.py`.
+- Refactor:
+  - Original execution path moved to `_kernel_impl(...)`.
+  - Public `kernel(...)` now tries graph replay when:
+    - destination-passing mode is used (`output` is provided), and
+    - all major tensor inputs are CUDA tensors.
+- Graph cache key includes device, T, selected `block_m`, all major tensor pointers, output pointer, and scalar identity/value.
+- On graph miss:
+  - run one eager pass to allocate workspaces,
+  - capture with `torch.cuda.CUDAGraph`,
+  - cache and replay subsequently.
+- Fallback behavior:
+  - if graph preconditions are not met, run eager `_kernel_impl(...)` unchanged.
 
-4. 修正 autotune key，让 GEMM2 真正按 T 选配置  
-autotune key 写了 `num_padded`（[kernel.py:444](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:444)），但 kernel 参数里没有这个字段（[kernel.py:448](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:448)）。  
-建议改成 `MAX_PID_M` 或显式传 `num_padded`，对应 README 里提到的 `T=512` GEMM2 回归问题。
-
-5. 索引类型从 `int64` 降到 `int32/int16`  
-`topk_idx`、`sorted_token_ids` 目前是 `int64`（[kernel.py:142](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:142), [kernel.py:589](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:589)），但 token/expert 范围很小。  
-降位宽可减少 sorting + GEMM 的访存带宽压力。
-
-6. `exp` 密集路径可尝试 fast sigmoid 近似  
-routing 和 SwiGLU 都在用 `tl.exp`（[kernel.py:68](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:68), [kernel.py:405](d:/mlsys2026/flashinfer-bench-starter-kit/solution/triton/kernel.py:405)）。  
-可按 README/CUDA baseline 思路试 Pade 近似，重点验证误差门限。
+  moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload b8f4f012...: PASSED | 0.167 ms | 69.57x speedup | abs_err=2.05e+03, rel_err=6.34e+01
+  Workload e05c6c03...: PASSED | 0.165 ms | 67.00x speedup | abs_err=2.05e+03, rel_err=8.84e+01
+  Workload 6230e838...: PASSED | 0.311 ms | 44.23x speedup | abs_err=4.10e+03, rel_err=4.02e+01
+  Workload 8f1ff9f1...: PASSED | 0.659 ms | 23.75x speedup | abs_err=4.10e+03, rel_err=3.61e+02
+  Workload 1a4c6ba1...: PASSED | 0.855 ms | 24.21x speedup | abs_err=4.69e+05, rel_err=4.69e+13
+  Workload a7c2bcfd...: PASSED | 0.198 ms | 62.73x speedup | abs_err=4.10e+03, rel_err=1.99e+01
+  Workload 2e69caee...: PASSED | 0.162 ms | 69.62x speedup | abs_err=2.05e+03, rel_err=3.63e+01
+  Workload 8cba5890...: PASSED | 0.209 ms | 58.28x speedup | abs_err=2.05e+03, rel_err=3.47e+02
+  Workload 5e8dc11c...: PASSED | 6.631 ms | 6.76x speedup | abs_err=5.49e+05, rel_err=4.51e+13
+  Workload 58a34f27...: PASSED | 4.728 ms | 7.53x speedup | abs_err=5.28e+05, rel_err=5.28e+13
+  Workload 5eadab1e...: PASSED | 0.264 ms | 51.23x speedup | abs_err=4.10e+03, rel_err=9.76e+01
+  Workload eedc63b2...: PASSED | 0.293 ms | 45.64x speedup | abs_err=4.10e+03, rel_err=3.83e+01
+  Workload e626d3e6...: PASSED | 0.349 ms | 43.21x speedup | abs_err=4.10e+03, rel_err=2.84e+02
+  Workload 74d7ff04...: PASSED | 0.348 ms | 42.01x speedup | abs_err=4.10e+03, rel_err=4.59e+02
+  Workload 4822167c...: PASSED | 0.347 ms | 45.80x speedup | abs_err=4.10e+03, rel_err=4.99e+02
+  Workload 81955b1e...: PASSED | 0.343 ms | 41.60x speedup | abs_err=2.05e+03, rel_err=1.18e+09
+  Workload 76010cb4...: PASSED | 0.327 ms | 43.20x speedup | abs_err=4.10e+03, rel_err=4.56e+02
+  Workload fc378037...: PASSED | 0.344 ms | 41.50x speedup | abs_err=4.10e+03, rel_err=4.71e+02
+  Workload f7d6ac7c...: PASSED | 0.276 ms | 46.89x speedup | abs_err=4.10e+03, rel_err=5.15e+01
