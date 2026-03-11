@@ -2,7 +2,7 @@
 
 > **赛道:** Track A — Fused MoE
 > **目标硬件:** NVIDIA B200 (Blackwell, sm100)
-> **当前状态:** ✅ 19/19 PASSED｜最高 **54.88x** 加速｜large-T **7.3-8.2x**｜中等 T **32-44x**
+> **当前状态:** ✅ 19/19 PASSED｜最高 **80.31x** 加速｜large-T **7.2-8.1x**｜中等 T **36-52x**
 
 ---
 
@@ -12,37 +12,37 @@
 |------|------|
 | DeepSeek-V3 routing | ✅ 完成 |
 | Token sorting (expert 分组) | ✅ 完成（`moe_sort_tokens()` + expert 边界检测） |
-| FP8 block-scale Triton Fused Kernel | ✅ 完成（`_fused_moe_gemm1_swiglu_kernel` 和 `_fused_moe_gemm2_scatter_kernel`） |
+| FP8 block-scale Triton Fused Kernel | ✅ 完成（`_fused_moe_gemm1_swiglu_kernel` + `_fused_moe_gemm2_kernel` + `_token_reduce_kernel`） |
 | Native FP32 精度对齐 | ✅ 完成（Triton 内全 FP32 math，通过所有数值测试） |
 | Benchmark 正确性 | ✅ 19/19 PASSED (100% Numerically Correct) |
 
 ### B200 Benchmark 结果（最新）
 
-Round 10 优化：将 GEMM2 的 `tl.atomic_add` 散射改为先写入本地 `expert_out` 缓冲区（非原子 `tl.store`），再由轻量级 `_reduce_scatter_kernel` 做加权累加。彻底消除了 GEMM2 计算路径上的原子竞争，中等规模工作负载**全线暴涨 50%**，峰值达到 **54.88x**！
+Round 10.1 优化：在 Round 10 非原子 GEMM2 基础上，进一步将 `_reduce_scatter_kernel`（仍使用 `tl.atomic_add`）替换为 **Token-Centric Reduce** `_token_reduce_kernel`。每个 output token 启动一个程序，通过 `scatter_map` 直接读取其 TOP_K=8 个 expert 贡献并求和，写入 bf16 output。**一举消除了 `output_fp32.zero_()`、`tl.atomic_add`、`fp32→bf16 copy`**。峰值达到 **80.31x**！
 
-| Workload | R7 | R8 (Routing) | R9 (Sort) | R10 (Non-Atomic) | 备注 |
-|----------|-----|---------|---------|---------|------|
-| e05c6c03 | 12.56x | 16.73x | 47.89x | **54.88x** | 🔥 peak |
-| b8f4f012 (T=7) | 11.67x | 15.34x | 40.42x | **47.02x** | |
-| 2e69caee | 12.05x | 16.11x | 42.84x | **40.17x** | T=7 |
-| a7c2bcfd (T=128)| 10.83x | 13.62x | 29.78x | **44.36x** | +49% 🔥 |
-| 8cba5890 | 10.89x | 13.55x | 29.85x | **42.70x** | +43% 🔥 |
-| 5eadab1e | 10.99x | 13.32x | 27.38x | **38.33x** | +40% 🔥 |
-| 6230e838 | 9.98x | 11.96x | 22.94x | **36.00x** | +57% 🔥 |
-| eedc63b2 | 9.92x | 12.23x | 23.95x | **35.43x** | +48% 🔥 |
-| 4822167c | 10.02x | 11.95x | 22.42x | **35.01x** | +56% 🔥 |
-| f7d6ac7c | 10.57x | 12.30x | 26.78x | **34.22x** | +28% |
-| e626d3e6 | 10.17x | 12.12x | 22.81x | **34.14x** | +50% 🔥 |
-| 76010cb4 | 9.86x | 12.00x | 23.04x | **33.48x** | +45% 🔥 |
-| 81955b1e | 9.86x | 11.85x | 22.18x | **33.28x** | +50% 🔥 |
-| fc378037 | 10.02x | 12.01x | 22.29x | **33.07x** | +48% 🔥 |
-| 74d7ff04 | 10.00x | 11.99x | 22.53x | **32.69x** | +45% 🔥 |
-| 1a4c6ba1 | 11.09x | 13.06x | 22.90x | **23.22x** | T=512 |
-| 8f1ff9f1 | 10.06x | 11.95x | 21.31x | **21.15x** | |
-| 58a34f27 (T=4096)| 7.11x | 7.91x | 7.13x | **8.18x** | +15% |
-| 5e8dc11c (T=4096)| 6.73x | 7.33x | 6.58x | **7.32x** | +11% |
+| Workload | R9 (Sort) | R10 (Non-Atomic) | R10.1 (Token Reduce) | 备注 |
+|----------|---------|---------|---------|------|
+| e05c6c03 | 47.89x | 54.88x | **80.31x** | 🔥 peak (+46%) |
+| 2e69caee | 42.84x | 40.17x | **71.54x** | +78% 🔥🔥 |
+| b8f4f012 (T=7) | 40.42x | 47.02x | **63.57x** | +35% 🔥 |
+| a7c2bcfd (T=128)| 29.78x | 44.36x | **52.08x** | +17% 🔥 |
+| 8cba5890 | 29.85x | 42.70x | **46.45x** | +9% |
+| 5eadab1e | 27.38x | 38.33x | **44.54x** | +16% 🔥 |
+| f7d6ac7c | 26.78x | 34.22x | **39.85x** | +16% 🔥 |
+| eedc63b2 | 23.95x | 35.43x | **39.23x** | +11% |
+| 76010cb4 | 23.04x | 33.48x | **38.36x** | +15% 🔥 |
+| 6230e838 | 22.94x | 36.00x | **37.86x** | +5% |
+| e626d3e6 | 22.81x | 34.14x | **37.84x** | +11% |
+| 74d7ff04 | 22.53x | 32.69x | **36.77x** | +12% |
+| 4822167c | 22.42x | 35.01x | **36.56x** | +4% |
+| 81955b1e | 22.18x | 33.28x | **36.00x** | +8% |
+| fc378037 | 22.29x | 33.07x | **35.78x** | +8% |
+| 1a4c6ba1 | 22.90x | 23.22x | **24.04x** | T=512 |
+| 8f1ff9f1 | 21.31x | 21.15x | **21.88x** | |
+| 58a34f27 (T=4096)| 7.13x | 8.18x | **8.06x** | ~持平 |
+| 5e8dc11c (T=4096)| 6.58x | 7.32x | **7.24x** | ~持平 |
 
-**Round 10 核心洞察：** 消除 GEMM2 中的 `tl.atomic_add` 后，GEMM2 内核变为纯计算 kernel（无原子竞争），吞吐量大幅提升。原子操作被推迟到独立的 `_reduce_scatter_kernel` 中，该 kernel 仅做 load+atomic_add 无 GEMM 计算，原子压力远小于与 K-loop 耦合时的情况。
+**Round 10.1 核心洞察：** Token-Centric Reduce 将 reduce 阶段从 expert-centric（遍历 sorted slots、atomic 写）改为 token-centric（遍历 output tokens、读 scatter_map、直接求和写 bf16）。消除了三个开销源：`zero_()`、`atomic_add`、`fp32→bf16 copy`。小 T 工作负载收益最大（+46-78%），因为这些场景中 reduce 占比更高。
 
 ---
 
@@ -174,9 +174,9 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
    - `_fused_moe_gemm2_kernel`（`@triton.autotune`）
    - Post-dot B-scale：`tl.dot(a, b.to(f32))` + `acc += partial * b_scale`
    - 非原子写入 `expert_out[num_padded, 7168]`，**彻底消除 GEMM 计算路径上的原子竞争**
-5. **Reduce-Scatter Kernel**
-   - `_reduce_scatter_kernel`：从 `expert_out` 加载并通过轻量级 `tl.atomic_add` 散射到 `output_fp32[T, 7168]`
-   - 无 GEMM 计算，原子压力远低于与 K-loop 耦合时
+5. **Token-Centric Reduce Kernel**
+   - `_token_reduce_kernel`：每个 output token 启动一个程序，通过 `scatter_map` 直接定位 TOP_K=8 个 expert 贡献
+   - 在 fp32 中求和后直接写入 bf16 output，**零原子、零清零、零 copy**
 
 ---
 

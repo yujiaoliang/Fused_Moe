@@ -171,6 +171,7 @@ def triton_sort_and_scatter_kernel(
     topk_wts_ptr,       # [T, TOP_K]
     sorted_tokens_ptr,  # [MAX_PADDED]
     sorted_weights_ptr, # [MAX_PADDED]
+    scatter_map_ptr,    # [T * TOP_K] int32 -- output: where each (token, expert) ended up
     block_offsets_ptr,  # [E_LOCAL + 1] -> 33
     total_blocks_ptr,   # [1]
     counts_ptr,         # [E_LOCAL] workspace
@@ -234,7 +235,7 @@ def triton_sort_and_scatter_kernel(
         offset += 256
     tl.debug_barrier()
     
-    # 4. Scatter
+    # 4. Scatter (and record scatter_map)
     offset = 0
     while offset < N:
         idx = offset + tid
@@ -255,6 +256,11 @@ def triton_sort_and_scatter_kernel(
         
         tl.store(out_tok_ptr, tok_id, mask=is_local)
         tl.store(out_wgt_ptr, wgt, mask=is_local)
+        
+        # Record scatter_map: for each (token, expert_slot), store dest position
+        # scatter_map[idx] = dest (or -1 if not local)
+        tl.store(scatter_map_ptr + idx, dest, mask=is_local)
+        tl.store(scatter_map_ptr + idx, -1, mask=mask & (~is_local))
         
         offset += 256
 
@@ -545,57 +551,56 @@ def _fused_moe_gemm2_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Triton Kernel 3: Reduce-Scatter
-# Reads expert_out[num_padded, N] and accumulates into output[T, N]
+# Triton Kernel 3: Token-Centric Reduce (zero-free, atomic-free, bf16 fused)
+# For each output token, sums its TOP_K expert contributions and writes bf16.
 # ═══════════════════════════════════════════════════════════════
 
 @triton.jit
-def _reduce_scatter_kernel(
+def _token_reduce_kernel(
     expert_out_ptr,   # [num_padded, N] fp32
-    output_ptr,       # [T, N] fp32
-    token_ids_ptr,    # [num_padded] int64
-    total_blocks_ptr, # [1] int32
-    T_val,
+    output_ptr,       # [T, N] bf16 (final output, written directly)
+    scatter_map_ptr,  # [T * TOP_K] int32 -- positions in expert_out
+    T_val: tl.constexpr,
     N: tl.constexpr,
+    TOP_K: tl.constexpr,
     stride_em, stride_en,
     stride_ot, stride_on,
-    BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """
-    Each program handles one M-block of sorted tokens, reading BLOCK_N columns.
-    Accumulates expert_out[sorted_idx, n] into output[token_id, n] via atomic_add.
-    Since this kernel does NO compute (just load+store), the atomic pressure
-    is much lighter than when combined with the full GEMM K-loop.
+    Grid: T_val * cdiv(N, BLOCK_N)
+    Each program handles one token's BLOCK_N columns.
+    Iterates over TOP_K expert slots, sums contributions, stores bf16.
+    No atomic_add, no zero_() needed, no fp32->bf16 copy needed.
     """
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     
-    total_blocks = tl.load(total_blocks_ptr)
-    if total_blocks <= 0:
-        return
-    if pid >= total_blocks * num_pid_n:
-        return
-
-    pid_m = pid // num_pid_n
+    pid_t = pid // num_pid_n
     pid_n = pid % num_pid_n
     
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    if pid_t >= T_val:
+        return
+    
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_mask = rn < N
     
-    # Load token IDs for this block
-    token_idx = tl.load(token_ids_ptr + rm)
-    valid_mask = token_idx < T_val
-    safe_token_idx = tl.where(valid_mask, token_idx, 0)
+    # Accumulate over TOP_K expert contributions
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
     
-    # Load expert output
-    e_ptrs = expert_out_ptr + rm[:, None] * stride_em + rn[None, :] * stride_en
-    vals = tl.load(e_ptrs)
+    # Load scatter_map for this token: scatter_map[t * TOP_K + k]
+    base_idx = pid_t * TOP_K
+    for k in tl.static_range(TOP_K):
+        pos = tl.load(scatter_map_ptr + base_idx + k)
+        if pos >= 0:
+            # Load expert_out[pos, rn]
+            e_ptrs = expert_out_ptr + pos * stride_em + rn * stride_en
+            vals = tl.load(e_ptrs, mask=n_mask, other=0.0)
+            acc += vals
     
-    # Scatter-add to output
-    o_ptrs = output_ptr + safe_token_idx[:, None] * stride_ot + rn[None, :] * stride_on
-    tl.atomic_add(o_ptrs, vals, mask=valid_mask[:, None] & n_mask[None, :], sem='relaxed')
+    # Store directly as bf16 -- no intermediate fp32 buffer needed
+    o_ptrs = output_ptr + pid_t * stride_ot + rn * stride_on
+    tl.store(o_ptrs, acc.to(tl.bfloat16), mask=n_mask)
 
 # ═══════════════════════════════════════════════════════════════
 # Pre-allocated buffer cache — reuse output_fp32/Intermediate
@@ -648,30 +653,32 @@ def kernel(
     bkey = (T, block_m)
 
     if bkey in _buf_cache:
-        output_fp32, Intermediate, expert_out = _buf_cache[bkey]
-        output_fp32.zero_()
+        Intermediate, expert_out = _buf_cache[bkey]
     else:
-        output_fp32 = torch.zeros((T, 7168), dtype=torch.float32, device=device)
         Intermediate = torch.empty((MAX_PADDED, 2048), dtype=torch.float32, device=device)
         expert_out = torch.empty((MAX_PADDED, 7168), dtype=torch.float32, device=device)
-        _buf_cache[bkey] = (output_fp32, Intermediate, expert_out)
+        _buf_cache[bkey] = (Intermediate, expert_out)
 
     if bkey in _sort_cache:
-        topk_idx_ws, topk_wts_ws, sorted_token_ids, sorted_weights, block_offsets, total_blocks, counts_workspace = _sort_cache[bkey]
+        topk_idx_ws, topk_wts_ws, sorted_token_ids, sorted_weights, scatter_map, block_offsets, total_blocks, counts_workspace = _sort_cache[bkey]
     else:
         topk_idx_ws = torch.empty((T, TOP_K), dtype=torch.int32, device=device)
         topk_wts_ws = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
         sorted_token_ids = torch.empty((MAX_PADDED,), dtype=torch.int64, device=device)
         sorted_weights = torch.empty((MAX_PADDED,), dtype=torch.float32, device=device)
+        scatter_map = torch.empty((T * TOP_K,), dtype=torch.int32, device=device)
         block_offsets = torch.empty((E_LOCAL + 1,), dtype=torch.int32, device=device)
         total_blocks = torch.empty((1,), dtype=torch.int32, device=device)
         counts_workspace = torch.empty((E_LOCAL,), dtype=torch.int32, device=device)
         _sort_cache[bkey] = (
             topk_idx_ws, topk_wts_ws,
-            sorted_token_ids, sorted_weights,
+            sorted_token_ids, sorted_weights, scatter_map,
             block_offsets, total_blocks, counts_workspace,
         )
 
+    # Allocate output if needed (destination-passing style)
+    if output is None:
+        output = torch.empty((T, 7168), dtype=torch.bfloat16, device=device)
 
     ds_routing(
         routing_logits,
@@ -685,6 +692,7 @@ def kernel(
         topk_wts_ws,
         sorted_token_ids,
         sorted_weights,
+        scatter_map,
         block_offsets,
         total_blocks,
         counts_workspace,
@@ -697,7 +705,7 @@ def kernel(
         num_warps=8
     )
 
-    # ── 4. Fused GEMM1 + SwiGLU ──
+    # -- 4. Fused GEMM1 + SwiGLU --
     grid1 = lambda META: (MAX_PID_M * triton.cdiv(2048, META['BLOCK_N']),)
 
     _fused_moe_gemm1_swiglu_kernel[grid1](
@@ -718,7 +726,7 @@ def kernel(
         BLOCK_M=block_m,
     )
 
-    # ── 5. GEMM2 (non-atomic, writes to expert_out) ──
+    # -- 5. GEMM2 (non-atomic, writes to expert_out) --
     grid2 = lambda META: (MAX_PID_M * triton.cdiv(7168, META['BLOCK_N']),)
 
     _fused_moe_gemm2_kernel[grid2](
@@ -737,26 +745,22 @@ def kernel(
         BLOCK_M=block_m,
     )
 
-    # ── 6. Reduce-Scatter (lightweight atomic, no GEMM compute) ──
-    RS_BLOCK_N = 256  # wide tiles for memory throughput
+    # -- 6. Token-Centric Reduce (zero-free, atomic-free, bf16 fused) --
+    RS_BLOCK_N = 256
     num_n_blocks = triton.cdiv(7168, RS_BLOCK_N)
-    grid3 = (MAX_PID_M * num_n_blocks,)
+    grid3 = (T * num_n_blocks,)
 
-    _reduce_scatter_kernel[grid3](
+    _token_reduce_kernel[grid3](
         expert_out_ptr=expert_out,
-        output_ptr=output_fp32,
-        token_ids_ptr=sorted_token_ids,
-        total_blocks_ptr=total_blocks,
+        output_ptr=output,
+        scatter_map_ptr=scatter_map,
         T_val=T,
         N=7168,
+        TOP_K=TOP_K,
         stride_em=expert_out.stride(0), stride_en=expert_out.stride(1),
-        stride_ot=output_fp32.stride(0), stride_on=output_fp32.stride(1),
-        BLOCK_M=block_m,
+        stride_ot=output.stride(0), stride_on=output.stride(1),
         BLOCK_N=RS_BLOCK_N,
         num_warps=4,
     )
 
-    if output is None:
-        return output_fp32.to(torch.bfloat16)
-    output.copy_(output_fp32)
     return output

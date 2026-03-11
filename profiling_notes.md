@@ -203,3 +203,29 @@ Large T (≥512): COMPUTE-BOUND — 充分利用 tensor cores
 - **Large-T (4096):** 6.6x → **7.3-8.2x** (+11-15%)
 
 **代价:** 额外 `expert_out[num_padded, 7168]` fp32 缓冲区。T=4096 时约 ~900MB，B200 有 180GB，完全可接受。
+
+---
+
+## 9. Round 10.1: Token-Centric Reduce (B200)
+
+**继续推进:** Round 10 虽然将 GEMM2 的原子竞争消除了，但 `_reduce_scatter_kernel` 仍然使用 `tl.atomic_add` 将 expert_out 散射到 output_fp32，并且还有 `output_fp32.zero_()` 和 `output_fp32.to(bf16)` 的开销。
+
+**方案:** 将 expert-centric 的 `_reduce_scatter_kernel` 替换为 token-centric 的 `_token_reduce_kernel`：
+- 在 sort kernel 中新增 `scatter_map[T*TOP_K]` 输出，记录每个 (token, expert_slot) 在 expert_out 中的位置
+- 新 kernel grid = `T × cdiv(7168, BLOCK_N)`，每个程序处理一个 token 的 BLOCK_N 列
+- 通过 `tl.static_range(TOP_K)` 循环读取恰好 8 个 expert 贡献并求和
+- 直接写入 bf16 output，无需 fp32 中间缓冲
+
+**消除的开销:**
+- `output_fp32.zero_()` — 完全不需要了（T=4096 时 = 112MB memset）
+- `tl.atomic_add` — 完全不需要了（每个 token 仅由一个程序处理）
+- `output_fp32.to(bf16)` — 完全不需要了（直接写 bf16）
+- `output_fp32` 缓冲区本身 — 完全不需要分配了
+
+**结果:**
+- **Peak:** 54.88x → **80.31x** (+46%) 🔥🔥🔥
+- **小 T (7-54):** 40-55x → **63-80x** (+35-78%)
+- **中等 T (128-512):** 32-44x → **36-52x** (+4-17%)
+- **Large-T (4096):** 7.3-8.2x → **7.2-8.1x** (~持平)
+
+**为什么小 T 收益最大?** 因为小 T 场景下 reduce 阶段占总时间的比例更高（GEMM 很快就结束了），所以消除 zero/atomic/copy 的效果被放大。
