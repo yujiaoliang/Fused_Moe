@@ -1,4 +1,4 @@
-﻿"""
+"""
 Fused MoE Kernel — Track A (FlashInfer AI Kernel Generation Contest)
 
 FP8 block-scale MoE with DeepSeek-V3 no-aux routing.
@@ -460,24 +460,23 @@ def _fused_moe_gemm1_swiglu_kernel(
     restore_value=['C_ptr'],
 )
 @triton.jit
-def _fused_moe_gemm2_scatter_kernel(
+def _fused_moe_gemm2_kernel(
     # Data pointers
     A_ptr,            # [num_padded, K] fp32 (intermediate SwiGLU output)
     B_ptr,            # [E, N, K] fp8 (W2 weights trans)
-    C_ptr,            # [T, N] fp32 (output accumulation buffer)
+    C_ptr,            # [num_padded, N] fp32 (expert_out buffer, NOT output)
     B_scale_ptr,      # [E, N//128, K//128] fp32 (W2 block scales)
     token_weights_ptr,# [num_padded] fp32 (routing weights for each slot)
-    token_ids_ptr,    # [num_padded] int64 (original token indices to scatter to)
     block_offsets_ptr,# [E_LOCAL + 1] int32
     total_blocks_ptr, # [1] int32
     
     # Dimensions
-    T_val, MAX_PID_M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    MAX_PID_M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
     
     # Strides
     stride_am, stride_ak,
     stride_be, stride_bn, stride_bk,
-    stride_ct, stride_cn,
+    stride_cm, stride_cn,
     stride_bse, stride_bsn, stride_bsk,
     
     # Block sizes
@@ -514,14 +513,7 @@ def _fused_moe_gemm2_scatter_kernel(
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     
-    # Masks
-    n_mask = rn < N
-    
-    # Load routing token IDs and Weights
-    token_idx = tl.load(token_ids_ptr + rm)
-    # T_val is the pad token. So actual valid tokens have index < T_val
-    valid_mask = token_idx < T_val
-    
+    # Load routing weights
     token_weights = tl.load(token_weights_ptr + rm)
 
     # Accumulator
@@ -541,22 +533,69 @@ def _fused_moe_gemm2_scatter_kernel(
         # Load B: fp8 (N=7168 always divisible by BLOCK_N, no mask needed)
         b = tl.load(b_base + rk[:, None] * stride_bk)
 
-        # Post-dot B-scale: BLOCK_K == QBLOCK so b_scale constant along K within tile
-        # a @ (b * scale) = (a @ b) * scale — fewer muls + better TF32 precision
+        # Post-dot B-scale
         b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk)
         partial = tl.dot(a, b.to(tl.float32), out_dtype=tl.float32)
         acc += partial * b_scale
         
-    # Scale by routing weights
+    # Scale by routing weights and store (NO atomic!)
     out = acc * token_weights[:, None]
+    c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+    tl.store(c_ptrs, out)
 
-    # Scatter Add directly to output tensor C[T, N]
-    # Cap token_idx to 0 to prevent out-of-bounds pointer crashes even when masked
-    safe_token_idx = tl.where(token_idx < T_val, token_idx, 0)
-    c_ptrs = C_ptr + safe_token_idx[:, None] * stride_ct + rn[None, :] * stride_cn
+
+# ═══════════════════════════════════════════════════════════════
+# Triton Kernel 3: Reduce-Scatter
+# Reads expert_out[num_padded, N] and accumulates into output[T, N]
+# ═══════════════════════════════════════════════════════════════
+
+@triton.jit
+def _reduce_scatter_kernel(
+    expert_out_ptr,   # [num_padded, N] fp32
+    output_ptr,       # [T, N] fp32
+    token_ids_ptr,    # [num_padded] int64
+    total_blocks_ptr, # [1] int32
+    T_val,
+    N: tl.constexpr,
+    stride_em, stride_en,
+    stride_ot, stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    """
+    Each program handles one M-block of sorted tokens, reading BLOCK_N columns.
+    Accumulates expert_out[sorted_idx, n] into output[token_id, n] via atomic_add.
+    Since this kernel does NO compute (just load+store), the atomic pressure
+    is much lighter than when combined with the full GEMM K-loop.
+    """
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
     
-    # Triton atomic_add into FP32 buffer
-    tl.atomic_add(c_ptrs, out, mask=valid_mask[:, None] & n_mask[None, :], sem='relaxed')
+    total_blocks = tl.load(total_blocks_ptr)
+    if total_blocks <= 0:
+        return
+    if pid >= total_blocks * num_pid_n:
+        return
+
+    pid_m = pid // num_pid_n
+    pid_n = pid % num_pid_n
+    
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    n_mask = rn < N
+    
+    # Load token IDs for this block
+    token_idx = tl.load(token_ids_ptr + rm)
+    valid_mask = token_idx < T_val
+    safe_token_idx = tl.where(valid_mask, token_idx, 0)
+    
+    # Load expert output
+    e_ptrs = expert_out_ptr + rm[:, None] * stride_em + rn[None, :] * stride_en
+    vals = tl.load(e_ptrs)
+    
+    # Scatter-add to output
+    o_ptrs = output_ptr + safe_token_idx[:, None] * stride_ot + rn[None, :] * stride_on
+    tl.atomic_add(o_ptrs, vals, mask=valid_mask[:, None] & n_mask[None, :], sem='relaxed')
 
 # ═══════════════════════════════════════════════════════════════
 # Pre-allocated buffer cache — reuse output_fp32/Intermediate
@@ -609,12 +648,13 @@ def kernel(
     bkey = (T, block_m)
 
     if bkey in _buf_cache:
-        output_fp32, Intermediate = _buf_cache[bkey]
+        output_fp32, Intermediate, expert_out = _buf_cache[bkey]
         output_fp32.zero_()
     else:
         output_fp32 = torch.zeros((T, 7168), dtype=torch.float32, device=device)
         Intermediate = torch.empty((MAX_PADDED, 2048), dtype=torch.float32, device=device)
-        _buf_cache[bkey] = (output_fp32, Intermediate)
+        expert_out = torch.empty((MAX_PADDED, 7168), dtype=torch.float32, device=device)
+        _buf_cache[bkey] = (output_fp32, Intermediate, expert_out)
 
     if bkey in _sort_cache:
         topk_idx_ws, topk_wts_ws, sorted_token_ids, sorted_weights, block_offsets, total_blocks, counts_workspace = _sort_cache[bkey]
@@ -658,7 +698,6 @@ def kernel(
     )
 
     # ── 4. Fused GEMM1 + SwiGLU ──
-    # Launch with MAX_PID_M, kernels will immediately return if pid_m >= total_blocks
     grid1 = lambda META: (MAX_PID_M * triton.cdiv(2048, META['BLOCK_N']),)
 
     _fused_moe_gemm1_swiglu_kernel[grid1](
@@ -679,24 +718,42 @@ def kernel(
         BLOCK_M=block_m,
     )
 
-    # ── 5. Fused GEMM2 + Scatter Add ──
+    # ── 5. GEMM2 (non-atomic, writes to expert_out) ──
     grid2 = lambda META: (MAX_PID_M * triton.cdiv(7168, META['BLOCK_N']),)
 
-    _fused_moe_gemm2_scatter_kernel[grid2](
+    _fused_moe_gemm2_kernel[grid2](
         A_ptr=Intermediate,
         B_ptr=gemm2_weights,
-        C_ptr=output_fp32,
+        C_ptr=expert_out,
         B_scale_ptr=gemm2_weights_scale,
         token_weights_ptr=sorted_weights,
-        token_ids_ptr=sorted_token_ids,
         block_offsets_ptr=block_offsets,
         total_blocks_ptr=total_blocks,
-        T_val=T, MAX_PID_M=MAX_PID_M, N=7168, K=2048,
+        MAX_PID_M=MAX_PID_M, N=7168, K=2048,
         stride_am=Intermediate.stride(0), stride_ak=Intermediate.stride(1),
         stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1), stride_bk=gemm2_weights.stride(2),
-        stride_ct=output_fp32.stride(0), stride_cn=output_fp32.stride(1),
+        stride_cm=expert_out.stride(0), stride_cn=expert_out.stride(1),
         stride_bse=gemm2_weights_scale.stride(0), stride_bsn=gemm2_weights_scale.stride(1), stride_bsk=gemm2_weights_scale.stride(2),
         BLOCK_M=block_m,
+    )
+
+    # ── 6. Reduce-Scatter (lightweight atomic, no GEMM compute) ──
+    RS_BLOCK_N = 256  # wide tiles for memory throughput
+    num_n_blocks = triton.cdiv(7168, RS_BLOCK_N)
+    grid3 = (MAX_PID_M * num_n_blocks,)
+
+    _reduce_scatter_kernel[grid3](
+        expert_out_ptr=expert_out,
+        output_ptr=output_fp32,
+        token_ids_ptr=sorted_token_ids,
+        total_blocks_ptr=total_blocks,
+        T_val=T,
+        N=7168,
+        stride_em=expert_out.stride(0), stride_en=expert_out.stride(1),
+        stride_ot=output_fp32.stride(0), stride_on=output_fp32.stride(1),
+        BLOCK_M=block_m,
+        BLOCK_N=RS_BLOCK_N,
+        num_warps=4,
     )
 
     if output is None:

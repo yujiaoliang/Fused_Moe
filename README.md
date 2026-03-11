@@ -2,7 +2,7 @@
 
 > **赛道:** Track A — Fused MoE
 > **目标硬件:** NVIDIA B200 (Blackwell, sm100)
-> **当前状态:** ✅ 19/19 PASSED｜最高 **12.56x** 加速｜large-T **6.8-7.3x**｜平均 **~10.2x**
+> **当前状态:** ✅ 19/19 PASSED｜最高 **54.88x** 加速｜large-T **7.3-8.2x**｜中等 T **32-44x**
 
 ---
 
@@ -18,31 +18,31 @@
 
 ### B200 Benchmark 结果（最新）
 
-Round 9 优化：实现 `triton_sort_and_scatter_kernel` 并结合 GEMM 端的 Empty-Block-Skipping 逻辑，彻底砍掉了所有的 CPU 端同步（如 `.item()`, `.tolist()`, `argsort()` 等）。峰值性能如同脱缰野马，直接爆拉至 **47.89x**！这是本次比赛真正的绝杀级优化。
+Round 10 优化：将 GEMM2 的 `tl.atomic_add` 散射改为先写入本地 `expert_out` 缓冲区（非原子 `tl.store`），再由轻量级 `_reduce_scatter_kernel` 做加权累加。彻底消除了 GEMM2 计算路径上的原子竞争，中等规模工作负载**全线暴涨 50%**，峰值达到 **54.88x**！
 
-| Workload | Round 5 | Round 6 | Round 7 | Round 8 (Routing) | Round 9 (Routing+Sort) | 备注 |
-|----------|---------|---------|---------|---------|---------|------|
-| e05c6c03 | 11.91x | 12.14x | 12.56x | 16.73x | **47.89x** | 🔥 peak |
-| 2e69caee | 11.54x | 11.97x | 12.05x | 16.11x | **42.84x** | T=7 |
-| b8f4f012 (T=7) | 10.93x | 11.06x | 11.67x | 15.34x | **40.42x** | |
-| a7c2bcfd (T=128)| 10.00x | 10.84x | 10.83x | 13.62x | **29.78x** | |
-| 8cba5890 | 10.35x | 10.78x | 10.89x | 13.55x | **29.85x** | |
-| 5eadab1e | 9.98x | 10.76x | 10.99x | 13.32x | **27.38x** | |
-| 1a4c6ba1 | 10.80x | 11.34x | 11.09x | 13.06x | **22.90x** | |
-| eedc63b2 | 9.32x | 10.18x | 9.92x | 12.23x | **23.95x** | |
-| e626d3e6 | 9.35x | 9.98x | 10.17x | 12.12x | **22.81x** | |
-| 74d7ff04 | 9.68x | 10.10x | 10.00x | 11.99x | **22.53x** | |
-| 6230e838 | 9.88x | 10.05x | 9.98x | 11.96x | **22.94x** | |
-| 4822167c | 9.68x | 10.19x | 10.02x | 11.95x | **22.42x** | |
-| 8f1ff9f1 | 8.95x | 10.02x | 10.06x | 11.95x | **21.31x** | |
-| 76010cb4 | 9.39x | 10.25x | 9.86x | 12.00x | **23.04x** | |
-| 81955b1e | 9.71x | 10.10x | 9.86x | 11.85x | **22.18x** | |
-| fc378037 | 9.52x | 10.06x | 10.02x | 12.01x | **22.29x** | |
-| f7d6ac7c | 9.85x | 10.53x | 10.57x | 12.30x | **26.78x** | |
-| 58a34f27 (T=4096)| 7.46x | 7.43x | 7.11x | 7.91x | **7.13x** | large-T (Atomic 竞争稍大) |
-| 5e8dc11c (T=4096)| 7.08x | 6.98x | 6.73x | 7.33x | **6.58x** | large-T |
+| Workload | R7 | R8 (Routing) | R9 (Sort) | R10 (Non-Atomic) | 备注 |
+|----------|-----|---------|---------|---------|------|
+| e05c6c03 | 12.56x | 16.73x | 47.89x | **54.88x** | 🔥 peak |
+| b8f4f012 (T=7) | 11.67x | 15.34x | 40.42x | **47.02x** | |
+| 2e69caee | 12.05x | 16.11x | 42.84x | **40.17x** | T=7 |
+| a7c2bcfd (T=128)| 10.83x | 13.62x | 29.78x | **44.36x** | +49% 🔥 |
+| 8cba5890 | 10.89x | 13.55x | 29.85x | **42.70x** | +43% 🔥 |
+| 5eadab1e | 10.99x | 13.32x | 27.38x | **38.33x** | +40% 🔥 |
+| 6230e838 | 9.98x | 11.96x | 22.94x | **36.00x** | +57% 🔥 |
+| eedc63b2 | 9.92x | 12.23x | 23.95x | **35.43x** | +48% 🔥 |
+| 4822167c | 10.02x | 11.95x | 22.42x | **35.01x** | +56% 🔥 |
+| f7d6ac7c | 10.57x | 12.30x | 26.78x | **34.22x** | +28% |
+| e626d3e6 | 10.17x | 12.12x | 22.81x | **34.14x** | +50% 🔥 |
+| 76010cb4 | 9.86x | 12.00x | 23.04x | **33.48x** | +45% 🔥 |
+| 81955b1e | 9.86x | 11.85x | 22.18x | **33.28x** | +50% 🔥 |
+| fc378037 | 10.02x | 12.01x | 22.29x | **33.07x** | +48% 🔥 |
+| 74d7ff04 | 10.00x | 11.99x | 22.53x | **32.69x** | +45% 🔥 |
+| 1a4c6ba1 | 11.09x | 13.06x | 22.90x | **23.22x** | T=512 |
+| 8f1ff9f1 | 10.06x | 11.95x | 21.31x | **21.15x** | |
+| 58a34f27 (T=4096)| 7.11x | 7.91x | 7.13x | **8.18x** | +15% |
+| 5e8dc11c (T=4096)| 6.73x | 7.33x | 6.58x | **7.32x** | +11% |
 
-**硬件极限界限 (Autotuning Context):** 针对 T=512 和 T=4096 序列通过枚举深网格映射 (`GROUP_M=32`) 与深流片维度 (`num_stages=6`) 调优证实：此时性能分布维持在稳定幅度内，当前 FP8 Triton 算子已经完全榨取了 B200 的 Memory Bound (访存带宽) 物理天花板，此为全局算力极大值点！
+**Round 10 核心洞察：** 消除 GEMM2 中的 `tl.atomic_add` 后，GEMM2 内核变为纯计算 kernel（无原子竞争），吞吐量大幅提升。原子操作被推迟到独立的 `_reduce_scatter_kernel` 中，该 kernel 仅做 load+atomic_add 无 GEMM 计算，原子压力远小于与 K-loop 耦合时的情况。
 
 ---
 
@@ -170,10 +170,13 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
    - FP8 Activation & Weights 传入
    - **Native FP8 Tensor Core Dot** (`tl.dot(fp8, fp8)`) + post-dot scale multiply，2x 吞吐 vs TF32
    - 输出 fp32 `Intermediate` [num_padded, 2048]（bf16 精度不足，6/19 失败）
-4. **Monolithic Triton Kernel 2: GEMM2 + Scatter Add**
-   - `_fused_moe_gemm2_scatter_kernel`（`@triton.autotune` 自动调参，BLOCK_K=128）
-   - Post-dot B-scale：`tl.dot(a, b.to(f32))` + `acc += partial * b_scale`，减少标量乘法并提升 TF32 精度
-   - 使用 Triton `tl.atomic_add` 直接将更新写入最终的 fp32 buffer，避免低精度 rounding error，随后复制至 `bfloat16` output。
+4. **Monolithic Triton Kernel 2: GEMM2 (Non-Atomic)**
+   - `_fused_moe_gemm2_kernel`（`@triton.autotune`）
+   - Post-dot B-scale：`tl.dot(a, b.to(f32))` + `acc += partial * b_scale`
+   - 非原子写入 `expert_out[num_padded, 7168]`，**彻底消除 GEMM 计算路径上的原子竞争**
+5. **Reduce-Scatter Kernel**
+   - `_reduce_scatter_kernel`：从 `expert_out` 加载并通过轻量级 `tl.atomic_add` 散射到 `output_fp32[T, 7168]`
+   - 无 GEMM 计算，原子压力远低于与 K-loop 耦合时
 
 ---
 

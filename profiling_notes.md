@@ -181,3 +181,25 @@ Large T (≥512): COMPUTE-BOUND — 充分利用 tensor cores
 - 添加极深流水线 (`num_stages=6`) 或是对齐整个 L2 Cache 的网格映射 (`GROUP_M=32`) 未能带来更显著的性能提升。
 - 最终 T=512 成绩稳固在约 **+22.5x**，而 T=4096 稳固在 **+6.5x~7.1x**。
 - **分析:** 这证明了当前的 `_fused_moe_gemm1_swiglu_kernel` (N=4096) 和 `_fused_moe_gemm2_scatter_kernel` (N=2048) 已经在指令并发和 HBM 带宽上挤干了 B200 的硬件能力。考虑到 Fused FP8 GEMMs + Scatter 添加过程本身的极限 Memory Bound 物理属性，目前的结果即为基于此工程配置的数学极限。
+
+---
+
+## 8. Round 10: Non-Atomic GEMM2 + Reduce-Scatter (B200)
+
+**核心发现:** 在 Round 7 的 autotune 饱和测试中，我们曾错误地认为 GEMM2 已经达到硬件极限。实际上，**瓶颈不是 GEMM 计算本身，而是 `tl.atomic_add` 的写入竞争**。
+
+**方案:** 将 `_fused_moe_gemm2_scatter_kernel`（GEMM + atomic scatter-add）拆分为两个独立 kernel：
+1. `_fused_moe_gemm2_kernel`：纯 GEMM 计算，通过非原子 `tl.store` 写入 `expert_out[num_padded, 7168]`
+2. `_reduce_scatter_kernel`：从 `expert_out` 读取并通过 `tl.atomic_add` 累加到 `output_fp32[T, 7168]`
+
+**为什么有效:**
+- 原来 GEMM2 的 K-loop（16 iterations × BLOCK_K=128）在计算完成后立即 atomic_add，大量 SM 同时竞争同一 output 行
+- 拆分后，GEMM2 变为纯计算 kernel（无竞争），吞吐量直接拉满
+- Reduce-scatter 仅做 load+add（无 GEMM），原子操作独占带宽，竞争程度大幅降低
+
+**结果:**
+- **Peak:** 47.89x → **54.88x** (+15%)
+- **中等 T (128-512):** 22x → **32-44x** (+45-57%) 🔥🔥
+- **Large-T (4096):** 6.6x → **7.3-8.2x** (+11-15%)
+
+**代价:** 额外 `expert_out[num_padded, 7168]` fp32 缓冲区。T=4096 时约 ~900MB，B200 有 180GB，完全可接受。
