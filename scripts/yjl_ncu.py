@@ -46,11 +46,21 @@ def _get_cuda_us(event) -> float:
     return 0.0
 
 
+def _get_cpu_us(event) -> float:
+    for attr in ("self_cpu_time_total", "cpu_time_total"):
+        value = getattr(event, attr, None)
+        if value is not None:
+            return float(value)
+    return 0.0
+
+
 def _classify_event(name: str) -> str:
     name_l = name.lower()
     if "_fused_moe_gemm1_swiglu_kernel" in name_l:
         return "gemm1"
     if "_fused_moe_gemm2_scatter_kernel" in name_l:
+        return "gemm2"
+    if "_reduce_scatter_slots_kernel" in name_l:
         return "gemm2"
     if "triton_ds_routing_kernel" in name_l:
         return "routing"
@@ -58,6 +68,17 @@ def _classify_event(name: str) -> str:
         return "sorting"
     if any(x in name_l for x in ("copy", "zero_", "fill_", "memset", "memcpy")):
         return "memops"
+    return "other"
+
+
+def _classify_cpu_event(name: str) -> str:
+    name_l = name.lower()
+    if "launchkernel" in name_l or "culaunchkernel" in name_l or "triton" in name_l:
+        return "launch"
+    if "synchronize" in name_l or "sync" in name_l:
+        return "sync"
+    if any(x in name_l for x in ("empty", "zeros", "copy", "fill", "memset", "memcpy", "malloc", "alloc")):
+        return "memory"
     return "other"
 
 
@@ -283,13 +304,15 @@ def run_profile(solution_json: str) -> str:
             local_expert_offset = _to_int(args[8])
             routed_scaling_factor = _to_float(args[9])
             t = int(routing_logits.shape[0])
+            block_m = int(module._select_block_m(t * TOP_K)) if hasattr(module, "_select_block_m") else BLOCK_M
 
             topk_idx, topk_wts = module.ds_routing(routing_logits, routing_bias, routed_scaling_factor)
 
-            max_padded = t * TOP_K + E_LOCAL * BLOCK_M
+            max_padded = t * TOP_K + E_LOCAL * block_m
             sorted_token_ids = torch.empty((max_padded,), dtype=torch.int64, device="cuda")
             sorted_weights = torch.empty((max_padded,), dtype=torch.float32, device="cuda")
             block_offsets = torch.empty((E_LOCAL + 1,), dtype=torch.int32, device="cuda")
+            block_expert_ids = torch.empty((max_padded // max(1, block_m),), dtype=torch.int32, device="cuda")
             total_blocks = torch.empty((1,), dtype=torch.int32, device="cuda")
             counts_workspace = torch.empty((E_LOCAL,), dtype=torch.int32, device="cuda")
 
@@ -299,18 +322,19 @@ def run_profile(solution_json: str) -> str:
                 sorted_token_ids,
                 sorted_weights,
                 block_offsets,
+                block_expert_ids,
                 total_blocks,
                 counts_workspace,
                 local_expert_offset,
                 t,
                 TOP_K,
                 E_LOCAL,
-                BLOCK_M,
+                block_m,
                 max_padded,
                 num_warps=8,
             )
             tb = int(total_blocks.item())
-            return tb, tb * BLOCK_M
+            return tb, tb * block_m
         except Exception:
             return None, None
 
@@ -323,10 +347,14 @@ def run_profile(solution_json: str) -> str:
         log(f"Using fallback T values: {run_t_values}")
 
     for t in run_t_values:
+        if t != 1:
+            continue
         log("")
         log("=" * 96)
         log(f"T = {t}")
         log("=" * 96)
+        if hasattr(module, "reset_graph_stats"):
+            module.reset_graph_stats()
 
         if t in trace_inputs_by_t:
             args = trace_inputs_by_t[t]
@@ -362,8 +390,8 @@ def run_profile(solution_json: str) -> str:
         toks_per_s = t / (wall_ms * 1e-3)
         log(f"Wall: {wall_ms:.3f} ms/iter | Throughput: {toks_per_s:,.0f} tok/s")
 
-        # Kernel breakdown
-        prof_kwargs = dict(activities=[ProfilerActivity.CUDA], record_shapes=False)
+        # Kernel breakdown + Host API breakdown
+        prof_kwargs = dict(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA], record_shapes=False)
         try:
             with profile(**prof_kwargs, acc_events=True) as prof:
                 for _ in range(ITERS):
@@ -384,20 +412,37 @@ def run_profile(solution_json: str) -> str:
             "memops": 0.0,
             "other": 0.0,
         }
+        cpu_totals_us = {
+            "launch": 0.0,
+            "sync": 0.0,
+            "memory": 0.0,
+            "other": 0.0,
+        }
         top_kernels = []
+        top_cpu_events = []
         for event in prof.key_averages():
             cuda_us = _get_cuda_us(event)
-            if cuda_us <= 0:
-                continue
-            category = _classify_event(event.key)
-            totals_us[category] += cuda_us
-            top_kernels.append((event.key, category, cuda_us / ITERS, event.count / ITERS))
+            if cuda_us > 0:
+                category = _classify_event(event.key)
+                totals_us[category] += cuda_us
+                top_kernels.append((event.key, category, cuda_us / ITERS, event.count / ITERS))
+
+            cpu_us = _get_cpu_us(event)
+            if cpu_us > 0:
+                cpu_category = _classify_cpu_event(event.key)
+                cpu_totals_us[cpu_category] += cpu_us
+                top_cpu_events.append((event.key, cpu_category, cpu_us / ITERS, event.count / ITERS))
 
         total_cuda_ms = sum(totals_us.values()) / ITERS / 1000.0
+        total_cpu_api_ms = sum(cpu_totals_us.values()) / ITERS / 1000.0
         cpu_overhead_ms = max(0.0, wall_ms - total_cuda_ms)
 
         def pct(us_val: float) -> float:
             denom = sum(totals_us.values())
+            return 100.0 * us_val / denom if denom > 0 else 0.0
+
+        def cpu_pct(us_val: float) -> float:
+            denom = sum(cpu_totals_us.values())
             return 100.0 * us_val / denom if denom > 0 else 0.0
 
         log("CUDA breakdown (per iter):")
@@ -408,12 +453,30 @@ def run_profile(solution_json: str) -> str:
         log(f"  MemOps  : {totals_us['memops']/ITERS/1000.0:8.3f} ms ({pct(totals_us['memops']):5.1f}%)")
         log(f"  Other   : {totals_us['other']/ITERS/1000.0:8.3f} ms ({pct(totals_us['other']):5.1f}%)")
         log(f"  Total CUDA: {total_cuda_ms:.3f} ms/iter")
+        log("Host API breakdown (per iter):")
+        log(f"  Launch  : {cpu_totals_us['launch']/ITERS/1000.0:8.3f} ms ({cpu_pct(cpu_totals_us['launch']):5.1f}%)")
+        log(f"  Sync    : {cpu_totals_us['sync']/ITERS/1000.0:8.3f} ms ({cpu_pct(cpu_totals_us['sync']):5.1f}%)")
+        log(f"  Memory  : {cpu_totals_us['memory']/ITERS/1000.0:8.3f} ms ({cpu_pct(cpu_totals_us['memory']):5.1f}%)")
+        log(f"  Other   : {cpu_totals_us['other']/ITERS/1000.0:8.3f} ms ({cpu_pct(cpu_totals_us['other']):5.1f}%)")
+        log(f"  Total CPU API: {total_cpu_api_ms:.3f} ms/iter")
         log(f"  CPU overhead: {cpu_overhead_ms:.3f} ms/iter ({(cpu_overhead_ms / wall_ms * 100.0):.1f}%)")
 
         top_kernels.sort(key=lambda x: -x[2])
         log("Top kernels:")
         for name, category, us, count in top_kernels[:8]:
             log(f"  [{category:7s}] {us:8.2f} us x {count:.1f} | {name[:90]}")
+        top_cpu_events.sort(key=lambda x: -x[2])
+        log("Top host APIs:")
+        for name, category, us, count in top_cpu_events[:8]:
+            log(f"  [{category:7s}] {us:8.2f} us x {count:.1f} | {name[:90]}")
+        if hasattr(module, "get_graph_stats"):
+            gs = module.get_graph_stats()
+            log(
+                "Graph stats: "
+                f"lookup={gs.get('lookup', 0)}, hit={gs.get('hit', 0)}, miss={gs.get('miss', 0)}, "
+                f"capture={gs.get('capture', 0)}, replay={gs.get('replay', 0)}, "
+                f"fallback={gs.get('fallback', 0)}, hit_rate={gs.get('hit_rate', 0.0):.3f}"
+            )
 
         # FLOP-based metrics using actual num_padded
         gemm1_tflops = None
@@ -440,6 +503,7 @@ def run_profile(solution_json: str) -> str:
                 "wall_ms": wall_ms,
                 "cuda_ms": total_cuda_ms,
                 "cpu_ms": cpu_overhead_ms,
+                "cpu_api_ms": total_cpu_api_ms,
                 "routing_ms": totals_us["routing"] / ITERS / 1000.0,
                 "sorting_ms": totals_us["sorting"] / ITERS / 1000.0,
                 "gemm1_ms": totals_us["gemm1"] / ITERS / 1000.0,
@@ -456,7 +520,7 @@ def run_profile(solution_json: str) -> str:
     log("SUMMARY")
     log("=" * 96)
     log(
-        f"{'T':>6s} | {'Wall':>7s} | {'CUDA':>7s} | {'CPU':>7s} | {'Route':>7s} | "
+        f"{'T':>6s} | {'Wall':>7s} | {'CUDA':>7s} | {'CPU':>7s} | {'CPU_API':>7s} | {'Route':>7s} | "
         f"{'Sort':>7s} | {'GEMM1':>7s} | {'GEMM2':>7s} | {'num_pad':>8s} | {'G1 TF':>8s} | {'G2 TF':>8s}"
     )
     for row in summary_rows:
@@ -465,6 +529,7 @@ def run_profile(solution_json: str) -> str:
         npad = str(row["num_padded"]) if row["num_padded"] >= 0 else "N/A"
         log(
             f"{row['T']:6d} | {row['wall_ms']:7.3f} | {row['cuda_ms']:7.3f} | {row['cpu_ms']:7.3f} | "
+            f"{row['cpu_api_ms']:7.3f} | "
             f"{row['routing_ms']:7.3f} | {row['sorting_ms']:7.3f} | {row['gemm1_ms']:7.3f} | "
             f"{row['gemm2_ms']:7.3f} | {npad:>8s} | {g1:>8s} | {g2:>8s}"
         )

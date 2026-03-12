@@ -164,7 +164,29 @@ key=['num_padded', ...] 改为 key=['MAX_PID_M', ...]。—— 无明显优化
   - Small batches: lower padding waste, reduce useless FLOPs.
   - Medium/large batches: keep existing 64-tile behavior for throughput.
 
-### 2026-03-10 cuda graph experiment
+Workload b8f4f012...: PASSED | 0.174 ms | 65.85x speedup | abs_err=4.10e+03, rel_err=1.98e+01
+  Workload e05c6c03...: PASSED | 0.175 ms | 63.62x speedup | abs_err=2.05e+03, rel_err=3.81e+00
+  Workload 6230e838...: PASSED | 0.308 ms | 45.99x speedup | abs_err=4.10e+03, rel_err=9.27e+01
+  Workload 8f1ff9f1...: PASSED | 0.661 ms | 24.06x speedup | abs_err=4.10e+03, rel_err=2.67e+02
+  Workload 1a4c6ba1...: PASSED | 0.857 ms | 24.66x speedup | abs_err=3.60e+05, rel_err=3.60e+13
+  Workload a7c2bcfd...: PASSED | 0.196 ms | 65.70x speedup | abs_err=4.10e+03, rel_err=1.17e+02
+  Workload 2e69caee...: PASSED | 0.173 ms | 66.82x speedup | abs_err=4.10e+03, rel_err=1.57e+01
+  Workload 8cba5890...: PASSED | 0.241 ms | 51.75x speedup | abs_err=2.05e+03, rel_err=1.52e+02
+  Workload 5e8dc11c...: PASSED | 6.653 ms | 6.82x speedup | abs_err=5.57e+05, rel_err=5.32e+13
+  Workload 58a34f27...: PASSED | 4.735 ms | 7.61x speedup | abs_err=5.61e+05, rel_err=4.51e+13
+  Workload 5eadab1e...: PASSED | 0.262 ms | 53.06x speedup | abs_err=4.10e+03, rel_err=1.24e+03
+  Workload eedc63b2...: PASSED | 0.291 ms | 47.42x speedup | abs_err=4.10e+03, rel_err=4.18e+01
+  Workload e626d3e6...: PASSED | 0.348 ms | 44.28x speedup | abs_err=4.10e+03, rel_err=1.24e+03
+  Workload 74d7ff04...: PASSED | 0.347 ms | 43.22x speedup | abs_err=4.10e+03, rel_err=4.28e+02
+  Workload 4822167c...: PASSED | 0.346 ms | 43.83x speedup | abs_err=2.05e+03, rel_err=8.03e+02
+  Workload 81955b1e...: PASSED | 0.343 ms | 42.82x speedup | abs_err=4.10e+03, rel_err=4.10e+02
+  Workload 76010cb4...: PASSED | 0.322 ms | 44.78x speedup | abs_err=4.10e+03, rel_err=4.40e+02
+  Workload fc378037...: PASSED | 0.343 ms | 43.09x speedup | abs_err=4.10e+03, rel_err=8.95e+03
+  Workload f7d6ac7c...: PASSED | 0.274 ms | 48.93x speedup | abs_err=2.05e+03, rel_err=5.26e+01
+
+
+
+5. cuda graph experiment
 
 - Added a CUDA Graph wrapper on top of kernel execution path in `solution/triton/kernel.py`.
 - Refactor:
@@ -180,23 +202,69 @@ key=['num_padded', ...] 改为 key=['MAX_PID_M', ...]。—— 无明显优化
 - Fallback behavior:
   - if graph preconditions are not met, run eager `_kernel_impl(...)` unchanged.
 
-  moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
-  Workload b8f4f012...: PASSED | 0.167 ms | 69.57x speedup | abs_err=2.05e+03, rel_err=6.34e+01
-  Workload e05c6c03...: PASSED | 0.165 ms | 67.00x speedup | abs_err=2.05e+03, rel_err=8.84e+01
-  Workload 6230e838...: PASSED | 0.311 ms | 44.23x speedup | abs_err=4.10e+03, rel_err=4.02e+01
-  Workload 8f1ff9f1...: PASSED | 0.659 ms | 23.75x speedup | abs_err=4.10e+03, rel_err=3.61e+02
-  Workload 1a4c6ba1...: PASSED | 0.855 ms | 24.21x speedup | abs_err=4.69e+05, rel_err=4.69e+13
-  Workload a7c2bcfd...: PASSED | 0.198 ms | 62.73x speedup | abs_err=4.10e+03, rel_err=1.99e+01
-  Workload 2e69caee...: PASSED | 0.162 ms | 69.62x speedup | abs_err=2.05e+03, rel_err=3.63e+01
-  Workload 8cba5890...: PASSED | 0.209 ms | 58.28x speedup | abs_err=2.05e+03, rel_err=3.47e+02
-  Workload 5e8dc11c...: PASSED | 6.631 ms | 6.76x speedup | abs_err=5.49e+05, rel_err=4.51e+13
-  Workload 58a34f27...: PASSED | 4.728 ms | 7.53x speedup | abs_err=5.28e+05, rel_err=5.28e+13
-  Workload 5eadab1e...: PASSED | 0.264 ms | 51.23x speedup | abs_err=4.10e+03, rel_err=9.76e+01
-  Workload eedc63b2...: PASSED | 0.293 ms | 45.64x speedup | abs_err=4.10e+03, rel_err=3.83e+01
-  Workload e626d3e6...: PASSED | 0.349 ms | 43.21x speedup | abs_err=4.10e+03, rel_err=2.84e+02
-  Workload 74d7ff04...: PASSED | 0.348 ms | 42.01x speedup | abs_err=4.10e+03, rel_err=4.59e+02
-  Workload 4822167c...: PASSED | 0.347 ms | 45.80x speedup | abs_err=4.10e+03, rel_err=4.99e+02
-  Workload 81955b1e...: PASSED | 0.343 ms | 41.60x speedup | abs_err=2.05e+03, rel_err=1.18e+09
-  Workload 76010cb4...: PASSED | 0.327 ms | 43.20x speedup | abs_err=4.10e+03, rel_err=4.56e+02
-  Workload fc378037...: PASSED | 0.344 ms | 41.50x speedup | abs_err=4.10e+03, rel_err=4.71e+02
-  Workload f7d6ac7c...: PASSED | 0.276 ms | 46.89x speedup | abs_err=4.10e+03, rel_err=5.15e+01
+  Workload b8f4f012...: PASSED | 0.204 ms | 58.55x speedup | abs_err=4.10e+03, rel_err=7.46e+00
+  Workload e05c6c03...: PASSED | 0.210 ms | 52.72x speedup | abs_err=2.05e+03, rel_err=3.59e+00
+  Workload 6230e838...: PASSED | 0.308 ms | 45.53x speedup | abs_err=2.05e+03, rel_err=2.33e+02
+  Workload 8f1ff9f1...: PASSED | 0.663 ms | 23.85x speedup | abs_err=4.10e+03, rel_err=1.93e+02
+  Workload 1a4c6ba1...: PASSED | 0.854 ms | 24.61x speedup | abs_err=3.77e+05, rel_err=3.40e+13
+  Workload a7c2bcfd...: PASSED | 0.210 ms | 60.53x speedup | abs_err=2.05e+03, rel_err=3.40e+01
+  Workload 2e69caee...: PASSED | 0.210 ms | 54.94x speedup | abs_err=4.10e+03, rel_err=2.39e+01
+  Workload 8cba5890...: PASSED | 0.240 ms | 51.90x speedup | abs_err=2.05e+03, rel_err=1.06e+02
+  Workload 5e8dc11c...: PASSED | 6.571 ms | 6.88x speedup | abs_err=4.59e+05, rel_err=4.40e+13
+  Workload 58a34f27...: PASSED | 4.810 ms | 7.50x speedup | abs_err=5.41e+05, rel_err=4.28e+13
+  Workload 5eadab1e...: PASSED | 0.264 ms | 52.18x speedup | abs_err=4.10e+03, rel_err=2.34e+02
+  Workload eedc63b2...: PASSED | 0.291 ms | 47.12x speedup | abs_err=4.10e+03, rel_err=1.23e+02
+  Workload e626d3e6...: PASSED | 0.344 ms | 44.33x speedup | abs_err=4.10e+03, rel_err=4.21e+02
+  Workload 74d7ff04...: PASSED | 0.345 ms | 43.33x speedup | abs_err=4.10e+03, rel_err=4.92e+01
+  Workload 4822167c...: PASSED | 0.347 ms | 43.39x speedup | abs_err=4.10e+03, rel_err=1.28e+02
+  Workload 81955b1e...: PASSED | 0.343 ms | 42.59x speedup | abs_err=4.10e+03, rel_err=1.26e+03
+  Workload 76010cb4...: PASSED | 0.323 ms | 44.39x speedup | abs_err=4.10e+03, rel_err=1.09e+02
+  Workload fc378037...: PASSED | 0.345 ms | 42.53x speedup | abs_err=4.10e+03, rel_err=5.94e+02
+  Workload f7d6ac7c...: PASSED | 0.274 ms | 48.79x speedup | abs_err=2.05e+03, rel_err=1.19e+02
+
+好像并没有相比上一步有进一步优化
+
+6. block_expert_ids optimization
+
+- Motivation: GEMM1/GEMM2 previously scanned all 32 experts and used `argmax` per program to map `pid_m -> expert_id`, which adds repeated control overhead.
+- Change:
+  - Added `block_expert_ids` workspace (`int32`, length `MAX_PID_M`).
+  - `triton_sort_and_scatter_kernel` now emits `block_expert_ids` after computing `block_offsets`.
+  - GEMM1/GEMM2 now directly load `expert_id = block_expert_ids[pid_m]`.
+  - Removed per-program expert boundary scan (`b_start/b_end/argmax`) from both GEMMs.
+- Host path updates:
+  - Extended `_sort_cache` tuple and sort launch args with `block_expert_ids`.
+  - Updated profiling helper (`yjl_ncu.py`) infer path to allocate/pass `block_expert_ids`.
+- Expected effect:
+  - Lower per-tile overhead in GEMM kernels, especially when `total_blocks * num_pid_n` is large.
+——没有优化
+
+### 2026-03-11 GEMM2 batched writeback experiment
+
+- Objective: reduce atomic contention in `_fused_moe_gemm2_scatter_kernel` writeback.
+- Change:
+  - Added constexpr switch `BATCHED_WRITEBACK` (currently enabled at launch).
+  - In batched mode, for each `BLOCK_M` tile:
+    - detect duplicate `token_idx` rows,
+    - aggregate duplicate rows locally,
+    - only leader row performs one `atomic_add` to `output_fp32`.
+  - `token_weights` load now uses `valid_mask` masked load (`other=0.0`) to avoid padded-row noise.
+- Notes:
+  - This is an experimental, higher-risk change: it trades additional local control/reduction work for potentially fewer atomic collisions.
+  - Must validate by profiling GEMM2 kernel time and end-to-end wall time.
+- Fix: Triton compilation error `unsupported tensor index: constexpr[...]` in GEMM2 batched writeback.
+  - Replaced unsupported direct indexing (`token_idx[i]`, `out[i, :]`) with pointer scalar load + mask-based vector aggregation (`tl.sum(tl.where(...), axis=0)`).
+—— 劣化
+### 2026-03-11 GEMM2 two-stage writeback (slot + reduce)
+
+- Objective: test structural writeback optimization by decoupling GEMM compute from output scatter atomics.
+- Changes:
+  - `_fused_moe_gemm2_scatter_kernel` now writes weighted GEMM2 results to contiguous slot buffer `SlotOut[num_padded, N]` (no atomics).
+  - Added `_reduce_scatter_slots_kernel` to reduce `SlotOut` into `output_fp32[T, N]` using `token_ids`.
+  - Host path updated:
+    - buffer cache now stores `SlotOut`.
+    - launch sequence becomes: GEMM2-to-slot -> reduce-scatter.
+  - Profiler classification updated (`_reduce_scatter_slots_kernel` counted into GEMM2 bucket).
+- Note:
+  - This introduces one extra kernel launch and extra global-memory traffic.
+  - Expected to help only if atomic contention was the dominant bottleneck.
