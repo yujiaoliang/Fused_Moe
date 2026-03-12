@@ -29,8 +29,10 @@ QBLOCK = 128  # FP8 quantization block size
 
 # ── Triton tuning parameters ──
 BLOCK_M_SMALL = 32  # for small batches to reduce per-expert padding waste
-BLOCK_M_LARGE = 64  # default tile for medium/large batches
+BLOCK_M_LARGE = 64  # default tile for medium batches
+BLOCK_M_XLARGE = 128 # for large batches (T>=2048, better K-loop reuse)
 SMALL_BATCH_TOPK_TOKENS = 512  # if T * TOP_K <= this, use BLOCK_M_SMALL
+LARGE_BATCH_TOPK_TOKENS = 16384 # if T * TOP_K > this, use BLOCK_M_XLARGE
 BLOCK_K = 128  # K-block (must equal QBLOCK for scale alignment)
 GROUP_SIZE_M = 8  # L2 cache reuse grouping
 
@@ -470,7 +472,7 @@ def _fused_moe_gemm2_kernel(
     # Data pointers
     A_ptr,            # [num_padded, K] fp32 (intermediate SwiGLU output)
     B_ptr,            # [E, N, K] fp8 (W2 weights trans)
-    C_ptr,            # [num_padded, N] fp32 (expert_out buffer, NOT output)
+    C_ptr,            # [num_padded, N] fp32 (expert_out buffer)
     B_scale_ptr,      # [E, N//128, K//128] fp32 (W2 block scales)
     token_weights_ptr,# [num_padded] fp32 (routing weights for each slot)
     block_offsets_ptr,# [E_LOCAL + 1] int32
@@ -536,7 +538,7 @@ def _fused_moe_gemm2_kernel(
         # Load A: fp32 from Intermediate buffer
         a = tl.load(a_base + rk[None, :] * stride_ak)
 
-        # Load B: fp8 (N=7168 always divisible by BLOCK_N, no mask needed)
+        # Load B: fp8
         b = tl.load(b_base + rk[:, None] * stride_bk)
 
         # Post-dot B-scale
@@ -558,8 +560,8 @@ def _fused_moe_gemm2_kernel(
 @triton.jit
 def _token_reduce_kernel(
     expert_out_ptr,   # [num_padded, N] fp32
-    output_ptr,       # [T, N] bf16 (final output, written directly)
-    scatter_map_ptr,  # [T * TOP_K] int32 -- positions in expert_out
+    output_ptr,       # [T, N] bf16 (final output)
+    scatter_map_ptr,  # [T * TOP_K] int32
     T_val: tl.constexpr,
     N: tl.constexpr,
     TOP_K: tl.constexpr,
@@ -571,7 +573,6 @@ def _token_reduce_kernel(
     Grid: T_val * cdiv(N, BLOCK_N)
     Each program handles one token's BLOCK_N columns.
     Iterates over TOP_K expert slots, sums contributions, stores bf16.
-    No atomic_add, no zero_() needed, no fp32->bf16 copy needed.
     """
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -588,17 +589,15 @@ def _token_reduce_kernel(
     # Accumulate over TOP_K expert contributions
     acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
     
-    # Load scatter_map for this token: scatter_map[t * TOP_K + k]
     base_idx = pid_t * TOP_K
     for k in tl.static_range(TOP_K):
         pos = tl.load(scatter_map_ptr + base_idx + k)
         if pos >= 0:
-            # Load expert_out[pos, rn]
             e_ptrs = expert_out_ptr + pos * stride_em + rn * stride_en
             vals = tl.load(e_ptrs, mask=n_mask, other=0.0)
             acc += vals
     
-    # Store directly as bf16 -- no intermediate fp32 buffer needed
+    # Store directly as bf16
     o_ptrs = output_ptr + pid_t * stride_ot + rn * stride_on
     tl.store(o_ptrs, acc.to(tl.bfloat16), mask=n_mask)
 
@@ -613,6 +612,8 @@ _sort_cache = {}
 def _select_block_m(num_topk_tokens: int) -> int:
     if num_topk_tokens <= SMALL_BATCH_TOPK_TOKENS:
         return BLOCK_M_SMALL
+    if num_topk_tokens > LARGE_BATCH_TOPK_TOKENS:
+        return BLOCK_M_XLARGE
     return BLOCK_M_LARGE
 _host_scalar_cache = {}
 

@@ -180,7 +180,8 @@ Large T (≥512): COMPUTE-BOUND — 充分利用 tensor cores
 **结论 (Hardware Saturation):**
 - 添加极深流水线 (`num_stages=6`) 或是对齐整个 L2 Cache 的网格映射 (`GROUP_M=32`) 未能带来更显著的性能提升。
 - 最终 T=512 成绩稳固在约 **+22.5x**，而 T=4096 稳固在 **+6.5x~7.1x**。
-- **分析:** 这证明了当前的 `_fused_moe_gemm1_swiglu_kernel` (N=4096) 和 `_fused_moe_gemm2_scatter_kernel` (N=2048) 已经在指令并发和 HBM 带宽上挤干了 B200 的硬件能力。考虑到 Fused FP8 GEMMs + Scatter 添加过程本身的极限 Memory Bound 物理属性，目前的结果即为基于此工程配置的数学极限。
+- **早期误判:** 当时分析认为这证明了 `_fused_moe_gemm1_swiglu_kernel` 和 `_fused_moe_gemm2_scatter_kernel` 已经在指令并发和 HBM 带宽上挤干了 B200 的硬件能力。
+- **后续反转 (Round 10):** 事实证明真正的瓶颈并不是计算或带宽，而是 **`tl.atomic_add` 的并发竞争耗尽了硬件原子单元吞吐**。拆解原子操作后，大 T 性能显著提升。
 
 ---
 
@@ -229,3 +230,40 @@ Large T (≥512): COMPUTE-BOUND — 充分利用 tensor cores
 - **Large-T (4096):** 7.3-8.2x → **7.2-8.1x** (~持平)
 
 **为什么小 T 收益最大?** 因为小 T 场景下 reduce 阶段占总时间的比例更高（GEMM 很快就结束了），所以消除 zero/atomic/copy 的效果被放大。
+
+---
+
+## 10. Round 11: GEMM2 BF16 & Weight Fusion (❌ Reverted)
+
+**探索思路:** 将 GEMM2 结尾乘 routing weight 的操作，推迟到 `_token_reduce_kernel` 中执行。这样可以带来的好处是：
+1. GEMM2 可以不乘 weight 直接写纯 FP32 累加结果。
+2. 尝试让 GEMM2 直接写出 **BF16** 的 `expert_out`，从而将 `expert_out` 的显存带宽需求减半（7168 维，T=4096 时从 900MB 减半到 450MB）。
+
+**失败原因分析:**
+- **尝试 A (BF16 `expert_out`):** 19/19 精度报错（INCORRECT Numerical）。未乘 routing weight 的 GEMM2 原始累加结果可以达到数百至数千级别，而 BF16 只有 3 位十进制的有效数字，强行缩减为 BF16 导致了无法接受的精度损失。
+- **尝试 B (FP32 `expert_out` + 推迟 weight):** 19/19 PASSED，但**性能倒退**（peak 80.31x 跌至 66.93x）。虽然 GEMM2 省掉了一次 token weight 读取，但在 Token-Reduce 阶段，每个 token slot 多了一次对 `sorted_weights` 的读操作和乘法操作。事实证明，在 Token-Reduce 这边增加操作的代价大于在 GEMM2 里减压的收益。
+
+**结论:** `expert_out` 必须保持为 FP32。不改变数据格式的前提下，推迟 weight 乘法毫无意义。代码**全部回退**至 Round 10.1 状态。
+
+---
+
+## 11. Round 12: BLOCK_M Adaptive Tuning
+
+**瓶颈分析:** Round 10.1 极大提升了小/中 T 的性能，但大 T (4096) 仍然停留在 7-8x。大 T 工作负载受限于 GEMM1 和 GEMM2 的 Memory Bandwidth。
+
+**方案:** 调整 Triton tuning parameters，实现多级 `BLOCK_M` 分配：
+- `T*8 <= 512`: `BLOCK_M_SMALL = 32` (减少 per-expert padding 浪费)
+- `T*8 > 16384`: `BLOCK_M_XLARGE = 128` (增大 tile size，提高 K-loop 的共享内存数据重用率)
+- 其他: `BLOCK_M_LARGE = 64` (默认)
+
+**失败尝试 (`BLOCK_M_TINY = 16`):**
+尝试为 T=7 (T*8=56) 使用 16 作为 BLOCK_M，以减少 padding waste (用 32 时 waste=78%)。
+结果性能严重倒退：`e05c6c03` 从 80x 跌至 51x，`2e69caee` 从 71x 跌至 48x。
+**原因:** 16 × 128 (BLOCK_M × BLOCK_K) 的矩阵乘法块太小，无法充分填满 B200 的 FP8 TensorCore 计算管线。TensorCore 需要起码的矩阵规模才能实现高吞吐，padding waste 带来的计算 overhead 远小于 underutilization 的惩罚。
+
+**最终结果:**
+采用 3-level 调整 (32 / 64 / 128)，大 T (4096) 收益显著：
+- `58a34f27`: 8.06x → **8.82x** (+9%)
+- `5e8dc11c`: 7.24x → **8.18x** (+13%)
+
+通过增大 `BLOCK_M` 到 128，我们为 large-T 缓解了 Memory Bound。

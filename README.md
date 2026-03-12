@@ -39,10 +39,16 @@ Round 10.1 优化：在 Round 10 非原子 GEMM2 基础上，进一步将 `_redu
 | fc378037 | 22.29x | 33.07x | **35.78x** | +8% |
 | 1a4c6ba1 | 22.90x | 23.22x | **24.04x** | T=512 |
 | 8f1ff9f1 | 21.31x | 21.15x | **21.88x** | |
-| 58a34f27 (T=4096)| 7.13x | 8.18x | **8.06x** | ~持平 |
-| 5e8dc11c (T=4096)| 6.58x | 7.32x | **7.24x** | ~持平 |
+| 58a34f27 (T=4096)| 7.13x | 8.18x | **8.82x** | 🔥 +8% (R12) |
+| 5e8dc11c (T=4096)| 6.58x | 7.32x | **8.18x** | 🔥 +12% (R12) |
 
 **Round 10.1 核心洞察：** Token-Centric Reduce 将 reduce 阶段从 expert-centric（遍历 sorted slots、atomic 写）改为 token-centric（遍历 output tokens、读 scatter_map、直接求和写 bf16）。消除了三个开销源：`zero_()`、`atomic_add`、`fp32→bf16 copy`。小 T 工作负载收益最大（+46-78%），因为这些场景中 reduce 占比更高。
+
+**Round 11 探索（❌ 已回退）：** 尝试将 GEMM2 weight 乘法推迟到 token-reduce 并将 `expert_out` 从 fp32 降为 bf16 以减半带宽。结果：
+- bf16 expert_out → **19/19 精度失败**（raw GEMM2 值范围太大，bf16 仅 3 位有效数字）
+- fp32 + 延迟 weight → 19/19 通过但 **性能倒退**（peak 66.93x vs 80.31x，token-reduce 额外的 weight load/multiply 成本 > GEMM2 省掉的成本）
+
+**Round 12 优化：** 实现 3-level BLOCK_M 自适应划分。T≤64 用 32，T≥2048 用 128，默认 64。大 T 工作负载由于 BLOCK_M 增大，K-loop 数据重用率提升，性能进一步提升 **8-12%**（T=4096 突破 8.8x）。放弃了 T≤8 用 BLOCK_M=16 的尝试，因为 16×128 的 dot 无法充分填满 B200 的 TensorCore，导致明显的性能倒退（80x 跌至 51x）。
 
 ---
 
