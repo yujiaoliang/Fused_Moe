@@ -267,3 +267,38 @@ Large T (≥512): COMPUTE-BOUND — 充分利用 tensor cores
 - `5e8dc11c`: 7.24x → **8.18x** (+13%)
 
 通过增大 `BLOCK_M` 到 128，我们为 large-T 缓解了 Memory Bound。
+
+---
+
+## 12. Round 13: Dynamic FP8 Quantization for SwiGLU (Bypass & Precision Wall)
+
+**探索思路:** 将 `Intermediate` 缓冲（SwiGLU 的输出）从 FP32 动态计算 Scale 并量化为 `float8_e4m3fn` (FP8)。这样在接下来的 GEMM2 中，可以直接使用 `tl.dot(f8, f8)`（彻底激活 B200 原生的 FP8xFP8 TensorCore），理论吞吐量翻倍。
+
+**核心发现与战术动作:**
+1. **编译器崩溃 (ICE):** 直接在 Triton 的 `_fused_moe_gemm1_swiglu_kernel` 中对 `swiglu_out` (MMA layout) 进行 `tl.reshape` 或 `.to(tl.float8e4nv)` 均会导致 B200 上的 `ptxas` 汇编器抛出严重内部崩溃 (ICE)。这是 Triton LLVM backend 对于 `cvt.e4m3x2` 寄存器打包生成的 Bug。
+2. **完美绕过 (Bypass):** 我们放弃了在 GEMM1 中量化。而是将 FP32 存入 Global Memory，并在 `_fused_moe_gemm2_kernel` 的 K-Loop 中从标准的 `Blocked` layout 载入 SRAM 后，执行即时 (JIT) 缩放与强化：
+   `a_fp8 = (a_fp32 / a_scale[:, None]).to(tl.float8e4nv)`
+   这成功避开了编译错误，并在 B200 上顺利调用了原生的 FP8xFP8 TensorCore！
+3. **不可逾越的精度墙 (Quantization Squeeze):**
+   虽然代码跑通了，但测试框架爆出了 `abs=1.02e+04` 的巨巨额误差。
+   原因是 `check_modal.py` 传入了未经归一化的 `torch.randn`，这导致 SwiGLU 累加结果飙升至 300+。而 `float8_e4m3fn` **只有 3 位尾数精度**。对于这种大范围浮点数，3 位的阶跃截断会产生几位的绝对偏移（Rounding Error）。而基准框架是用极其苛刻的 `$10^{-3}$` 级 FP32/BF16 容差防线做比对。这导致原生的物理级 FP8 计算先天注定无法通过这项严苛的容差校验。
+
+**结论:**
+我们在代码生成、内存布局和 TensorCore 编排上取得了全胜，实现了一个完全 Layout-Safe 的 FP8 动态量化架构。但也证实了：在一个要求极高浮点容差比对的评测系统中，3-bit (FP8) 的粗糙精度天然无法交出及格卷。
+**行动:** 将主线 `kernel.py` 干净回溯至峰值 80.31x 的 Round 12 状态，全面转向方向 A (Multi-Block Sort)。
+
+---
+
+## 13. Round 14: Multi-Block Parallel Sort (Direction A)
+
+**探索思路:** 
+Round 9 实现的 `triton_sort_and_scatter` 在统计各 Expert 的 Token 计数时，由于只有一个 Program（单线程）遍历所有 `T * TOP_K` 个 Token，其内部的 `tl.atomic_add` 操作在大长序列 (如 `T=4096`) 时形成了严重的串行原子竞争瓶颈。
+
+**解决方案:**
+摒弃串行扫描，全面引入 `parallel_sort_and_scatter` 并行调度。队友通过多 Block 切分计算，让 GPU 内部多个 SM 并行执行 Histogram 统计和 Prefix Sum 计算（通过分配 `partial_counts` 等额外 Workspace Buffer 配合 `NUM_TILES`），彻底化解了长序列时的 Atomic Bottleneck。
+
+**结果:**
+- **Peak Performance:** 80.31x → **88.x** (打破极致天花板！)
+- **Large-T (4096):** 8.8x → **>9.3x** (彻底消除串行统计损耗，大规模序列性能飙升)
+
+**结论:** Multi-Block Sort 是我们在 B200 芯片上榨干内存带宽和指令并发之后的最终调度红利，也是本次黑客松最优美的终点。

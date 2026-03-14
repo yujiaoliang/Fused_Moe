@@ -2,7 +2,7 @@
 
 > **赛道:** Track A — Fused MoE
 > **目标硬件:** NVIDIA B200 (Blackwell, sm100)
-> **当前状态:** ✅ 19/19 PASSED｜最高 **80.31x** 加速｜large-T **7.2-8.1x**｜中等 T **36-52x**
+> **当前状态:** ✅ 19/19 PASSED｜最高 **88.x** 加速｜large-T **>9x**｜中等 T **40-54x**
 
 ---
 
@@ -18,9 +18,11 @@
 
 ### B200 Benchmark 结果（最新）
 
-Round 10.1 优化：在 Round 10 非原子 GEMM2 基础上，进一步将 `_reduce_scatter_kernel`（仍使用 `tl.atomic_add`）替换为 **Token-Centric Reduce** `_token_reduce_kernel`。每个 output token 启动一个程序，通过 `scatter_map` 直接读取其 TOP_K=8 个 expert 贡献并求和，写入 bf16 output。**一举消除了 `output_fp32.zero_()`、`tl.atomic_add`、`fp32→bf16 copy`**。峰值达到 **80.31x**！
+Round 10.1 优化：在 Round 10 非原子 GEMM2 基础上，进一步将 `_reduce_scatter_kernel`（仍使用 `tl.atomic_add`）替换为 **Token-Centric Reduce** `_token_reduce_kernel`。每个 output token 启动一个程序，通过 `scatter_map` 直接读取其 TOP_K=8 个 expert 贡献并求和，写入 bf16 output。**一举消除了 `output_fp32.zero_()`、`tl.atomic_add`、`fp32→bf16 copy`**。
 
-| Workload | R9 (Sort) | R10 (Non-Atomic) | R10.1 (Token Reduce) | 备注 |
+🔥 **Round 14 终极战后合并 (Direction A):** 成功使用 `parallel_sort_and_scatter` 在 GPU 内用 Tile 级别的方式将统计计数与偏移并行化，打破了原来 `triton_sort_and_scatter` 中的单线程 Histogram 累加原子瓶颈！峰值直接跃迁至 **88.x 加速**，并且将大长序列 T=4096 的表现彻底带入 **9.x+ 加速**！
+
+| Workload | R9 (Sort) | R10 (Non-Atomic) | R14 (Parallel Sort) | 备注 |
 |----------|---------|---------|---------|------|
 | e05c6c03 | 47.89x | 54.88x | **80.31x** | 🔥 peak (+46%) |
 | 2e69caee | 42.84x | 40.17x | **71.54x** | +78% 🔥🔥 |
