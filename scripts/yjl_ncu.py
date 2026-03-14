@@ -58,11 +58,13 @@ def _classify_event(name: str) -> str:
     name_l = name.lower()
     if "_fused_moe_gemm1_swiglu_kernel" in name_l:
         return "gemm1"
-    if "_fused_moe_gemm2_scatter_kernel" in name_l:
+    if "_t1_fused_gemm2_reduce_kernel" in name_l:
         return "gemm2"
-    if "triton_ds_routing_kernel" in name_l:
+    if "_fused_moe_gemm2_kernel" in name_l or "_fused_moe_gemm2_scatter_kernel" in name_l:
+        return "gemm2"
+    if "triton_ds_routing_kernel" in name_l or "triton_ds_routing_t1_local_kernel" in name_l:
         return "routing"
-    if "triton_sort_and_scatter_kernel" in name_l:
+    if "triton_sort_and_scatter_kernel" in name_l or "triton_sort_histogram_kernel" in name_l or "triton_sort_layout_kernel" in name_l or "triton_sort_scatter_kernel" in name_l or "triton_init_sorted_buffers_kernel" in name_l:
         return "sorting"
     if any(x in name_l for x in ("copy", "zero_", "fill_", "memset", "memcpy")):
         return "memops"
@@ -284,7 +286,7 @@ def run_profile(solution_json: str) -> str:
 
     def infer_num_padded(args) -> tuple[int | None, int | None]:
         # Uses the same Triton kernels as runtime path, so this is exact for current input.
-        if not hasattr(module, "ds_routing") or not hasattr(module, "triton_sort_and_scatter_kernel"):
+        if not hasattr(module, "ds_routing"):
             return None, None
         try:
             def _to_int(v):
@@ -308,26 +310,53 @@ def run_profile(solution_json: str) -> str:
             max_padded = t * TOP_K + E_LOCAL * BLOCK_M
             sorted_token_ids = torch.empty((max_padded,), dtype=torch.int64, device="cuda")
             sorted_weights = torch.empty((max_padded,), dtype=torch.float32, device="cuda")
+            scatter_map = torch.empty((t * TOP_K,), dtype=torch.int32, device="cuda")
             block_offsets = torch.empty((E_LOCAL + 1,), dtype=torch.int32, device="cuda")
             total_blocks = torch.empty((1,), dtype=torch.int32, device="cuda")
-            counts_workspace = torch.empty((E_LOCAL,), dtype=torch.int32, device="cuda")
-
-            module.triton_sort_and_scatter_kernel[(1,)](
-                topk_idx,
-                topk_wts,
-                sorted_token_ids,
-                sorted_weights,
-                block_offsets,
-                total_blocks,
-                counts_workspace,
-                local_expert_offset,
-                t,
-                TOP_K,
-                E_LOCAL,
-                BLOCK_M,
-                max_padded,
-                num_warps=8,
-            )
+            parallel_sort_min_tiles = int(getattr(module, "PARALLEL_SORT_MIN_TILES", 128))
+            sort_block_items = int(getattr(module, "SORT_BLOCK_ITEMS", 256))
+            if hasattr(module, "parallel_sort_and_scatter") and ((t * TOP_K + sort_block_items - 1) // sort_block_items) >= parallel_sort_min_tiles:
+                num_tiles = (t * TOP_K + sort_block_items - 1) // sort_block_items
+                partial_counts = torch.empty((num_tiles, E_LOCAL), dtype=torch.int32, device="cuda")
+                tile_offsets = torch.empty((num_tiles, E_LOCAL), dtype=torch.int32, device="cuda")
+                counts_workspace = torch.empty((E_LOCAL,), dtype=torch.int32, device="cuda")
+                module.parallel_sort_and_scatter(
+                    topk_idx,
+                    topk_wts,
+                    sorted_token_ids,
+                    sorted_weights,
+                    scatter_map,
+                    block_offsets,
+                    total_blocks,
+                    partial_counts,
+                    tile_offsets,
+                    local_expert_offset,
+                    t,
+                    BLOCK_M,
+                    max_padded,
+                    counts_workspace,
+                )
+            elif hasattr(module, "triton_sort_and_scatter_kernel"):
+                counts_workspace = torch.empty((E_LOCAL,), dtype=torch.int32, device="cuda")
+                module.triton_sort_and_scatter_kernel[(1,)](
+                    topk_idx,
+                    topk_wts,
+                    sorted_token_ids,
+                    sorted_weights,
+                    scatter_map,
+                    block_offsets,
+                    total_blocks,
+                    counts_workspace,
+                    local_expert_offset,
+                    t,
+                    TOP_K,
+                    E_LOCAL,
+                    BLOCK_M,
+                    max_padded,
+                    num_warps=8,
+                )
+            else:
+                return None, None
             tb = int(total_blocks.item())
             return tb, tb * BLOCK_M
         except Exception:
@@ -346,8 +375,6 @@ def run_profile(solution_json: str) -> str:
         log("=" * 96)
         log(f"T = {t}")
         log("=" * 96)
-        if t != 1:
-            continue
         if t in trace_inputs_by_t:
             args = trace_inputs_by_t[t]
             log(f"Input source: trace set (T={t})")
@@ -559,7 +586,7 @@ def run_profile(solution_json: str) -> str:
         cmd = [
             ncu_path,
             "--kernel-name",
-            "regex:.*(fused_moe|triton_ds_routing_kernel|triton_sort_and_scatter_kernel).*",
+            "regex:.*(fused_moe|t1_fused_gemm2_reduce|triton_ds_routing|triton_sort_).*",
             "--metrics",
             ",".join(
                 [

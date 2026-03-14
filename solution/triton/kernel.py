@@ -35,6 +35,8 @@ SMALL_BATCH_TOPK_TOKENS = 512  # if T * TOP_K <= this, use BLOCK_M_SMALL
 LARGE_BATCH_TOPK_TOKENS = 16384 # if T * TOP_K > this, use BLOCK_M_XLARGE
 BLOCK_K = 128  # K-block (must equal QBLOCK for scale alignment)
 GROUP_SIZE_M = 8  # L2 cache reuse grouping
+SORT_BLOCK_ITEMS = 256
+PARALLEL_SORT_MIN_TILES = 128
 T1_GENERIC_BLOCK_M = 16
 T1_GENERIC_MAX_PADDED = TOP_K * T1_GENERIC_BLOCK_M
 
@@ -318,21 +320,19 @@ def triton_sort_and_scatter_kernel(
     local_start: tl.constexpr,
     T,                  # scalar
     TOP_K: tl.constexpr,
-    E_LOCAL: tl.constexpr, 
+    E_LOCAL: tl.constexpr,
     BLOCK_M: tl.constexpr,
     MAX_PADDED,         # scalar
 ):
     tid = tl.arange(0, 256)
 
-    # 0. Initialize counts
     e_idx = tl.arange(0, 32)
     e_mask = e_idx < E_LOCAL
     tl.store(counts_ptr + e_idx, 0, mask=e_mask)
     tl.debug_barrier()
-    
+
     N = T * TOP_K
-    
-    # 1. Histogram
+
     offset = 0
     while offset < N:
         idx = offset + tid
@@ -344,27 +344,20 @@ def triton_sort_and_scatter_kernel(
         tl.atomic_add(ptr, 1, mask=is_local, sem='relaxed')
         offset += 256
     tl.debug_barrier()
-    
-    # 2. Prefix Sum and Block Offsets
+
     cnts = tl.load(counts_ptr + e_idx, mask=e_mask, other=0)
     blocks = (cnts + (BLOCK_M - 1)) // BLOCK_M
     padded_cnts = blocks * BLOCK_M
-    
     inc_sum = tl.cumsum(padded_cnts, axis=0)
     offsets = inc_sum - padded_cnts
-    
     total_blocks = tl.sum(blocks, axis=0)
-    
-    block_offs = offsets // BLOCK_M
-    tl.store(block_offsets_ptr + e_idx, block_offs, mask=e_mask)
-    
+
+    tl.store(block_offsets_ptr + e_idx, offsets // BLOCK_M, mask=e_mask)
     tl.store(block_offsets_ptr + E_LOCAL, total_blocks)
     tl.store(total_blocks_ptr, total_blocks)
-        
     tl.store(counts_ptr + e_idx, offsets, mask=e_mask)
     tl.debug_barrier()
-    
-    # 3. Initialize only the effective padded range.
+
     num_padded = total_blocks * BLOCK_M
     offset = 0
     while offset < num_padded:
@@ -374,35 +367,223 @@ def triton_sort_and_scatter_kernel(
         tl.store(sorted_weights_ptr + idx, 0.0, mask=mask)
         offset += 256
     tl.debug_barrier()
-    
-    # 4. Scatter (and record scatter_map)
+
     offset = 0
     while offset < N:
         idx = offset + tid
         mask = idx < N
         exp = tl.load(topk_idx_ptr + idx, mask=mask, other=-1)
         wgt = tl.load(topk_wts_ptr + idx, mask=mask, other=0.0)
-        
         is_local = (exp >= local_start) & (exp < local_start + E_LOCAL)
         local_exp = exp - local_start
-        
         ptr = counts_ptr + tl.where(is_local, local_exp, 0)
         dest = tl.atomic_add(ptr, 1, mask=is_local, sem='relaxed')
-        
         tok_id = idx // TOP_K
-        
-        out_tok_ptr = sorted_tokens_ptr + tl.where(is_local, dest, 0)
-        out_wgt_ptr = sorted_weights_ptr + tl.where(is_local, dest, 0)
-        
-        tl.store(out_tok_ptr, tok_id, mask=is_local)
-        tl.store(out_wgt_ptr, wgt, mask=is_local)
-        
-        # Record scatter_map: for each (token, expert_slot), store dest position
-        # scatter_map[idx] = dest (or -1 if not local)
+
+        tl.store(sorted_tokens_ptr + tl.where(is_local, dest, 0), tok_id, mask=is_local)
+        tl.store(sorted_weights_ptr + tl.where(is_local, dest, 0), wgt, mask=is_local)
         tl.store(scatter_map_ptr + idx, dest, mask=is_local)
         tl.store(scatter_map_ptr + idx, -1, mask=mask & (~is_local))
-        
         offset += 256
+
+
+@triton.jit
+def triton_sort_histogram_kernel(
+    topk_idx_ptr,
+    partial_counts_ptr,
+    local_start: tl.constexpr,
+    N,
+    E_LOCAL: tl.constexpr,
+    BLOCK_ITEMS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    idx = pid * BLOCK_ITEMS + tl.arange(0, BLOCK_ITEMS)
+    mask = idx < N
+    exp = tl.load(topk_idx_ptr + idx, mask=mask, other=-1)
+    is_local = mask & (exp >= local_start) & (exp < local_start + E_LOCAL)
+    local_exp = exp - local_start
+
+    for e in tl.static_range(E_LOCAL):
+        count = tl.sum(((local_exp == e) & is_local).to(tl.int32), axis=0)
+        tl.store(partial_counts_ptr + pid * E_LOCAL + e, count)
+
+
+@triton.jit
+def triton_sort_layout_kernel(
+    partial_counts_ptr,
+    tile_offsets_ptr,
+    block_offsets_ptr,
+    total_blocks_ptr,
+    num_tiles,
+    E_LOCAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    e_idx = tl.arange(0, E_LOCAL)
+    total_counts = tl.zeros((E_LOCAL,), dtype=tl.int32)
+
+    tile = 0
+    while tile < num_tiles:
+        total_counts += tl.load(partial_counts_ptr + tile * E_LOCAL + e_idx)
+        tile += 1
+
+    blocks = (total_counts + (BLOCK_M - 1)) // BLOCK_M
+    padded_counts = blocks * BLOCK_M
+    inc_sum = tl.cumsum(padded_counts, axis=0)
+    global_offsets = inc_sum - padded_counts
+    total_blocks = tl.sum(blocks, axis=0)
+
+    tl.store(block_offsets_ptr + e_idx, global_offsets // BLOCK_M)
+    tl.store(block_offsets_ptr + E_LOCAL, total_blocks)
+    tl.store(total_blocks_ptr, total_blocks)
+
+    running = tl.zeros((E_LOCAL,), dtype=tl.int32)
+    tile = 0
+    while tile < num_tiles:
+        counts = tl.load(partial_counts_ptr + tile * E_LOCAL + e_idx)
+        tl.store(tile_offsets_ptr + tile * E_LOCAL + e_idx, global_offsets + running)
+        running += counts
+        tile += 1
+
+
+@triton.jit
+def triton_init_sorted_buffers_kernel(
+    sorted_tokens_ptr,
+    sorted_weights_ptr,
+    total_blocks_ptr,
+    T,
+    BLOCK_M: tl.constexpr,
+    MAX_PADDED,
+    BLOCK_ITEMS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    total_blocks = tl.load(total_blocks_ptr)
+    num_padded = total_blocks * BLOCK_M
+    idx = pid * BLOCK_ITEMS + tl.arange(0, BLOCK_ITEMS)
+    mask = (idx < num_padded) & (idx < MAX_PADDED)
+    tl.store(sorted_tokens_ptr + idx, T, mask=mask)
+    tl.store(sorted_weights_ptr + idx, 0.0, mask=mask)
+
+
+@triton.jit
+def triton_sort_scatter_kernel(
+    topk_idx_ptr,
+    topk_wts_ptr,
+    sorted_tokens_ptr,
+    sorted_weights_ptr,
+    scatter_map_ptr,
+    tile_offsets_ptr,
+    local_start: tl.constexpr,
+    N,
+    TOP_K: tl.constexpr,
+    E_LOCAL: tl.constexpr,
+    BLOCK_ITEMS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    e_idx = tl.arange(0, E_LOCAL)
+    tile_base = tl.load(tile_offsets_ptr + pid * E_LOCAL + e_idx)
+    running = tl.zeros((E_LOCAL,), dtype=tl.int32)
+    start = pid * BLOCK_ITEMS
+
+    for i in tl.static_range(BLOCK_ITEMS):
+        idx = start + i
+        mask = idx < N
+        exp = tl.load(topk_idx_ptr + idx, mask=mask, other=-1)
+        wgt = tl.load(topk_wts_ptr + idx, mask=mask, other=0.0)
+        is_local = mask & (exp >= local_start) & (exp < local_start + E_LOCAL)
+        local_exp = exp - local_start
+        is_match = e_idx == local_exp
+        dest = tl.sum(tl.where(is_match, tile_base + running, 0), axis=0)
+        tok_id = idx // TOP_K
+
+        tl.store(scatter_map_ptr + idx, -1, mask=mask)
+        tl.store(sorted_tokens_ptr + dest, tok_id, mask=is_local)
+        tl.store(sorted_weights_ptr + dest, wgt, mask=is_local)
+        tl.store(scatter_map_ptr + idx, dest, mask=is_local)
+        running += is_match.to(tl.int32) * is_local.to(tl.int32)
+
+
+def parallel_sort_and_scatter(
+    topk_idx,
+    topk_wts,
+    sorted_token_ids,
+    sorted_weights,
+    scatter_map,
+    block_offsets,
+    total_blocks,
+    partial_counts,
+    tile_offsets,
+    local_start,
+    T,
+    block_m,
+    max_padded,
+    counts_workspace=None,
+):
+    num_items = T * TOP_K
+    num_tiles = triton.cdiv(num_items, SORT_BLOCK_ITEMS)
+    if num_tiles < PARALLEL_SORT_MIN_TILES:
+        triton_sort_and_scatter_kernel[(1,)](
+            topk_idx,
+            topk_wts,
+            sorted_token_ids,
+            sorted_weights,
+            scatter_map,
+            block_offsets,
+            total_blocks,
+            counts_workspace,
+            local_start,
+            T,
+            TOP_K,
+            E_LOCAL,
+            block_m,
+            max_padded,
+            num_warps=8,
+        )
+        return
+
+    triton_sort_histogram_kernel[(num_tiles,)](
+        topk_idx,
+        partial_counts,
+        local_start=local_start,
+        N=num_items,
+        E_LOCAL=E_LOCAL,
+        BLOCK_ITEMS=SORT_BLOCK_ITEMS,
+        num_warps=4,
+    )
+    triton_sort_layout_kernel[(1,)](
+        partial_counts,
+        tile_offsets,
+        block_offsets,
+        total_blocks,
+        num_tiles,
+        E_LOCAL=E_LOCAL,
+        BLOCK_M=block_m,
+        num_warps=1,
+    )
+
+    triton_init_sorted_buffers_kernel[(triton.cdiv(max_padded, SORT_BLOCK_ITEMS),)](
+        sorted_token_ids,
+        sorted_weights,
+        total_blocks,
+        T,
+        BLOCK_M=block_m,
+        MAX_PADDED=max_padded,
+        BLOCK_ITEMS=SORT_BLOCK_ITEMS,
+        num_warps=4,
+    )
+    triton_sort_scatter_kernel[(num_tiles,)](
+        topk_idx,
+        topk_wts,
+        sorted_token_ids,
+        sorted_weights,
+        scatter_map,
+        tile_offsets,
+        local_start=local_start,
+        N=num_items,
+        TOP_K=TOP_K,
+        E_LOCAL=E_LOCAL,
+        BLOCK_ITEMS=SORT_BLOCK_ITEMS,
+        num_warps=4,
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1142,8 +1323,9 @@ def kernel(
         _buf_cache[bkey] = (Intermediate, expert_out)
 
     if bkey in _sort_cache:
-        topk_idx_ws, topk_wts_ws, sorted_token_ids, sorted_weights, scatter_map, block_offsets, total_blocks, counts_workspace = _sort_cache[bkey]
+        topk_idx_ws, topk_wts_ws, sorted_token_ids, sorted_weights, scatter_map, block_offsets, total_blocks, counts_workspace, partial_counts, tile_offsets = _sort_cache[bkey]
     else:
+        num_tiles = triton.cdiv(T * TOP_K, SORT_BLOCK_ITEMS)
         topk_idx_ws = torch.empty((T, TOP_K), dtype=torch.int32, device=device)
         topk_wts_ws = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
         sorted_token_ids = torch.empty((MAX_PADDED,), dtype=torch.int64, device=device)
@@ -1152,10 +1334,12 @@ def kernel(
         block_offsets = torch.empty((E_LOCAL + 1,), dtype=torch.int32, device=device)
         total_blocks = torch.empty((1,), dtype=torch.int32, device=device)
         counts_workspace = torch.empty((E_LOCAL,), dtype=torch.int32, device=device)
+        partial_counts = torch.empty((num_tiles, E_LOCAL), dtype=torch.int32, device=device)
+        tile_offsets = torch.empty((num_tiles, E_LOCAL), dtype=torch.int32, device=device)
         _sort_cache[bkey] = (
             topk_idx_ws, topk_wts_ws,
             sorted_token_ids, sorted_weights, scatter_map,
-            block_offsets, total_blocks, counts_workspace,
+            block_offsets, total_blocks, counts_workspace, partial_counts, tile_offsets,
         )
 
     ds_routing(
@@ -1165,7 +1349,7 @@ def kernel(
         topk_idx=topk_idx_ws,
         topk_weights=topk_wts_ws,
     )
-    triton_sort_and_scatter_kernel[(1,)](
+    parallel_sort_and_scatter(
         topk_idx_ws,
         topk_wts_ws,
         sorted_token_ids,
@@ -1173,14 +1357,13 @@ def kernel(
         scatter_map,
         block_offsets,
         total_blocks,
-        counts_workspace,
+        partial_counts,
+        tile_offsets,
         local_start,
         T,
-        TOP_K,
-        E_LOCAL,
         block_m,
         MAX_PADDED,
-        num_warps=8
+        counts_workspace,
     )
 
     # -- 4. Fused GEMM1 + SwiGLU --

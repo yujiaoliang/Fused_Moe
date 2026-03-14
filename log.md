@@ -200,3 +200,50 @@ key=['num_padded', ...] 改为 key=['MAX_PID_M', ...]。—— 无明显优化
   Workload 76010cb4...: PASSED | 0.327 ms | 43.20x speedup | abs_err=4.10e+03, rel_err=4.56e+02
   Workload fc378037...: PASSED | 0.344 ms | 41.50x speedup | abs_err=4.10e+03, rel_err=4.71e+02
   Workload f7d6ac7c...: PASSED | 0.276 ms | 46.89x speedup | abs_err=4.10e+03, rel_err=5.15e+01
+
+
+
+### 对T>4096进行3-phase优化，
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload b8f4f012...: PASSED | 0.172 ms | 68.13x speedup | abs_err=2.05e+03, rel_err=5.43e+00
+  Workload e05c6c03...: PASSED | 0.128 ms | 86.69x speedup | abs_err=5.12e+02, rel_err=8.06e-03
+  Workload 6230e838...: PASSED | 0.306 ms | 45.30x speedup | abs_err=4.10e+03, rel_err=4.85e+01
+  Workload 8f1ff9f1...: PASSED | 0.661 ms | 23.93x speedup | abs_err=4.10e+03, rel_err=2.55e+02
+  Workload 1a4c6ba1...: PASSED | 0.857 ms | 24.50x speedup | abs_err=3.36e+05, rel_err=3.36e+13
+  Workload a7c2bcfd...: PASSED | 0.194 ms | 65.00x speedup | abs_err=2.05e+03, rel_err=2.28e+02
+  Workload 2e69caee...: PASSED | 0.178 ms | 64.51x speedup | abs_err=4.10e+03, rel_err=3.92e+01
+  Workload 8cba5890...: PASSED | 0.224 ms | 55.37x speedup | abs_err=2.05e+03, rel_err=5.78e+00
+  Workload 5e8dc11c...: PASSED | 5.278 ms | 8.55x speedup | abs_err=5.37e+05, rel_err=4.49e+13
+  Workload 58a34f27...: PASSED | 3.766 ms | 9.52x speedup | abs_err=5.49e+05, rel_err=5.49e+13
+  Workload 5eadab1e...: PASSED | 0.259 ms | 53.04x speedup | abs_err=4.10e+03, rel_err=4.90e+01
+  Workload eedc63b2...: PASSED | 0.290 ms | 46.78x speedup | abs_err=2.05e+03, rel_err=1.97e+02
+  Workload e626d3e6...: PASSED | 0.345 ms | 44.34x speedup | abs_err=4.10e+03, rel_err=2.91e+02
+  Workload 74d7ff04...: PASSED | 0.346 ms | 42.88x speedup | abs_err=4.10e+03, rel_err=6.60e+01
+  Workload 4822167c...: PASSED | 0.347 ms | 43.05x speedup | abs_err=4.10e+03, rel_err=2.64e+02
+  Workload 81955b1e...: PASSED | 0.343 ms | 42.18x speedup | abs_err=4.10e+03, rel_err=8.23e+02
+  Workload 76010cb4...: PASSED | 0.316 ms | 44.91x speedup | abs_err=4.10e+03, rel_err=1.39e+02
+  Workload fc378037...: PASSED | 0.343 ms | 42.30x speedup | abs_err=4.10e+03, rel_err=7.97e+01
+  Workload f7d6ac7c...: PASSED | 0.270 ms | 49.18x speedup | abs_err=2.05e+03, rel_err=9.33e+02
+
+
+### 改为不直接硬判断T，而是对num tile进行判断
+
+  Workload b8f4f012...: PASSED | 0.175 ms | 66.21x speedup | abs_err=2.05e+03, rel_err=1.43e+01
+  Workload e05c6c03...: PASSED | 0.127 ms | 86.69x speedup | abs_err=1.02e+03, rel_err=1.19e-02
+  Workload 6230e838...: PASSED | 0.306 ms | 44.97x speedup | abs_err=2.05e+03, rel_err=5.95e+01
+  Workload 8f1ff9f1...: PASSED | 0.661 ms | 23.91x speedup | abs_err=4.10e+03, rel_err=2.06e+02
+  Workload 1a4c6ba1...: PASSED | 0.857 ms | 24.48x speedup | abs_err=3.32e+05, rel_err=3.09e+13
+  Workload a7c2bcfd...: PASSED | 0.196 ms | 64.44x speedup | abs_err=4.10e+03, rel_err=2.45e+01
+  Workload 2e69caee...: PASSED | 0.179 ms | 64.23x speedup | abs_err=4.10e+03, rel_err=2.26e+01
+  Workload 8cba5890...: PASSED | 0.224 ms | 55.04x speedup | abs_err=4.10e+03, rel_err=2.59e+01
+  Workload 5e8dc11c...: PASSED | 5.278 ms | 8.54x speedup | abs_err=5.28e+05, rel_err=4.92e+13
+  Workload 58a34f27...: PASSED | 3.766 ms | 9.51x speedup | abs_err=4.94e+05, rel_err=4.51e+13
+  Workload 5eadab1e...: PASSED | 0.259 ms | 52.98x speedup | abs_err=4.10e+03, rel_err=3.78e+02
+  Workload eedc63b2...: PASSED | 0.290 ms | 46.68x speedup | abs_err=4.10e+03, rel_err=3.24e+02
+  Workload e626d3e6...: PASSED | 0.345 ms | 44.27x speedup | abs_err=4.10e+03, rel_err=3.92e+02
+  Workload 74d7ff04...: PASSED | 0.346 ms | 42.75x speedup | abs_err=4.10e+03, rel_err=1.18e+02
+  Workload 4822167c...: PASSED | 0.347 ms | 42.93x speedup | abs_err=4.10e+03, rel_err=2.35e+03
+  Workload 81955b1e...: PASSED | 0.343 ms | 42.06x speedup | abs_err=4.10e+03, rel_err=5.47e+02
+  Workload 76010cb4...: PASSED | 0.316 ms | 44.83x speedup | abs_err=4.10e+03, rel_err=6.66e+01
+  Workload fc378037...: PASSED | 0.343 ms | 42.30x speedup | abs_err=4.10e+03, rel_err=1.08e+02
+  Workload f7d6ac7c...: PASSED | 0.270 ms | 49.08x speedup | abs_err=2.05e+03, rel_err=1.96e+01
