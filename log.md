@@ -247,3 +247,25 @@ moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
   Workload 76010cb4...: PASSED | 0.316 ms | 44.83x speedup | abs_err=4.10e+03, rel_err=6.66e+01
   Workload fc378037...: PASSED | 0.343 ms | 42.30x speedup | abs_err=4.10e+03, rel_err=1.08e+02
   Workload f7d6ac7c...: PASSED | 0.270 ms | 49.08x speedup | abs_err=2.05e+03, rel_err=1.96e+01
+
+
+  ### 分桶，特化！中型T 有一点收益，具体如下：
+    Workload b8f4f012...: PASSED | 0.112 ms | 95.85x speedup | abs_err=2.05e+03, rel_err=3.54e+00
+  Workload e05c6c03...: PASSED | 0.106 ms | 96.83x speedup | abs_err=2.05e+03, rel_err=1.71e-02
+  Workload 6230e838...: PASSED | 0.248 ms | 51.59x speedup | abs_err=4.10e+03, rel_err=1.03e+02
+  Workload 8f1ff9f1...: PASSED | 0.307 ms | 48.09x speedup | abs_err=4.10e+03, rel_err=6.65e+02
+  Workload 1a4c6ba1...: PASSED | 0.860 ms | 23.04x speedup | abs_err=3.46e+05, rel_err=3.13e+13
+  Workload a7c2bcfd...: PASSED | 0.161 ms | 72.44x speedup | abs_err=4.10e+03, rel_err=5.94e+01
+  Workload 2e69caee...: PASSED | 0.100 ms | 106.65x speedup | abs_err=4.10e+03, rel_err=1.12e+02
+  Workload 8cba5890...: PASSED | 0.168 ms | 67.82x speedup | abs_err=2.05e+03, rel_err=8.77e+01
+  Workload 5e8dc11c...: PASSED | 5.239 ms | 8.34x speedup | abs_err=4.96e+05, rel_err=4.34e+13
+  Workload 58a34f27...: PASSED | 3.735 ms | 9.25x speedup | abs_err=5.53e+05, rel_err=5.53e+13
+  Workload 5eadab1e...: PASSED | 0.206 ms | 61.82x speedup | abs_err=4.10e+03, rel_err=1.13e+02
+  Workload eedc63b2...: PASSED | 0.228 ms | 55.24x speedup | abs_err=4.10e+03, rel_err=7.89e+02
+  Workload e626d3e6...: PASSED | 0.271 ms | 52.39x speedup | abs_err=4.10e+03, rel_err=5.97e+01
+  Workload 74d7ff04...: PASSED | 0.271 ms | 50.66x speedup | abs_err=4.10e+03, rel_err=1.97e+02
+  Workload 4822167c...: PASSED | 0.275 ms | 49.96x speedup | abs_err=2.05e+03, rel_err=3.38e+08
+  Workload 81955b1e...: PASSED | 0.264 ms | 50.93x speedup | abs_err=4.10e+03, rel_err=8.35e+01
+  Workload 76010cb4...: PASSED | 0.256 ms | 51.48x speedup | abs_err=4.10e+03, rel_err=8.33e+02
+  Workload fc378037...: PASSED | 0.261 ms | 51.64x speedup | abs_err=4.10e+03, rel_err=1.08e+02
+  Workload f7d6ac7c...: PASSED | 0.220 ms | 55.52x speedup | abs_err=2.05e+03, rel_err=4.73e+01

@@ -56,7 +56,7 @@ def _get_cpu_us(event) -> float:
 
 def _classify_event(name: str) -> str:
     name_l = name.lower()
-    if "_fused_moe_gemm1_swiglu_kernel" in name_l:
+    if "_fused_moe_gemm1_swiglu_kernel" in name_l or "_t1_fused_gemm1_swiglu_kernel" in name_l:
         return "gemm1"
     if "_t1_fused_gemm2_reduce_kernel" in name_l:
         return "gemm2"
@@ -159,7 +159,7 @@ def run_profile(solution_json: str) -> str:
     E_LOCAL = int(getattr(module, "E_LOCAL", 32))
     TOP_K = int(getattr(module, "TOP_K", 8))
     QBLOCK = int(getattr(module, "QBLOCK", 128))
-    BLOCK_M = int(getattr(module, "BLOCK_M", 64))
+    BLOCK_M = int(getattr(module, "BLOCK_M_LARGE", 64))
 
     DEFAULT_T_VALUES = [7, 14, 64, 128, 512, 1024, 4096]
     WARMUP = 15
@@ -307,7 +307,12 @@ def run_profile(solution_json: str) -> str:
 
             topk_idx, topk_wts = module.ds_routing(routing_logits, routing_bias, routed_scaling_factor)
 
-            max_padded = t * TOP_K + E_LOCAL * BLOCK_M
+            if hasattr(module, "_select_block_m"):
+                block_m = int(module._select_block_m(t * TOP_K))
+            else:
+                block_m = BLOCK_M
+
+            max_padded = t * TOP_K + E_LOCAL * block_m
             sorted_token_ids = torch.empty((max_padded,), dtype=torch.int64, device="cuda")
             sorted_weights = torch.empty((max_padded,), dtype=torch.float32, device="cuda")
             scatter_map = torch.empty((t * TOP_K,), dtype=torch.int32, device="cuda")
@@ -332,7 +337,7 @@ def run_profile(solution_json: str) -> str:
                     tile_offsets,
                     local_expert_offset,
                     t,
-                    BLOCK_M,
+                    block_m,
                     max_padded,
                     counts_workspace,
                 )
@@ -351,14 +356,14 @@ def run_profile(solution_json: str) -> str:
                     t,
                     TOP_K,
                     E_LOCAL,
-                    BLOCK_M,
+                    block_m,
                     max_padded,
                     num_warps=8,
                 )
             else:
                 return None, None
             tb = int(total_blocks.item())
-            return tb, tb * BLOCK_M
+            return tb, tb * block_m
         except Exception:
             return None, None
 
@@ -506,9 +511,11 @@ def run_profile(solution_json: str) -> str:
                 gemm1_tflops = gemm1_flops / (gemm1_ms * 1e-3) / 1e12
             if gemm2_ms > 0:
                 gemm2_tflops = gemm2_flops / (gemm2_ms * 1e-3) / 1e12
+            gemm1_tflops_str = f"{gemm1_tflops:.1f}T" if gemm1_tflops is not None else "N/A"
+            gemm2_tflops_str = f"{gemm2_tflops:.1f}T" if gemm2_tflops is not None else "N/A"
             log(
                 f"Effective TFLOPS (actual num_padded={num_padded}): "
-                f"GEMM1={gemm1_tflops:.1f}T, GEMM2={gemm2_tflops:.1f}T"
+                f"GEMM1={gemm1_tflops_str}, GEMM2={gemm2_tflops_str}"
             )
         else:
             log("Effective TFLOPS: N/A (num_padded unavailable)")
