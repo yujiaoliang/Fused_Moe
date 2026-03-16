@@ -190,12 +190,19 @@ def run_profile(solution_json: str) -> str:
                     return v
             return 0
 
-        gemm1_us = 0
-        gemm2_us = 0
-        routing_us = 0
-        sorting_us = 0
-        copy_us = 0
-        other_us = 0
+        phase_us = {
+            'gemm1': 0,
+            'gemm2': 0,
+            'route': 0,
+            'sort_hist': 0,
+            'sort_layout': 0,
+            'sort_init': 0,
+            'sort_scatter': 0,
+            'sort_fallback': 0,
+            'reduce': 0,
+            'copy': 0,
+            'other': 0,
+        }
         top_kernels = []
 
         for e in events:
@@ -205,33 +212,72 @@ def run_profile(solution_json: str) -> str:
             name = e.key
             nl = name.lower()
 
-            if 'gemm1_swiglu' in nl or '_fused_moe_gemm1' in nl:
-                gemm1_us += t
+            if '_t1_fused_gemm2_reduce' in nl or 'token_reduce' in nl:
+                phase_us['reduce'] += t
+                top_kernels.append(('REDUCE', name[:80], t / NUM_ITERS, e.count / NUM_ITERS))
+            elif 'triton_sort_histogram_kernel' in nl:
+                phase_us['sort_hist'] += t
+                top_kernels.append(('S-HIST', name[:80], t / NUM_ITERS, e.count / NUM_ITERS))
+            elif 'triton_sort_layout_kernel' in nl:
+                phase_us['sort_layout'] += t
+                top_kernels.append(('S-LAY', name[:80], t / NUM_ITERS, e.count / NUM_ITERS))
+            elif 'triton_init_sorted_buffers_kernel' in nl:
+                phase_us['sort_init'] += t
+                top_kernels.append(('S-INIT', name[:80], t / NUM_ITERS, e.count / NUM_ITERS))
+            elif 'triton_sort_scatter_kernel' in nl:
+                phase_us['sort_scatter'] += t
+                top_kernels.append(('S-SCAT', name[:80], t / NUM_ITERS, e.count / NUM_ITERS))
+            elif 'triton_sort_and_scatter_kernel' in nl:
+                phase_us['sort_fallback'] += t
+                top_kernels.append(('S-FALL', name[:80], t / NUM_ITERS, e.count / NUM_ITERS))
+            elif 'triton_ds_routing' in nl or 'ds_routing_t1_local' in nl:
+                phase_us['route'] += t
+                top_kernels.append(('ROUTE', name[:80], t / NUM_ITERS, e.count / NUM_ITERS))
+            elif 'gemm1_swiglu' in nl or '_fused_moe_gemm1' in nl or '_t1_generic_gemm1' in nl:
+                phase_us['gemm1'] += t
                 top_kernels.append(('GEMM1', name[:80], t / NUM_ITERS, e.count / NUM_ITERS))
-            elif 'gemm2_scatter' in nl or '_fused_moe_gemm2' in nl:
-                gemm2_us += t
+            elif 'gemm2_scatter' in nl or '_fused_moe_gemm2' in nl or '_t1_generic_gemm2' in nl:
+                phase_us['gemm2'] += t
                 top_kernels.append(('GEMM2', name[:80], t / NUM_ITERS, e.count / NUM_ITERS))
             elif any(k in nl for k in ['sigmoid', 'topk', 'masked_fill', 'gather',
                                         'scatter_', 'mul_', 'div_', 'add_']):
-                routing_us += t
+                phase_us['route'] += t
             elif any(k in nl for k in ['argsort', 'sort', 'cumsum', 'repeat_interleave',
                                         'arange', 'ones_like', 'full']):
-                sorting_us += t
+                phase_us['sort_fallback'] += t
             elif any(k in nl for k in ['copy', 'zero', 'fill', 'memset', 'memcpy']):
-                copy_us += t
+                phase_us['copy'] += t
             else:
-                other_us += t
+                phase_us['other'] += t
                 if t / NUM_ITERS > 5.0:  # >5us per iter — notable
                     top_kernels.append(('other', name[:80], t / NUM_ITERS, e.count / NUM_ITERS))
 
-        total_cuda_us = gemm1_us + gemm2_us + routing_us + sorting_us + copy_us + other_us
+        gemm1_us = phase_us['gemm1']
+        gemm2_us = phase_us['gemm2']
+        routing_us = phase_us['route']
+        sort_hist_us = phase_us['sort_hist']
+        sort_layout_us = phase_us['sort_layout']
+        sort_init_us = phase_us['sort_init']
+        sort_scatter_us = phase_us['sort_scatter']
+        sort_fallback_us = phase_us['sort_fallback']
+        sorting_us = sort_hist_us + sort_layout_us + sort_init_us + sort_scatter_us + sort_fallback_us
+        reduce_us = phase_us['reduce']
+        copy_us = phase_us['copy']
+        other_us = phase_us['other']
+        total_cuda_us = sum(phase_us.values())
 
         log(f"\n  CUDA breakdown (per iter):")
         def pct(x): return 100 * x / total_cuda_us if total_cuda_us > 0 else 0
         log(f"    GEMM1 (Triton FP8):  {gemm1_us/NUM_ITERS/1000:8.3f} ms  ({pct(gemm1_us):5.1f}%)")
         log(f"    GEMM2 (Triton TF32): {gemm2_us/NUM_ITERS/1000:8.3f} ms  ({pct(gemm2_us):5.1f}%)")
-        log(f"    Routing (PyTorch):   {routing_us/NUM_ITERS/1000:8.3f} ms  ({pct(routing_us):5.1f}%)")
-        log(f"    Sorting (PyTorch):   {sorting_us/NUM_ITERS/1000:8.3f} ms  ({pct(sorting_us):5.1f}%)")
+        log(f"    Routing:             {routing_us/NUM_ITERS/1000:8.3f} ms  ({pct(routing_us):5.1f}%)")
+        log(f"    Sort total:          {sorting_us/NUM_ITERS/1000:8.3f} ms  ({pct(sorting_us):5.1f}%)")
+        log(f"      histogram:         {sort_hist_us/NUM_ITERS/1000:8.3f} ms  ({pct(sort_hist_us):5.1f}%)")
+        log(f"      layout:            {sort_layout_us/NUM_ITERS/1000:8.3f} ms  ({pct(sort_layout_us):5.1f}%)")
+        log(f"      init:              {sort_init_us/NUM_ITERS/1000:8.3f} ms  ({pct(sort_init_us):5.1f}%)")
+        log(f"      scatter:           {sort_scatter_us/NUM_ITERS/1000:8.3f} ms  ({pct(sort_scatter_us):5.1f}%)")
+        log(f"      fallback:          {sort_fallback_us/NUM_ITERS/1000:8.3f} ms  ({pct(sort_fallback_us):5.1f}%)")
+        log(f"    Token reduce:        {reduce_us/NUM_ITERS/1000:8.3f} ms  ({pct(reduce_us):5.1f}%)")
         log(f"    Copy/zero/memset:    {copy_us/NUM_ITERS/1000:8.3f} ms  ({pct(copy_us):5.1f}%)")
         log(f"    Other:               {other_us/NUM_ITERS/1000:8.3f} ms  ({pct(other_us):5.1f}%)")
         log(f"    Total CUDA:          {total_cuda_us/NUM_ITERS/1000:8.3f} ms")
@@ -271,8 +317,11 @@ def run_profile(solution_json: str) -> str:
         gemm2_flops = 2.0 * total_padded * H * I_SIZE
         gemm2_bytes = (total_padded * I_SIZE * 4        # A reads (fp32)
                      + active_experts * H * I_SIZE * 1   # B reads (fp8)
-                     + T * H * 4)                        # C writes (fp32, atomicAdd)
+                     + total_padded * H * 4)            # expert_out writes (fp32)
         gemm2_ai = gemm2_flops / gemm2_bytes if gemm2_bytes > 0 else 0
+        reduce_bytes = (total_padded * H * 4            # expert_out reads (fp32)
+                      + T * TOP_K * 4                    # scatter_map reads (int32)
+                      + T * H * 2)                       # output writes (bf16)
 
         gemm1_bound = 'COMPUTE' if gemm1_ai > RIDGE_FP8 else 'MEMORY'
         gemm2_bound = 'COMPUTE' if gemm2_ai > RIDGE_TF32 else 'MEMORY'
@@ -284,6 +333,7 @@ def run_profile(solution_json: str) -> str:
         # Achieved bandwidth (only meaningful if memory-bound)
         gemm1_bw = gemm1_bytes / (gemm1_us / NUM_ITERS * 1e-6) / 1e9 if gemm1_us > 0 else 0
         gemm2_bw = gemm2_bytes / (gemm2_us / NUM_ITERS * 1e-6) / 1e9 if gemm2_us > 0 else 0
+        reduce_bw = reduce_bytes / (reduce_us / NUM_ITERS * 1e-6) / 1e9 if reduce_us > 0 else 0
 
         log(f"\n  Roofline analysis (avg {tokens_per_exp} tok/expert, {active_experts} active experts):")
         log(f"    GEMM1: {gemm1_flops/1e9:.1f} GFLOP, {gemm1_bytes/1e6:.1f} MB, "
@@ -294,6 +344,9 @@ def run_profile(solution_json: str) -> str:
             f"AI={gemm2_ai:.0f} FLOP/B → {gemm2_bound}-BOUND (ridge={RIDGE_TF32:.0f})")
         log(f"      Achieved: {gemm2_achieved:.0f} TFLOPS ({100*gemm2_achieved/PEAK_TF32:.1f}% TF32 peak)"
             f", BW: {gemm2_bw:.0f} GB/s ({100*gemm2_bw/PEAK_BW:.1f}% peak)")
+        if reduce_us > 0:
+            log(f"    Reduce: {reduce_bytes/1e6:.1f} MB moved, BW: {reduce_bw:.0f} GB/s"
+                f" ({100*reduce_bw/PEAK_BW:.1f}% peak)")
 
         results.append({
             'T': T,
@@ -301,7 +354,13 @@ def run_profile(solution_json: str) -> str:
             'gemm1_ms': gemm1_us / NUM_ITERS / 1000,
             'gemm2_ms': gemm2_us / NUM_ITERS / 1000,
             'route_ms': routing_us / NUM_ITERS / 1000,
+            'sort_hist_ms': sort_hist_us / NUM_ITERS / 1000,
+            'sort_layout_ms': sort_layout_us / NUM_ITERS / 1000,
+            'sort_init_ms': sort_init_us / NUM_ITERS / 1000,
+            'sort_scatter_ms': sort_scatter_us / NUM_ITERS / 1000,
+            'sort_fallback_ms': sort_fallback_us / NUM_ITERS / 1000,
             'sort_ms': sorting_us / NUM_ITERS / 1000,
+            'reduce_ms': reduce_us / NUM_ITERS / 1000,
             'other_ms': (copy_us + other_us) / NUM_ITERS / 1000,
             'gemm1_tflops': gemm1_achieved,
             'gemm2_tflops': gemm2_achieved,
@@ -314,19 +373,29 @@ def run_profile(solution_json: str) -> str:
     log(f"SUMMARY TABLE")
     log(f"{'='*90}")
     hdr = (f"{'T':>6s} | {'Wall':>7s} | {'GEMM1':>7s} | {'GEMM2':>7s} | {'Route':>7s} |"
-           f" {'Sort':>7s} | {'Other':>7s} | {'GEMM%':>5s} | {'G1 TFLOP':>8s} | {'G2 TFLOP':>8s} |"
+           f" {'Sort':>7s} | {'Reduce':>7s} | {'Other':>7s} | {'GEMM%':>5s} | {'G1 TFLOP':>8s} | {'G2 TFLOP':>8s} |"
            f" {'G1':>7s} | {'G2':>7s}")
     log(hdr)
     log(f"{'':>6s} | {'(ms)':>7s} | {'(ms)':>7s} | {'(ms)':>7s} | {'(ms)':>7s} |"
-        f" {'(ms)':>7s} | {'(ms)':>7s} | {'':>5s} | {'':>8s} | {'':>8s} |"
+        f" {'(ms)':>7s} | {'(ms)':>7s} | {'(ms)':>7s} | {'':>5s} | {'':>8s} | {'':>8s} |"
         f" {'bound':>7s} | {'bound':>7s}")
-    log('─' * 120)
+    log('─' * 130)
     for r in results:
         gemm_pct = 100 * (r['gemm1_ms'] + r['gemm2_ms']) / r['wall_ms'] if r['wall_ms'] > 0 else 0
         log(f"{r['T']:6d} | {r['wall_ms']:7.3f} | {r['gemm1_ms']:7.3f} | {r['gemm2_ms']:7.3f} |"
-            f" {r['route_ms']:7.3f} | {r['sort_ms']:7.3f} | {r['other_ms']:7.3f} |"
+            f" {r['route_ms']:7.3f} | {r['sort_ms']:7.3f} | {r['reduce_ms']:7.3f} | {r['other_ms']:7.3f} |"
             f" {gemm_pct:4.0f}% | {r['gemm1_tflops']:7.0f}T | {r['gemm2_tflops']:7.0f}T |"
             f" {r['gemm1_bound']:>7s} | {r['gemm2_bound']:>7s}")
+
+    log(f"\n{'='*90}")
+    log(f"SORT DETAIL")
+    log(f"{'='*90}")
+    log(f"{'T':>6s} | {'Hist':>7s} | {'Layout':>7s} | {'Init':>7s} | {'Scatter':>7s} | {'Fallback':>8s}")
+    log(f"{'':>6s} | {'(ms)':>7s} | {'(ms)':>7s} | {'(ms)':>7s} | {'(ms)':>7s} | {'(ms)':>8s}")
+    log('─' * 70)
+    for r in results:
+        log(f"{r['T']:6d} | {r['sort_hist_ms']:7.3f} | {r['sort_layout_ms']:7.3f} |"
+            f" {r['sort_init_ms']:7.3f} | {r['sort_scatter_ms']:7.3f} | {r['sort_fallback_ms']:8.3f}")
 
     log(f"\n{'='*90}")
     log(f"OPTIMIZATION INSIGHTS")
@@ -340,26 +409,31 @@ def run_profile(solution_json: str) -> str:
         r = large_t[-1]  # T=4096
         g1_frac = r['gemm1_ms'] / r['wall_ms'] * 100 if r['wall_ms'] > 0 else 0
         g2_frac = r['gemm2_ms'] / r['wall_ms'] * 100 if r['wall_ms'] > 0 else 0
-        overhead = r['route_ms'] + r['sort_ms'] + r['other_ms']
+        sort_frac = r['sort_ms'] / r['wall_ms'] * 100 if r['wall_ms'] > 0 else 0
+        reduce_frac = r['reduce_ms'] / r['wall_ms'] * 100 if r['wall_ms'] > 0 else 0
+        overhead = r['route_ms'] + r['other_ms']
         oh_frac = overhead / r['wall_ms'] * 100 if r['wall_ms'] > 0 else 0
-        log(f"\n  Large-T (T={r['T']}): GEMM1={g1_frac:.0f}%, GEMM2={g2_frac:.0f}%, overhead={oh_frac:.0f}%")
-        if g2_frac > g1_frac * 1.3:
+        log(f"\n  Large-T (T={r['T']}): GEMM1={g1_frac:.0f}%, GEMM2={g2_frac:.0f}%, sort={sort_frac:.0f}%, reduce={reduce_frac:.0f}%, misc={oh_frac:.0f}%")
+        if sort_frac > 10:
+            log(f"  → Parallel sort still matters. Sweep tile thresholds and histogram/scatter shape first.")
+        elif reduce_frac > 10:
+            log(f"  → Token-reduce is material. Autotune BLOCK_N/warps before touching GEMM math.")
+        elif g2_frac > g1_frac * 1.3:
             log(f"  → GEMM2 dominates. TF32 throughput is the bottleneck (half of FP8).")
             log(f"    Options: FP8 Intermediate (failed — precision), or improve GEMM2 tile efficiency.")
         elif oh_frac > 20:
-            log(f"  → Routing/sorting overhead significant. Consider persistent kernel or fused routing.")
+            log(f"  → Non-kernel overhead still visible. Check memset/copy and stray runtime kernels.")
         else:
             log(f"  → Balanced. Both GEMMs + overhead contribute.")
 
     if small_t:
         r = small_t[0]  # T=7
-        overhead = r['route_ms'] + r['sort_ms'] + r['other_ms']
+        overhead = r['route_ms'] + r['sort_ms'] + r['reduce_ms'] + r['other_ms']
         oh_frac = overhead / r['wall_ms'] * 100 if r['wall_ms'] > 0 else 0
         gemm_frac = (r['gemm1_ms'] + r['gemm2_ms']) / r['wall_ms'] * 100 if r['wall_ms'] > 0 else 0
         log(f"\n  Small-T (T={r['T']}): GEMM={gemm_frac:.0f}%, overhead={oh_frac:.0f}%")
         if oh_frac > 50:
-            log(f"  → Overhead-dominated. Routing/sorting cost > GEMM compute.")
-            log(f"    Options: fuse routing into kernel, or persistent kernel to amortize launch cost.")
+            log(f"  → Non-GEMM stages dominate. Tiny-batch fast path and lighter sort/reduce are best bets.")
         else:
             log(f"  → GEMM memory-bound (loading 32 experts' weights for few tokens).")
             log(f"    Options: skip inactive experts (already done), or weight prefetching.")

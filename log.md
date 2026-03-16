@@ -249,8 +249,29 @@ moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
   Workload f7d6ac7c...: PASSED | 0.270 ms | 49.08x speedup | abs_err=2.05e+03, rel_err=1.96e+01
 
 
-  ### 分桶，特化！中型T 有一点收益，具体如下：
-    Workload b8f4f012...: PASSED | 0.112 ms | 95.85x speedup | abs_err=2.05e+03, rel_err=3.54e+00
+### 2026-03-16 Round 15（commit `d2fdf14`）：Medium-T Bucket Specialization
+
+- 背景：Round 14 之后 routing / sort / reduce 的固定开销已经压得比较低，主要剩下的是 `T≈32-128` 上 generic GEMM 的固定成本；上一版“按 num tile 判断”的方案把 mean 大致推到 `45.05x`，但中型 T 仍然没有真正吃满。
+- 这次改动：
+  - `BLOCK_M` 扩成四档：`16 / 32 / 64 / 128`
+  - `32 <= T <= 64` 走 `_small_medium_*` kernel
+  - `65 <= T <= 128` 走 `_medium_*` kernel
+  - small-medium GEMM1 中 expert lookup 改成基于 `block_offsets_ptr` 的二分查找，避免每个 tile 做完整 32-way scan
+- 结果摘要：
+  - **Peak:** **106.65x**（`2e69caee`）
+  - **Mean:** **55.77x**
+  - **GMean:** **47.54x**
+  - **50x+ Workloads:** **14 / 19**
+  - **代表性提升:** `b8f4f012 66.21x -> 95.85x`，`8f1ff9f1 23.91x -> 48.09x`，`a7c2bcfd 64.44x -> 72.44x`，`2e69caee 64.23x -> 106.65x`
+  - **Large-T 基本持平:** `58a34f27 9.51x -> 9.25x`，`5e8dc11c 8.54x -> 8.34x`
+- 对比上一版（按 num tile 判断）：
+  - `b8f4f012`: `66.21x -> 95.85x`
+  - `8f1ff9f1`: `23.91x -> 48.09x`
+  - `a7c2bcfd`: `64.44x -> 72.44x`
+  - `2e69caee`: `64.23x -> 106.65x`
+
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload b8f4f012...: PASSED | 0.112 ms | 95.85x speedup | abs_err=2.05e+03, rel_err=3.54e+00
   Workload e05c6c03...: PASSED | 0.106 ms | 96.83x speedup | abs_err=2.05e+03, rel_err=1.71e-02
   Workload 6230e838...: PASSED | 0.248 ms | 51.59x speedup | abs_err=4.10e+03, rel_err=1.03e+02
   Workload 8f1ff9f1...: PASSED | 0.307 ms | 48.09x speedup | abs_err=4.10e+03, rel_err=6.65e+02

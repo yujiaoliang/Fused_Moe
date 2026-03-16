@@ -4,6 +4,8 @@
 > **硬件:** NVIDIA B200 (Blackwell, sm100a)
 > **峰值性能:** FP8 ~2500 TFLOPS, TF32 ~1250 TFLOPS, HBM3e ~8 TB/s
 
+> **当前最佳版本:** Round 15 (`d2fdf14`) — Peak **106.65x**, Mean **55.77x**, GMean **47.54x**, `14 / 19` workloads 达到 **50x+**
+
 ---
 
 ## 1. Profiling 结果（Round 6 baseline）
@@ -289,6 +291,7 @@ Large T (≥512): COMPUTE-BOUND — 充分利用 tensor cores
 
 ---
 
+
 ## 13. Round 14: Multi-Block Parallel Sort (Direction A)
 
 **探索思路:** 
@@ -298,7 +301,41 @@ Round 9 实现的 `triton_sort_and_scatter` 在统计各 Expert 的 Token 计数
 摒弃串行扫描，全面引入 `parallel_sort_and_scatter` 并行调度。队友通过多 Block 切分计算，让 GPU 内部多个 SM 并行执行 Histogram 统计和 Prefix Sum 计算（通过分配 `partial_counts` 等额外 Workspace Buffer 配合 `NUM_TILES`），彻底化解了长序列时的 Atomic Bottleneck。
 
 **结果:**
-- **Peak Performance:** 80.31x → **88.x** (打破极致天花板！)
-- **Large-T (4096):** 8.8x → **>9.3x** (彻底消除串行统计损耗，大规模序列性能飙升)
+- **Peak Performance:** 80.31x → **88.x**
+- **Large-T (4096):** 8.8x → **>9.3x**
 
-**结论:** Multi-Block Sort 是我们在 B200 芯片上榨干内存带宽和指令并发之后的最终调度红利，也是本次黑客松最优美的终点。
+**结论:** Multi-Block Sort 基本清掉了长序列上的 sort / histogram 串行瓶颈，也把系统主瓶颈从全局调度问题进一步推进到了 medium-T GEMM 固定成本。它不是终点，而是 Round 15 bucket specialization 的前置基础。
+
+---
+
+## 14. Round 15: Medium-T Bucket Specialization (`d2fdf14`)
+
+**瓶颈迁移:**
+Round 14 之后，routing / sort / reduce 的大头固定开销已经明显下降，large-T 也被 `BLOCK_M=128` 和并行 sort 基本托住。剩下最突出的短板变成了 **`T≈32-128` 的 medium batch**：这类 workload 的 GEMM 计算量还不足以完全淹没 kernel 固定成本，但又已经大到会被 padding、expert 边界查找和过宽 autotune 搜索空间拖慢。
+
+**方案:**
+- 将 `BLOCK_M` 扩成四档：`16 / 32 / 64 / 128`
+- `32 <= T <= 64` 走 `_small_medium_fused_moe_gemm1_swiglu_kernel` / `_small_medium_fused_moe_gemm2_kernel`
+- `65 <= T <= 128` 走 `_medium_fused_moe_gemm1_swiglu_kernel` / `_medium_fused_moe_gemm2_kernel`
+- small-medium GEMM1 中 expert lookup 从完整 32-way scan 改为基于 `block_offsets_ptr` 的二分查找
+
+**为什么有效（profiling 视角）:**
+- medium-T 对 per-expert padding waste 更敏感，细分 `BLOCK_M` 能直接减少无效 tile
+- bucketed kernel 缩窄了 autotune / launch configuration 的搜索空间，降低 generic path 的固定开销
+- expert 边界查找被简化后，GEMM1 前置控制流成本明显下降，短中序列更容易把时间花在真正的 MMA 上
+- 这说明主瓶颈已不再是 Round 14 之前的全局 sort atomic contention，而是 **medium-T 的 kernel specialization 不足**
+
+**结果摘要:**
+- **Peak:** **106.65x**（`2e69caee`）
+- **Mean:** **55.77x**
+- **GMean:** **47.54x**
+- **50x+ Workloads:** **14 / 19**
+- **代表性提升:** `b8f4f012 66.21x -> 95.85x`，`8f1ff9f1 23.91x -> 48.09x`，`a7c2bcfd 64.44x -> 72.44x`，`2e69caee 64.23x -> 106.65x`
+- **Large-T 基本持平:** `58a34f27 9.51x -> 9.25x`，`5e8dc11c 8.54x -> 8.34x`
+
+**结论:** 到 Round 15 为止，系统层面的优化路径已经非常清晰：
+1. 先用 Pure Triton routing / sorting / token-reduce 清掉 CPU 与 atomic 固定开销；
+2. 再用 `BLOCK_M=128` 和 parallel sort 稳住 large-T；
+3. 最后通过 medium-T bucket specialization 把 `T≈32-128` 的 generic GEMM 固定成本继续打薄。
+
+如果后面还要继续抬分，profiling 的重点应放在 **GEMM2 / medium bucket 的进一步特化**，而不是回头再优化 routing 或 sort。
