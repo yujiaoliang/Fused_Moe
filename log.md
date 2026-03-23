@@ -290,3 +290,85 @@ moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
   Workload 76010cb4...: PASSED | 0.256 ms | 51.48x speedup | abs_err=4.10e+03, rel_err=8.33e+02
   Workload fc378037...: PASSED | 0.261 ms | 51.64x speedup | abs_err=4.10e+03, rel_err=1.08e+02
   Workload f7d6ac7c...: PASSED | 0.220 ms | 55.52x speedup | abs_err=2.05e+03, rel_err=4.73e+01
+
+
+### 2026-03-23 保留优化：large-T exact dispatch
+
+#### 背景
+
+base 版本里，sort 之后虽然已经能得到真实的 `total_blocks`，但后续 GEMM1/GEMM2 的 launch 仍然按 `MAX_PADDED // BLOCK_M` 这个上界发射。  
+当 `T` 很大且 local expert 分布比较稀疏时，`MAX_PID_M` 会明显大于真实需要计算的 block 数，导致两个问题：
+
+* GEMM1/GEMM2 存在明显 overlaunch，很多 program 只是在 kernel 内早退
+* kernel bucket 仍然按 `T` 分桶，而不是按真实 workload 分桶，large-T 下容易错配
+
+#### 修改内容
+
+在 `solution/triton/kernel.py` 中只保留了一条最终有效的优化：
+
+* 新增 `EXACT_WORKLOAD_DISPATCH_T_MIN = 4096`
+* 新增 `_use_exact_workload_dispatch(t)`，仅在 `T >= 4096` 时启用 exact dispatch
+* 新增 `_select_gemm_buckets_from_workload(t, block_m, total_blocks)`，对于 large-T 不再只按 `T` 选择 small/medium/general GEMM bucket，而是按真实 `total_blocks * block_m` 判断
+* 在 `parallel_sort_and_scatter(...)` 之后，读取一次 `total_blocks.item()` 得到真实 `exact_pid_m`
+* GEMM1/GEMM2 的 grid 从：
+
+```python
+MAX_PID_M * ceil_div(N, BLOCK_N)
+```
+
+改为：
+
+```python
+exact_pid_m * ceil_div(N, BLOCK_N)
+```
+
+* GEMM1/GEMM2 launch 时传入的 `MAX_PID_M` 也同步改成 `exact_pid_m`
+* 如果 `exact_pid_m <= 0`，则直接 `output.zero_()` 返回
+
+#### 为什么只对 large-T 开启
+
+这条优化需要一次 `total_blocks.item()`，也就是一次 host 读标量。  
+在 `T=901` 这类 workload 上，这个同步成本会吃掉 GPU 侧减少 overlaunch 的收益；但在 `T=11948/14107` 这类真正的大 workload 上，这个固定成本可以被摊薄，所以净收益为正。
+
+因此最终策略是：
+
+* `T < 4096`：保持 base 行为
+* `T >= 4096`：启用 exact dispatch + workload-aware bucket
+
+#### 实测效果
+
+相对 `0321 base`，当前保留版本在大 T 上有稳定收益：
+
+* `T=11948`：`3.790 ms -> 3.583 ms`，约 `-5.5%`
+* `T=14107`：`5.308 ms -> 5.066 ms`，约 `-4.6%`
+* `T=901`：基本持平，因此不对这类 case 开启
+
+进一步看 kernel 级别，主要收益来自 GEMM2：
+
+* `T=11948`：`GEMM2 1832.89 us -> 1606.74 us`
+* `T=14107`：`GEMM2 2629.37 us -> 2374.67 us`
+
+#### 结论
+
+这是目前相对 base 唯一稳定、可复现、且不牺牲正确性的通用路径优化。  
+后续优化应继续围绕 large-T 的真实 workload 调度与 GEMM2 主体展开，而不是再回到 small-T 特化或大而全的 fuse 路线。
+moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
+  Workload b8f4f012...: PASSED | 0.171 ms | 66.95x speedup | abs_err=2.05e+03, rel_err=8.19e+00
+  Workload e05c6c03...: PASSED | 0.124 ms | 87.55x speedup | abs_err=2.56e+02, rel_err=7.19e-03
+  Workload 6230e838...: PASSED | 0.250 ms | 54.41x speedup | abs_err=4.10e+03, rel_err=7.22e+01
+  Workload 8f1ff9f1...: PASSED | 0.305 ms | 51.01x speedup | abs_err=4.10e+03, rel_err=5.83e+02
+  Workload 1a4c6ba1...: PASSED | 0.855 ms | 24.19x speedup | abs_err=4.32e+05, rel_err=2.45e+13
+  Workload a7c2bcfd...: PASSED | 0.177 ms | 69.96x speedup | abs_err=2.05e+03, rel_err=3.34e+03
+  Workload 2e69caee...: PASSED | 0.173 ms | 65.08x speedup | abs_err=2.05e+03, rel_err=6.91e+01
+  Workload 8cba5890...: PASSED | 0.175 ms | 69.17x speedup | abs_err=2.05e+03, rel_err=7.87e+01
+  Workload 5e8dc11c...: PASSED | 4.983 ms | 9.00x speedup | abs_err=5.49e+05, rel_err=5.49e+13
+  Workload 58a34f27...: PASSED | 3.516 ms | 10.10x speedup | abs_err=5.18e+05, rel_err=5.18e+13
+  Workload 5eadab1e...: PASSED | 0.209 ms | 64.62x speedup | abs_err=4.10e+03, rel_err=2.04e+02
+  Workload eedc63b2...: PASSED | 0.228 ms | 58.28x speedup | abs_err=4.10e+03, rel_err=3.01e+02
+  Workload e626d3e6...: PASSED | 0.271 ms | 55.33x speedup | abs_err=4.10e+03, rel_err=2.34e+02
+  Workload 74d7ff04...: PASSED | 0.269 ms | 53.89x speedup | abs_err=2.05e+03, rel_err=2.40e+02
+  Workload 4822167c...: PASSED | 0.275 ms | 53.05x speedup | abs_err=4.10e+03, rel_err=2.98e+02
+  Workload 81955b1e...: PASSED | 0.266 ms | 53.30x speedup | abs_err=4.10e+03, rel_err=1.21e+03
+  Workload 76010cb4...: PASSED | 0.255 ms | 54.44x speedup | abs_err=4.10e+03, rel_err=8.51e+01
+  Workload fc378037...: PASSED | 0.261 ms | 54.65x speedup | abs_err=4.10e+03, rel_err=4.72e+01
+  Workload f7d6ac7c...: PASSED | 0.222 ms | 58.14x speedup | abs_err=2.05e+03, rel_err=1.17e+02

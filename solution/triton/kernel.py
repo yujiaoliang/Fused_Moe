@@ -41,6 +41,8 @@ SMALL_MEDIUM_T_MIN = 32
 SMALL_MEDIUM_T_MAX = 64
 UPPER_MEDIUM_T_MIN = 65
 UPPER_MEDIUM_T_MAX = 128
+# Large traces benefit from exact pid_m dispatch; smaller traces lose to the extra host sync.
+EXACT_WORKLOAD_DISPATCH_T_MIN = 4096
 BLOCK_K = 128  # K-block (must equal QBLOCK for scale alignment)
 GROUP_SIZE_M = 8  # L2 cache reuse grouping
 SORT_BLOCK_ITEMS = 256
@@ -1604,8 +1606,6 @@ _buf_cache = {}
 _routing_cache = {}
 _sort_cache = {}
 _t1_cache = {}
-
-
 def _select_block_m(num_topk_tokens: int) -> int:
     if num_topk_tokens <= TINY_BATCH_TOPK_TOKENS:
         return BLOCK_M_TINY
@@ -1644,6 +1644,26 @@ def _use_small_medium_gemm_bucket(t: int) -> bool:
 
 def _use_upper_medium_gemm_bucket(t: int) -> bool:
     return UPPER_MEDIUM_T_MIN <= t <= UPPER_MEDIUM_T_MAX
+
+
+def _use_exact_workload_dispatch(t: int) -> bool:
+    return t >= EXACT_WORKLOAD_DISPATCH_T_MIN
+
+
+def _select_gemm_buckets_from_workload(t: int, block_m: int, total_blocks: int) -> tuple[bool, bool]:
+    if t <= UPPER_MEDIUM_T_MAX:
+        return _use_small_medium_gemm_bucket(t), _use_upper_medium_gemm_bucket(t)
+    if total_blocks <= 0:
+        return False, False
+    if block_m >= BLOCK_M_LARGE:
+        return False, False
+
+    padded_rows = total_blocks * block_m
+    if padded_rows <= SMALL_MEDIUM_T_MAX * TOP_K:
+        return True, False
+    if padded_rows <= UPPER_MEDIUM_T_MAX * TOP_K:
+        return False, True
+    return False, False
 
 
 _host_scalar_cache = {}
@@ -1858,11 +1878,28 @@ def kernel(
         counts_workspace,
     )
 
-    use_small_medium_gemm = _use_small_medium_gemm_bucket(T)
-    use_upper_medium_gemm = _use_upper_medium_gemm_bucket(T)
+    # Only switch to exact workload dispatch for very large traces where the reduced overlaunch
+    # amortizes the single total_blocks host read.
+    exact_pid_m = MAX_PID_M
+    use_exact_dispatch = _use_exact_workload_dispatch(T)
+    if use_exact_dispatch:
+        exact_pid_m = int(total_blocks.item())
+        if exact_pid_m <= 0:
+            output.zero_()
+            return output
+
+    if use_exact_dispatch:
+        use_small_medium_gemm, use_upper_medium_gemm = _select_gemm_buckets_from_workload(
+            T,
+            block_m,
+            exact_pid_m,
+        )
+    else:
+        use_small_medium_gemm = _use_small_medium_gemm_bucket(T)
+        use_upper_medium_gemm = _use_upper_medium_gemm_bucket(T)
 
     # -- 4. Fused GEMM1 + SwiGLU --
-    grid1 = lambda META: (MAX_PID_M * triton.cdiv(2048, META['BLOCK_N']),)
+    grid1 = lambda META: (exact_pid_m * triton.cdiv(2048, META['BLOCK_N']),)
 
     if use_small_medium_gemm:
         gemm1_kernel = _small_medium_fused_moe_gemm1_swiglu_kernel
@@ -1879,7 +1916,7 @@ def kernel(
         token_ids_ptr=sorted_token_ids,
         block_offsets_ptr=block_offsets,
         total_blocks_ptr=total_blocks,
-        MAX_PID_M=MAX_PID_M, T=T, H=7168, N=4096, K=7168,
+        MAX_PID_M=exact_pid_m, T=T, H=7168, N=4096, K=7168,
         stride_at=hidden_states.stride(0), stride_ah=hidden_states.stride(1),
         stride_as0=hidden_states_scale.stride(0), stride_as1=hidden_states_scale.stride(1),
         stride_be=gemm1_weights.stride(0), stride_bn=gemm1_weights.stride(1), stride_bh=gemm1_weights.stride(2),
@@ -1890,7 +1927,7 @@ def kernel(
     )
 
     # -- 5. GEMM2 (non-atomic, writes to expert_out) --
-    grid2 = lambda META: (MAX_PID_M * triton.cdiv(7168, META['BLOCK_N']),)
+    grid2 = lambda META: (exact_pid_m * triton.cdiv(7168, META['BLOCK_N']),)
 
     if use_small_medium_gemm:
         gemm2_kernel = _small_medium_fused_moe_gemm2_kernel
@@ -1906,7 +1943,7 @@ def kernel(
         token_weights_ptr=sorted_weights,
         block_offsets_ptr=block_offsets,
         total_blocks_ptr=total_blocks,
-        MAX_PID_M=MAX_PID_M, N=7168, K=2048,
+        MAX_PID_M=exact_pid_m, N=7168, K=2048,
         stride_am=Intermediate.stride(0), stride_ak=Intermediate.stride(1),
         stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1), stride_bk=gemm2_weights.stride(2),
         stride_cm=expert_out.stride(0), stride_cn=expert_out.stride(1),
