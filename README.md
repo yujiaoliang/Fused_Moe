@@ -2,7 +2,7 @@
 
 > **赛道:** Track A — Fused MoE
 > **目标硬件:** NVIDIA B200 (Blackwell, sm100)
-> **当前状态:** ✅ 19/19 PASSED｜最高 **106.65x** 加速｜短序列 **95-106x**｜中等 T **50x+**｜large-T **9.x**
+> **当前状态:** ✅ 19/19 PASSED｜最高 **87.55x** 加速｜短序列 **65-88x**｜中等 T **50x+**｜large-T **9-10x**
 
 ---
 
@@ -16,7 +16,7 @@
 | Native FP32 精度对齐 | ✅ 完成（Triton 内全 FP32 math，通过所有数值测试） |
 | Benchmark 正确性 | ✅ 19/19 PASSED (100% Numerically Correct) |
 
-### B200 Benchmark 结果（`d2fdf14` / Round 15）
+### B200 Benchmark 结果（`c685b02` / Round 16）
 
 Round 10.1 优化：在 Round 10 非原子 GEMM2 基础上，进一步将 `_reduce_scatter_kernel`（仍使用 `tl.atomic_add`）替换为 **Token-Centric Reduce** `_token_reduce_kernel`。每个 output token 启动一个程序，通过 `scatter_map` 直接读取其 TOP_K=8 个 expert 贡献并求和，写入 bf16 output。**一举消除了 `output_fp32.zero_()`、`tl.atomic_add`、`fp32→bf16 copy`**。
 
@@ -63,6 +63,79 @@ Round 10.1 优化：在 Round 10 非原子 GEMM2 基础上，进一步将 `_redu
 **Round 12 优化：** 实现 3-level BLOCK_M 自适应划分。T≤64 用 32，T≥2048 用 128，默认 64。大 T 工作负载由于 BLOCK_M 增大，K-loop 数据重用率提升，性能进一步提升 **8-12%**（T=4096 突破 8.8x）。放弃了 T≤8 用 BLOCK_M=16 的尝试，因为 16×128 的 dot 无法充分填满 B200 的 TensorCore，导致明显的性能倒退（80x 跌至 51x）。
 
 **Round 15 核心洞察：** Round 14 已经把 routing / sort / reduce 的大头固定开销压到很低，剩余问题变成 **中等 batch (尤其 T≈32-128) 上 generic GEMM kernel 的固定成本过高**。这类 workload 对 padding、expert 边界查找、autotune 搜索空间都更敏感，因此采用 **bucket dispatch + 更窄 autotune 空间 + 更轻 expert lookup** 比继续堆大而全配置更有效。
+
+### 🔥 Round 16 / commit `c685b02` — Large-T Exact Dispatch
+
+**优化内容：** 新增 `EXACT_WORKLOAD_DISPATCH_T_MIN = 4096`。sort 之后读取一次真实的 `total_blocks.item()`，GEMM1/GEMM2 launch 的 `MAX_PID_M` 改为精确值，彻底消除 large-T 下的 overlaunch 早退开销。同时新增 `_select_gemm_buckets_from_workload()`，对 `T ≥ 4096` 按真实 `total_blocks * block_m` 而非 `T` 选择 GEMM bucket。`T < 4096` 保持原有路径，避免 `total_blocks.item()` 同步成本拖慢中小 T。
+
+**Large-T kernel 级收益：**
+- `T=11948`：GEMM2 `1832.89 us → 1606.74 us`，wall `3.790 ms → 3.583 ms`（-5.5%）
+- `T=14107`：GEMM2 `2629.37 us → 2374.67 us`，wall `5.308 ms → 5.066 ms`（-4.6%）
+
+**Round 16 Full-19 结果（B200，`c685b02`）：**
+- **Peak:** **87.55x**（`e05c6c03`）
+- **Mean:** **~53.3x**
+- **GMean:** **~47.1x**
+- **Large-T 提升:** `5e8dc11c 8.34x → 9.00x`，`58a34f27 9.25x → 10.10x`
+
+| Workload | R15 (`d2fdf14`) | R16 (`c685b02`) | 备注 |
+|----------|---------|---------|------|
+| e05c6c03 | 96.83x | **87.55x** | 短序列（Modal 环境波动） |
+| b8f4f012 | 95.85x | **66.95x** | 短序列 |
+| a7c2bcfd | 72.44x | **69.96x** | T=128 |
+| 8cba5890 | 67.82x | **69.17x** | ≈持平 |
+| 2e69caee | 106.65x | **65.08x** | 短序列（环境波动） |
+| 5eadab1e | 61.82x | **64.62x** | +5% |
+| f7d6ac7c | 55.52x | **58.14x** | +5% |
+| eedc63b2 | 55.24x | **58.28x** | +5% |
+| 8f1ff9f1 | 48.09x | **51.01x** | T=80 |
+| 1a4c6ba1 | 23.04x | **24.19x** | T=512 |
+| **5e8dc11c** (T=11948) | 8.34x | **9.00x** | 🔥 large-T +8% |
+| **58a34f27** (T=14107) | 9.25x | **10.10x** | 🔥 large-T +9% |
+
+> ⚠️ 短序列的数值较 Round 15 有所下降，系 Modal B200 线上环境漂移所致（非代码退化）。Large-T 的提升是本 commit 的真实净收益。
+
+### [2026-03-22] 当前 Modal 可复现口径 & Direction 4（Microbatch Scheduling）实验记录
+
+> ⚠️ 上面的 `106.65x / 55.77x / 47.54x` 是 **Round 15 / commit `d2fdf14` 的历史最佳记录**，不是今天 Modal 环境下的可复现官方 full19 成绩。
+
+使用当前仓库内的 `scripts/test_modal.py` 在当日 Modal B200 环境重新跑官方 full19，得到：
+
+- `d2fdf14` 官方重跑：**mean 43.86x / gmean 39.36x / peak 66.20x**
+- 稳定基线 `e7e8f66` 官方重跑：**mean 44.25x / gmean 39.64x / peak 66.85x**
+
+这说明 **当前 Modal 线上环境相较于 Round 15 提交期已明显漂移**，README 顶部 headline 目前更适合作为“历史最佳”，而不是“今日可复现”。
+
+在这个前提下，本轮沿着 **Direction 4: 激进调度 / Decode-Microbatch 优化** 做了多组小批量实验：
+
+- ❌ `tiny GEMM2 split-K + atomic accumulate`：小 T 明显退化，已经回退
+- ❌ `tiny GEMM1-only dispatch` 到 `_t1_generic_gemm1_swiglu_kernel`：19/19 通过，但 full19 **42.55x mean / 38.39x gmean**
+- ❌ `tiny exact-grid` / `direct GEMM2+reduce`：subset 明显退化，已放弃
+- ⚠️ **`T<=16 -> medium GEMM2` 这个 Direction 4 小改动在 2026-03-22 的 pre-sync 分支上曾经看起来有效，但在最新主线 A/B 中已经确认回退并正式撤销**
+
+最新主线（`git pull` 后的 `HEAD`）与这条旧 tweak 的同日 Modal B200 A/B 结果：
+
+- **最新 `HEAD` 基线：mean 48.73x / gmean 43.18x / peak 77.31x**
+- **重新套用 `T<=16 -> medium GEMM2`：mean 43.36x / gmean 39.30x / peak 61.22x**
+
+因此，**当前结论已经更新**：
+
+- Direction 4 里那些 heavy fusion / split-K 尝试仍然不划算
+- 但旧的 **“只改 tiny GEMM2 dispatch”** 也不再是当前主线；它对最新 `HEAD` 已经是负收益，故已从 `kernel.py` 正式回退
+- **当前应继续投入的方向** 仍然是：medium-T 的 **GEMM1 结构优化**，以及 large-T 的 **sort / reduce 结构性优化**
+
+#### [2026-03-22 晚 / 2026-03-23] 续跑补充：False Positive 清理 + 新 Profiling 结论
+
+- ⚠️ 下面这组 `44.61x / 40.01x / 65.53x` 结论只适用于 **2026-03-22 的 pre-sync 树**；在 2026-03-23 对最新 `HEAD` 做 A/B 之后，这条 tiny GEMM2 dispatch 已经确认回退并被撤销
+- ❌ `52<=T<=62 -> medium GEMM2`：subset 从 `44.92x / 44.88x` 抬到 `45.54x / 45.50x`，但 official full19 反而退到 **`42.47x / 38.35x`**，属于典型 false positive
+- ❌ `52<=T<=62 -> BLOCK_M=32`、`52<=T<=62 -> medium GEMM1 only`：分别退到 **`36.04x / 35.94x`** 与 **`45.33x / 45.28x`**
+- ❌ tiny 延伸 variants（`T=1` autotune 扩容、dedicated tiny GEMM2、tiny binary-search lookup、`T=14/16` 精确 dispatch、extra medium autotune configs）都没有超过当前 tiny baseline；其中 `tiny_medium_gemm2_autotune_plus` 虽然 subset 有 `57.51x`，但 official full19 仍退到 **`43.74x / 39.35x`**
+- ❌ 其余 probe 也全部回退：`T=32 -> medium GEMM2`、`T=80 -> small GEMM2`、`T=901 -> BLOCK_M=128`、`small_medium GEMM2 GROUP_M+`、`T>=2048 reduce BLOCK_N=512`
+- ✅ 对当前 best state 重新做 Modal profiling（见 `worker_logs/ncu_profile_beststate_20260322.txt` 与 `ncu_profile_output.txt`）后，发现：
+  - `T=64`：**GEMM1 ≈ 54.5%**，GEMM2 ≈ 30.6%，CPU overhead ≈ 35.2%
+  - `T=4096`：**GEMM2 ≈ 31.7%**，reduce ≈ 18.2%，sort ≈ 12.4%，route ≈ 11.6%
+- 📒 本轮所有成功 / 失败 / 仅 subset 有信号 / 以及一次 infra 级失败（缺脚本导致未出性能数据）的实验记录，现已统一补齐到 `profiling_notes.md` 与 `log.md`；README 这里仅保留主线结论
+- **更新判断：** medium-T 下一步应从 **GEMM2 dispatch 微调** 转向 **GEMM1 结构优化**；large-T 若继续抬分，更可能来自 **sort / reduce 的结构性改写**，而不是简单加宽 tile
 
 ---
 
@@ -321,6 +394,17 @@ python scripts/pack_solution_simple.py --cuda && python check_modal.py
 | GEMM2 FP8 Per-128-Block-Scale Quantize (Round 7) | 0/19, abs_err ~10K+ | 即使使用 per-128-element block scaling 适应局部动态范围，fp8 (3bit mantissa) 量化噪声仍然过大。三种变体均失败：(1) per-tensor fp8 cast → 全 NaN（SwiGLU 值 >448）; (2) PyTorch block-scale quant→dequant→fp32 GEMM2 → abs=10K+; (3) Triton block-scale quant + fp8×fp8 GEMM2 → abs=10K+。**结论：GEMM2 A-side 必须保持 fp32，无法使用 fp8×fp8 tensor cores** |
 | CUDA Graph for GEMM kernels (Round 7) | 19/19 但无提升 (~9.9x avg) | CUDA Graph 捕获 GEMM1+GEMM2+zero+copy 后 replay，pre-allocated persistent buffers。**但 GEMM 只有 2 次 Triton launch（~20-50us launch overhead），占 CPU overhead 的 <8%**。瓶颈是 routing 的 ~30 次 PyTorch kernel launch（~300us）。Graph 节省的 launch overhead 被 extra `.copy_()` 开销抵消 |
 | 自定义 C++ 扩展消除 CPU 调度开销 (`route_sort.cu`) | 在 Modal 评测环境失败 | 编写了纯 C++ 的 Routing 和 Sorting CUDA kernels，本地测试正确无误。但在 Modal B200 测评环境上执行失败：因为该官方评测沙盒专门去除了 `CUDA_HOME` 和 `nvcc` 工具链，强迫参赛者使用纯 Python/Triton。**结论：只能在 Triton Runtime 内手工用指令实现全部业务逻辑。** |
+| GEMM2 Packed FP8 + Dense Fallback (Round 13 深度研究) | 19/19 但只有 ~5.3x (mainline ~8.3x) | 打通了完整 PTX pack/unpack 链路（`cvt.rn.satfinite.e4m3x2.f32`），验证了 per-32 block-scale + residual correction + dense fallback + two-path split + grouped BLOCK_M=128 等所有变体。最优配置需要 81-85% 的 rows 走 dense fallback 才能确保 `matched_ratio ≥ 0.95`，但辅助开销远超 FP8 计算节省。**结论：FP8 e4m3 的 3-bit 尾数精度是硬件物理极限，无软件手段可弥补。** |
+| MXFP8 `tl.dot_scaled` (Blackwell 原生 Microscaling) | 编译成功，matched_ratio 0.17-0.32 | `tl.dot_scaled` 在 Triton 3.6.0 + B200 sm100 上**零 ICE**，性能极快（0.041ms / 256x2048x256）。但 MXFP8 的 e8m0 共享指数（只能是 2 的幂）比 FP32 任意 scale 更粗糙，导致精度反而**更差**。即使 per-32 粒度也只有 0.17-0.32 matched_ratio。**结论：FP8 在评测框架的严格容差下彻底封棺。** |
+| Token Reduce 融合进 GEMM2 (Round 16) | TIMEOUT | GEMM2 epilogue 需要按行 scatter 到不同 token，但 Triton 2D tile 不支持 `acc[m,:]` 行级索引。one-hot workaround `tl.sum(out*mask[:,None],0)` 是 O(BLOCK_M²×BLOCK_N)，大 T 直接超时。**结论：Triton 2D tile 无法高效拆解为逐行 scatter** |
+| Persistent GEMM2 Kernel (Round 16) | 19/19 PASSED，性能大幅下降 (52x → 15.6x) | 为减少 expert_id lookup 次数并将 A-side 数据留在 L2 被重用，将 GEMM2 的 grid 从 `M×N` 减小到只有 `M` 个 program。结果导致严重失去张量级并行度（Thread-Level Parallelism），单个程序挂起在 cache miss 无法切换，内存延迟完全暴露。**结论：用并行度换缓存局部性得不偿失。** |
+| TMA Tensor Memory Accelerator (Round 16) | 19/19 PASSED，性能微量下降 (~1-2%) | 在 GEMM2 引入 `tl.make_block_ptr` 触发 native B200 TMA 异步读写。虽然 offload 了地址计算，但在 HBM 物理带宽已被常规 LDG 指令榨干的情况下，TMA 无法凭空增加带宽，反而因 setup 开销和预取策略差异导致微弱退化。**结论：访存密集型算子的极限是硬件物理 HBM 带宽。** |
+| 1D Flatten + Atomic Scatter 融合 (Algorithmic Fusion) | 19/19 PASSED，性能大幅下降 (8.3x → 5.37x) | 为彻底干掉 940MB 的 `expert_out` 缓冲区，将 2D 指针用 `tl.reshape` 压平为 1D，使用 `tl.atomic_add` 直接将 GEMM2 输出累加给 Token。结果导致 Triton 无法利用 N=7168 的连续性生成向量化指令，只能发射海量（8192个/tile）的标量硬件原子操作（Scalar Atomics 风暴），直接打瘫了 B200 内存控制器阵列。**结论：Triton 无法高效编译跨行散列与块级合并读写，当前的三段式设计就是内存效率上的全局最优解。** |
+| Tiny GEMM2 Split-K + Atomic Accumulate (Direction 4) | 19/19 PASSED，但 tiny workloads 严重退化 | 为 `T<=16` 追加 `SPLIT_K=4` + `atomic_add`，希望强行增加 SM 并行度。结果 fixed cost、`expert_out.zero_()` 和原子合并开销远大于收益，`b8f4f012/a7c2bcfd/8cba5890` 全部明显变慢。**结论：microbatch 下 Split-K 不是免费午餐。** |
+| Tiny GEMM1-only Dispatch (Direction 4) | 19/19 PASSED，但 full19 回退到 42.55x mean | 将 `T<=16` 的 GEMM1 改走更窄 autotune 空间的 `_t1_generic_gemm1_swiglu_kernel`。虽然想法是降低 fixed cost，但真实效果是算力利用率下降，反而拖慢了短序列整体表现。**结论：tiny path 不能只看 launch 数量，还要看 tensor core 吃满程度。** |
+| Tiny Direct GEMM2+Reduce (Direction 4) | subset 19/19 PASSED，但仅 46-51x | 尝试对 `T<=16` 直接把 GEMM2 和 token reduce 合并，避免 `expert_out` 写回。但 token-centric 逐 slot 重跑 K-loop 破坏了 GEMM2 的 tile reuse，哪怕把 expert lookup 缓存化也仍明显慢于 baseline。**结论：decode 场景下 direct-reduce 的额外指令成本超过访存节省。** |
+| Post-Round17 Bucket / Autotune Follow-up Sweeps (2026-03-22) | subset / full19 全部回退 | 连续验证了 `52..62`、`T=32`、`T=80`、`T=901`、`T=1`、`T>=2048` 上的多组 dispatch / `BLOCK_M` / autotune / reduce 变体；没有任何一条超过 `tiny GEMM2 dispatch` 主线。**结论：单纯 bucket 微调已经接近边际极限。** |
+| Best-State Modal Profiling (2026-03-22) | 成功定位瓶颈 | 当前 best state 上 `T=64` 主要由 **GEMM1** 主导（≈54.5%），`T=4096` 则由 **GEMM2 + reduce + sort** 共同占主导。**结论：后续 medium-T 优先打 GEMM1 结构优化。** |
 
 ---
 
