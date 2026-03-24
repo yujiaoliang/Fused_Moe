@@ -43,6 +43,8 @@ UPPER_MEDIUM_T_MIN = 65
 UPPER_MEDIUM_T_MAX = 128
 # Large traces benefit from exact pid_m dispatch; smaller traces lose to the extra host sync.
 EXACT_WORKLOAD_DISPATCH_T_MIN = 4096
+# A second guard keeps boundary workloads on the base path unless the overlaunch upper bound is large enough.
+EXACT_WORKLOAD_DISPATCH_MIN_PID_M = 640
 BLOCK_K = 128  # K-block (must equal QBLOCK for scale alignment)
 GROUP_SIZE_M = 8  # L2 cache reuse grouping
 SORT_BLOCK_ITEMS = 256
@@ -1646,8 +1648,8 @@ def _use_upper_medium_gemm_bucket(t: int) -> bool:
     return UPPER_MEDIUM_T_MIN <= t <= UPPER_MEDIUM_T_MAX
 
 
-def _use_exact_workload_dispatch(t: int) -> bool:
-    return t >= EXACT_WORKLOAD_DISPATCH_T_MIN
+def _use_exact_workload_dispatch(t: int, max_pid_m: int) -> bool:
+    return t >= EXACT_WORKLOAD_DISPATCH_T_MIN and max_pid_m >= EXACT_WORKLOAD_DISPATCH_MIN_PID_M
 
 
 def _select_gemm_buckets_from_workload(t: int, block_m: int, total_blocks: int) -> tuple[bool, bool]:
@@ -1881,7 +1883,7 @@ def kernel(
     # Only switch to exact workload dispatch for very large traces where the reduced overlaunch
     # amortizes the single total_blocks host read.
     exact_pid_m = MAX_PID_M
-    use_exact_dispatch = _use_exact_workload_dispatch(T)
+    use_exact_dispatch = _use_exact_workload_dispatch(T, MAX_PID_M)
     if use_exact_dispatch:
         exact_pid_m = int(total_blocks.item())
         if exact_pid_m <= 0:
