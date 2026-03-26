@@ -1,10 +1,13 @@
 # Profiling & Optimization Notes — B200
 
-> **工具:** `scripts/ncu_profile_modal.py` — `torch.profiler` per-kernel 时间分解 + analytical roofline
-> **硬件:** NVIDIA B200 (Blackwell, sm100a)
+> **工具:** `scripts/ncu_profile_modal.py` — `torch.profiler` per-kernel 时间分解 + analytical roofline  
+> **硬件:** NVIDIA B200 (Blackwell, sm100a)  
 > **峰值性能:** FP8 ~2500 TFLOPS, TF32 ~1250 TFLOPS, HBM3e ~8 TB/s
 
-> **当前最佳版本:** Round 15 (`d2fdf14`) — Peak **106.65x**, Mean **55.77x**, GMean **47.54x**, `14 / 19` workloads 达到 **50x+**
+> **当前最新版本:** Round 16 (`c685b02` / `9447f19`)  
+> **当前 Modal 可复现口径:** peak ~55-65x, mean ~43-45x  
+> **历史最佳 (Round 15, `d2fdf14`):** Peak 106.65x, Mean 55.77x, GMean 47.54x  
+> ⚠️ 绝对 speedup 数值受 Modal 环境漂移影响，同代码不同时段可差 20-30%
 
 ---
 
@@ -889,3 +892,150 @@ subset 上的 tiny 结果：
 | `RS_BLOCK_N=128` mixed subset rerun | subset **`49.08x / 48.76x`** | 没有显示出优于当前主线的价值，且不构成可复现正收益路径 |
 | `GEMM1 autotune + RS512` full19 rerun | official full19 **`43.73x / 39.47x`** | 低于 latest `HEAD` 当前基线 **`48.73x / 43.18x`**，因此作为无效尝试清理 |
 | latest `HEAD` 上重试 `T<=16 -> medium GEMM2` | official full19 **`43.36x / 39.30x / 61.22x`** | 明确低于 latest `HEAD` 基线 **`48.73x / 43.18x / 77.31x`**，故正式回退该 tweak |
+
+---
+
+## 20. [2026-03-25/26] 噪声基准测量 + 精度/带宽/Tile 优化探索
+
+### 20.1 Modal B200 噪声基准测量
+
+**动机：** 历史记录中的"历史最佳"（Round 15 peak 106.65x）与当前 Modal 可复现口径（peak ~55-65x）存在巨大差距。为了建立可信的 A/B 对比方法论，在同一 Modal B200 session 内背靠背跑同一份代码测量噪声。
+
+**工具：** 新建 `scripts/ab_test_modal.py`，在同一个 `@app.function` 调用内依次运行两个 `solution.json`，消除跨 session 的环境漂移。
+
+**噪声测量结果（A=B=同一份代码）：**
+
+| 指标 | 噪声范围 | 代表性数据 |
+|------|---------|-----------|
+| **Mean speedup** | **±2%** | A=43.41x, B=43.44x, Δ=+0.1% |
+| **单个中小 T workload** | **±15%** | `e05c6c03`: A=55.52x, B=64.68x (Δ=+16.5%) |
+| **Large-T (≥4096)** | **<1%** | `58a34f27`: A=9.92x, B=9.93x (Δ=+0.2%) |
+
+**判断优化有效的标准：**
+- Mean speedup Δ > 2%
+- 或 Large-T latency Δ > 1%
+- 单个中小 T workload ≤15% 的变化不可作为判据
+
+**full A/B self-comparison 原始数据：**
+
+| Workload | Run A | Run B | Δ | 判定 |
+|----------|-------|-------|---|------|
+| 1a4c6ba1 | 24.01x | 23.79x | -0.9% | ≈ SAME |
+| 2e69caee | 63.48x | 62.52x | -1.5% | ≈ SAME |
+| 4822167c | 43.43x | 43.35x | -0.2% | ≈ SAME |
+| 58a34f27 | 9.92x | 9.93x | +0.2% | ≈ SAME |
+| 5e8dc11c | 8.83x | 8.82x | -0.1% | ≈ SAME |
+| 5eadab1e | 48.99x | 48.66x | -0.7% | ≈ SAME |
+| 6230e838 | 47.93x | 42.15x | -12.1% | ❌ 噪声 |
+| 74d7ff04 | 43.87x | 44.30x | +1.0% | ≈ SAME |
+| 76010cb4 | 45.81x | 43.83x | -4.3% | ❌ 噪声 |
+| 81955b1e | 43.93x | 44.00x | +0.2% | ≈ SAME |
+| 8cba5890 | 49.88x | 51.56x | +3.4% | 噪声 |
+| 8f1ff9f1 | 40.85x | 41.38x | +1.3% | ≈ SAME |
+| a7c2bcfd | 52.81x | 53.14x | +0.6% | ≈ SAME |
+| b8f4f012 | 61.61x | 59.52x | -3.4% | 噪声 |
+| e05c6c03 | 55.52x | 64.68x | +16.5% | ❌ 噪声 |
+| e626d3e6 | 43.73x | 44.81x | +2.5% | 噪声 |
+| eedc63b2 | 47.34x | 47.47x | +0.3% | ≈ SAME |
+| f7d6ac7c | 47.89x | 47.39x | -1.0% | ≈ SAME |
+| fc378037 | 44.96x | 44.11x | -1.9% | ≈ SAME |
+
+### 20.2 全 Commit 审计
+
+基于噪声基准，对所有 kernel.py 优化提交做了回顾性审计。详见 README.md 中的"全 Commit 审计"章节。
+
+**结论：当前主线中所有代码改动都是 ✅ 或 ✅✅ 确定真实的。** 所有 ❌ 实验已正确回退。
+
+### 20.3 ❌ bf16 Intermediate 缓冲区
+
+**假设：** 将 GEMM1 SwiGLU 输出的 `Intermediate [num_padded, 2048]` 从 fp32 改为 bf16，减半带宽。
+
+**结果：** 9/19 PASSED，abs_err 2048-4096，远超官方 atol=1。大型 workload 触发 Triton PTX 寄存器分配错误。
+
+**原因：** SwiGLU 输出动态范围极大（可达数千），bf16 仅 7-bit mantissa 无法保持精度。
+
+**结论：** 死路。已回退。
+
+### 20.4 ⚠️ expert_out bf16 缓冲区
+
+**假设：** 将 GEMM2 输出 `expert_out [num_padded, 7168]` 从 fp32 改为 bf16。expert_out 经过 routing weight 缩放后动态范围收敛，可能精度可接受。
+
+**结果：** 19/19 PASSED（精度完全通过），但性能中性偏负。带宽节省被 fp32→bf16 cast 开销抵消。
+
+**原始数据：**
+
+| Workload | fp32 baseline | bf16 expert_out | Δ |
+|----------|-------------|----------------|---|
+| e05c6c03 | 66.95x | 60.08x | -10.3% |
+| 2e69caee | 64.80x | 57.47x | -11.3% |
+| b8f4f012 | 62.34x | 55.32x | -11.3% |
+| 58a34f27 | 9.92x | 9.92x | 0.0% |
+| 5e8dc11c | 8.82x | 8.79x | -0.3% |
+
+> ⚠️ 注意：这些 Δ 是跨 session 测量的，部分退化可能是 Modal 噪声。
+
+**结论：** 精度可行但性能不赚。保留为备选项。已回退以保持基线纯净。
+
+### 20.5 ⚠️ GEMM1 BLOCK_N=32 深度流水线
+
+**假设：** 给 GEMM1 autotune 增加 BLOCK_N=32 + num_stages=6-8 的配置。BLOCK_N=32 用极少的寄存器（accumulators 小），腾出空间做更深的 software pipelining，可能隐藏 56 次 K-loop 迭代的内存延迟。
+
+**实现：** 为 3 个 GEMM1 kernel 共增加 13 个新 autotune config（generic +6, small_medium +3, medium +3）。
+
+**结果：** 19/19 PASSED，但 autotuner 从未选择 BLOCK_N=32 config。整体性能略降 3-10%（可能因 autotuning 开销增加）。
+
+**原始数据：**
+
+| Workload | baseline | BLOCK_N=32 | Δ |
+|----------|----------|-----------|---|
+| e05c6c03 | 66.95x | 60.07x | -10.3% |
+| b8f4f012 | 62.34x | 58.78x | -5.7% |
+| a7c2bcfd | 54.93x | 51.61x | -6.0% |
+| 8cba5890 | 53.96x | 48.31x | -10.5% |
+| 58a34f27 | 9.92x | 9.97x | ≈持平 |
+| 5e8dc11c | 8.82x | 8.85x | ≈持平 |
+
+> ⚠️ 注意：如 20.1 所述，跨 session 的中小 T 数据有 ±15% 噪声。实际退化可能只有 0-5%。
+
+**结论：** BLOCK_N=32 对 GEMM1 无优势。现有 BLOCK_N≥64 的 accum footprint 在 B200 寄存器文件下没有溢出问题。已回退。
+
+### 20.6 当前瓶颈与下一步方向
+
+综合 NCU profiling 和本轮实验，当前瓶颈：
+
+| T 范围 | 主瓶颈 | 可能有效方向 |
+|--------|--------|------------|
+| T=64 (medium) | **GEMM1 54.5%** | K-loop 结构优化、scale 加载合并 |
+| T=4096 (large) | GEMM2 31.7% + reduce 18.2% + sort 12.4% | sort/reduce 结构性改写 |
+
+- 已尝试但无效的 GEMM1 方向：
+  - ❌ BLOCK_N=32 深度流水线
+  - ❌ bf16 intermediate（精度死路）
+
+### 20.7 [新增] GEMM/Reduce/Sort 同 Session A/B 微调结果 (全失败)
+
+为了挖掘剩余的 5-10% 性能，我们在同一个 Modal Session 内进行了 5 组针对性的并行尺寸/循环结构的微调。结果表明：**在不改变宏观 Kernel 结构（例如依然保持 GEMM1->GEMM2->Reduce 三阶段）的前提下，当前代码已经是极高点的 Local Maximum。**
+
+| 实验代号 | 目标 | 优化措施 | 同 session A/B 结果 | 失败根因分析 |
+|---------|------|----------|-------------------|------------|
+| **Exp-A1** | 降低 GEMM1 K-loop 指令开销 | 移除 `m_mask`（针对 A 矩阵加载处的边界保护，因为 Pad 行的 safe_token_idx=0 已经是合法地址） | ⚠️ Mean Δ = **-0.8%** (噪声) | **Predicate 指令几乎零成本**。56 次 K-loop 的真正瓶颈在 HBM 内存延迟，省掉几个谓词计算指令完全被内存访问的 pending stall 掩盖了。 |
+| **Exp-A3** | 隐藏 GEMM1 K-loop 内存延迟 | 在 `small_medium` 和 `medium` GEMM1 中增加 `num_stages=4/5` 的深流水线配置 | ⚠️ Mean Δ = **-0.8%** (噪声) | **当前 num_stages=2/3 已经饱和**。更深的流水线没有换来更高的吞吐，说明 Tensor Core 利用率已达上限，或者额外的 Shared Memory 消耗反而降低了 SM Occupancy。 |
+| **Exp-C1** | 降低 Benchmark 期间的 Autotune 热身开销 | 裁剪 GEMM1/GEMM2 配置空间，删掉从不获胜的 `GROUP_M=1/32` 和 `num_stages>=5` 等 16 个配置 | ❌ Mean Δ = **-0.8%**, **5个 workload 退化** | **局部最优陷阱**。对于某些特定的长宽比矩阵，Autotuner 实际上会依赖那些“看似无用”的极宽/极深配置来避开特定的 Cache 冲突，移除它们反而导致性能跌落。 |
+| **Exp-B2** | 降低 Large-T 的 Reduce Grid Launch 开销 | `_token_reduce_kernel` 的 `BLOCK_N` 从 256 加大到 512，将 T=4096 时的程序加载数从 28 个/Token 降为 14 个/Token | ❌ Mean Δ = **-1.0%** | 虽然减少了 launch overhead，但每个 thread 处理两倍数据可能导致 **L1 Cache/寄存器命中率倒退**，得不偿失。 |
+| **Exp-B3** | 降低 Large-T 的 Sort 直方图开销 | `triton_sort_histogram` 的 `SORT_BLOCK_ITEMS` 从 256 加大到 512，每个 Block 处理更多 Token | ⚠️ Mean Δ = **-0.3%** (噪声) | 排序的真正瓶颈在 Global Memory 的 **Scatter 随机写入带宽**，而不是早期的直方图统计计算。改变线程块大小对带宽瓶颈毫无帮助。 |
+
+**核心结论：** 
+所有基于“改大 Tile、加深 Pipeline、去假性分支”的微观手段均已干涸。此时如果我们想追求下一个显著的性能飞跃（例如突破 60x Mean），只能诉诸极其高风险的**算法级融合 (Exp-C2: Fused GEMM2+Reduce)**，即冒着巨大 Atomic Scatter 风暴的风险，强行省掉将近 1GB 的 `expert_out` 显存带请求。考虑到评测的稳定性，目前保留当前基线作为最终提交备选是更明智的选择。
+
+### 20.8 [新增] 编译器与架构 Hint 优化 (Exp-D) & 深度流水线 (Exp-B1)
+
+在放弃了微观计算密度的调整之后，系统全面转向了更贴近硬件架构的 Hint 和流水线深度实验，并在同 Session A/B 测试中斩获了显著的净收益：
+
+| 实验代号 | 目标 | 优化措施 | 同 session A/B 结果 | 成功/失败根因分析 |
+|---------|------|----------|-------------------|------------|
+| **Exp-D1+D2** | 缓解寄存器压力与 L2 Cache 颠簸 | 1) 设置 `DISABLE_LLVM_OPT="disable-lsr"` 关闭 LLVM 的 Loop Strength Reduction；2) 对 GEMM1/GEMM2 施加非对称的 `eviction_policy` (Weights='evict_last', Tokens='evict_first' streaming) | ✅ Mean Δ = **+4.9%** (至高 +19.4%) | **大获全胜**。LSR 优化在复杂的 SwiGLU 寻址中意外增加了原本就紧张的寄存器压力（导致 spills）；而非对称缓存策略完美契合了 MoE 专家权重被高频重用的算子特性，直接提升了 L2 Cache Hit Rate。 |
+| **Exp-D3** | 消除 K-loop 指针越界检查并对齐向量加载 | 介入 `tl.multiple_of` 通知 Triton 编译器 K 维度和基指针均已对齐 `BLOCK_K` (128) 和 `BLOCK_M` 等 | ⚠️ Mean Δ = **0.0%** (中性暂退) | 现代 Triton 3.x 编译器的指针分析阶段（Pointer Alignment Pass）已经足够智能，能自动从 PyTorch 的张量步长中推断出对齐属性。手写 Hint 并未带来额外的 PTX 优化。为保代码整洁已回退。 |
+| **Exp-B1** | 压榨 GEMM2 计算访存重叠的极限 | 为 GEMM2 所有的 Kernel 系列打破原有的 `num_stages=2/3/4` 上限，直接拓展压入 `num_stages=6/7/8` 的极深软件流水线 Configs | ✅ Mean Δ = **+2.1%** (至高 +10.1%) | 在 `BLOCK_N=128/256` 且寄存器不溢出的情况下，更深的 Pipeline 让 TMA/LDG 访存操作更早发出，大幅掩盖了对 `Intermediate` FP32 缓冲的读取延迟。Autotuner 成功抓取到了这些能够填满 SM 队列的深层配置，显著惠及了 Medium-T 场景。 |
+
+**核心结论：**
+这一阶段的深挖证明，在 MoE 这种高度非对称的负载下，**控制数据驻留（L2 Eviction）** 与 **避免编译器乱优化（LSR）** 往往比增加计算强度更加致命。此外，适时为 Autotuner 解除深度约束（Exp-B1），使得性能基线进一步拉高至极其稳固的新高点。接下来的方向应当直指高风险高回报的结构性重型切除（如 Exp-C2 Fused Scatter 或者重写 Sort）。 

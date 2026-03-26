@@ -13,6 +13,8 @@ Architecture:
   6. Weighted reduce (PyTorch): scatter-add expert outputs
 """
 
+import os
+os.environ["DISABLE_LLVM_OPT"] = "disable-lsr"
 import torch
 import triton
 import triton.language as tl
@@ -725,22 +727,22 @@ def _fused_moe_gemm1_swiglu_kernel(
         rk = k + tl.arange(0, BLOCK_K)
 
         # Load A: fp8
-        a = tl.load(a_base + rk[None, :] * stride_ah, mask=m_mask[:, None], other=0.0)
+        a = tl.load(a_base + rk[None, :] * stride_ah, mask=m_mask[:, None], other=0.0, eviction_policy='evict_first')
 
         # Load A scale: fp32 [BLOCK_M]
-        a_scale = tl.load(a_scale_base + (k // 128) * stride_as0, mask=m_mask, other=0.0)
+        a_scale = tl.load(a_scale_base + (k // 128) * stride_as0, mask=m_mask, other=0.0, eviction_policy='evict_first')
 
         # Load B for W1: fp8
-        b_1 = tl.load(b_base_1 + rk[:, None] * stride_bh)
+        b_1 = tl.load(b_base_1 + rk[:, None] * stride_bh, eviction_policy='evict_last')
 
         # Load B scale for W1: fp32 [1, BLOCK_N]
-        b_scale_1 = tl.load(b_scale_base_1 + (k // 128) * stride_bsh)
+        b_scale_1 = tl.load(b_scale_base_1 + (k // 128) * stride_bsh, eviction_policy='evict_last')
 
         # Load B for W3: fp8
-        b_3 = tl.load(b_base_3 + rk[:, None] * stride_bh)
+        b_3 = tl.load(b_base_3 + rk[:, None] * stride_bh, eviction_policy='evict_last')
 
         # Load B scale for W3: fp32 [1, BLOCK_N]
-        b_scale_3 = tl.load(b_scale_base_3 + (k // 128) * stride_bsh)
+        b_scale_3 = tl.load(b_scale_base_3 + (k // 128) * stride_bsh, eviction_policy='evict_last')
 
         # Native FP8 tensor cores — 2x throughput vs TF32 on Blackwell
         partial_1 = tl.dot(a, b_1, out_dtype=tl.float32)
@@ -759,7 +761,7 @@ def _fused_moe_gemm1_swiglu_kernel(
     
     # Store to C as fp32 (bf16 causes too much precision loss — 6/19 PASSED)
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, swiglu_out)
+    tl.store(c_ptrs, swiglu_out, eviction_policy='evict_first')
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -789,6 +791,10 @@ def _fused_moe_gemm1_swiglu_kernel(
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=5),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=5),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=6),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=7),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=8),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=7),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=8),
         # Varied Group Sizes
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=8, num_stages=4),
@@ -867,20 +873,20 @@ def _fused_moe_gemm2_kernel(
         rk = k + tl.arange(0, BLOCK_K)
 
         # Load A: fp32 from Intermediate buffer
-        a = tl.load(a_base + rk[None, :] * stride_ak)
+        a = tl.load(a_base + rk[None, :] * stride_ak, eviction_policy='evict_first')
 
         # Load B: fp8
-        b = tl.load(b_base + rk[:, None] * stride_bk)
+        b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
 
         # Post-dot B-scale
-        b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk)
+        b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
         partial = tl.dot(a, b.to(tl.float32), out_dtype=tl.float32)
         acc += partial * b_scale
         
     # Scale by routing weights and store (NO atomic!)
     out = acc * token_weights[:, None]
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, out)
+    tl.store(c_ptrs, out, eviction_policy='evict_first')
 
 
 @triton.autotune(
@@ -964,12 +970,12 @@ def _small_medium_fused_moe_gemm1_swiglu_kernel(
 
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
-        a = tl.load(a_base + rk[None, :] * stride_ah, mask=m_mask[:, None], other=0.0)
-        a_scale = tl.load(a_scale_base + (k // 128) * stride_as0, mask=m_mask, other=0.0)
-        b_1 = tl.load(b_base_1 + rk[:, None] * stride_bh)
-        b_3 = tl.load(b_base_3 + rk[:, None] * stride_bh)
-        b_scale_1 = tl.load(b_scale_base_1 + (k // 128) * stride_bsh)
-        b_scale_3 = tl.load(b_scale_base_3 + (k // 128) * stride_bsh)
+        a = tl.load(a_base + rk[None, :] * stride_ah, mask=m_mask[:, None], other=0.0, eviction_policy='evict_first')
+        a_scale = tl.load(a_scale_base + (k // 128) * stride_as0, mask=m_mask, other=0.0, eviction_policy='evict_first')
+        b_1 = tl.load(b_base_1 + rk[:, None] * stride_bh, eviction_policy='evict_last')
+        b_3 = tl.load(b_base_3 + rk[:, None] * stride_bh, eviction_policy='evict_last')
+        b_scale_1 = tl.load(b_scale_base_1 + (k // 128) * stride_bsh, eviction_policy='evict_last')
+        b_scale_3 = tl.load(b_scale_base_3 + (k // 128) * stride_bsh, eviction_policy='evict_last')
         partial_1 = tl.dot(a, b_1, out_dtype=tl.float32)
         partial_3 = tl.dot(a, b_3, out_dtype=tl.float32)
         acc_1 += partial_1 * (a_scale[:, None] * b_scale_1)
@@ -977,7 +983,7 @@ def _small_medium_fused_moe_gemm1_swiglu_kernel(
 
     swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, swiglu_out)
+    tl.store(c_ptrs, swiglu_out, eviction_policy='evict_first')
 
 
 @triton.autotune(
@@ -989,6 +995,12 @@ def _small_medium_fused_moe_gemm1_swiglu_kernel(
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=5),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=6),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=5),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=6),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
     restore_value=['C_ptr'],
@@ -1044,14 +1056,14 @@ def _small_medium_fused_moe_gemm2_kernel(
 
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
-        a = tl.load(a_base + rk[None, :] * stride_ak)
-        b = tl.load(b_base + rk[:, None] * stride_bk)
-        b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk)
+        a = tl.load(a_base + rk[None, :] * stride_ak, eviction_policy='evict_first')
+        b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
+        b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
         acc += tl.dot(a, b.to(tl.float32), out_dtype=tl.float32) * b_scale
 
     out = acc * token_weights[:, None]
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, out)
+    tl.store(c_ptrs, out, eviction_policy='evict_first')
 
 
 @triton.autotune(
@@ -1155,6 +1167,12 @@ def _medium_fused_moe_gemm1_swiglu_kernel(
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=8, num_stages=2),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=8, num_stages=2),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=6),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=7),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=8),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=6),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=7),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=8),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
     restore_value=['C_ptr'],
@@ -1230,6 +1248,12 @@ def _medium_fused_moe_gemm2_kernel(
         triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=2),
         triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=6),
+        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=7),
+        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=8),
+        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=6),
+        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=7),
+        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=8),
     ],
     key=['N', 'K'],
 )
@@ -1270,16 +1294,16 @@ def _t1_fused_gemm2_reduce_kernel(
 
             for k in range(0, K, BLOCK_K):
                 rk = k + tl.arange(0, BLOCK_K)
-                a = tl.load(a_base + rk * stride_ak)
-                b = tl.load(b_base + rk[:, None] * stride_bk)
-                b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk)
+                a = tl.load(a_base + rk * stride_ak, eviction_policy='evict_first')
+                b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
+                b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
                 partial = tl.sum(a[:, None] * b.to(tl.float32), axis=0)
                 slot_acc += partial * b_scale
 
             acc_out += slot_acc * token_weight
 
     o_ptrs = output_ptr + rn * stride_on
-    tl.store(o_ptrs, acc_out.to(tl.bfloat16))
+    tl.store(o_ptrs, acc_out.to(tl.bfloat16), eviction_policy='evict_first')
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1324,12 +1348,12 @@ def _token_reduce_kernel(
         pos = tl.load(scatter_map_ptr + base_idx + k)
         if pos >= 0:
             e_ptrs = expert_out_ptr + pos * stride_em + rn * stride_en
-            vals = tl.load(e_ptrs, mask=n_mask, other=0.0)
+            vals = tl.load(e_ptrs, mask=n_mask, other=0.0, eviction_policy='evict_first')
             acc += vals
     
     # Store directly as bf16
     o_ptrs = output_ptr + pid_t * stride_ot + rn * stride_on
-    tl.store(o_ptrs, acc.to(tl.bfloat16), mask=n_mask)
+    tl.store(o_ptrs, acc.to(tl.bfloat16), mask=n_mask, eviction_policy='evict_first')
 
 
 @triton.autotune(
@@ -1423,12 +1447,12 @@ def _t1_fused_gemm1_swiglu_kernel(
 
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
-        a = tl.load(a_base + rk[None, :] * stride_ah, mask=m_mask[:, None], other=0.0)
-        a_scale = tl.load(a_scale_base + (k // 128) * stride_as0, mask=m_mask, other=0.0)
-        b_1 = tl.load(b_base_1 + rk[:, None] * stride_bh)
-        b_3 = tl.load(b_base_3 + rk[:, None] * stride_bh)
-        b_scale_1 = tl.load(b_scale_base_1 + (k // 128) * stride_bsh)
-        b_scale_3 = tl.load(b_scale_base_3 + (k // 128) * stride_bsh)
+        a = tl.load(a_base + rk[None, :] * stride_ah, mask=m_mask[:, None], other=0.0, eviction_policy='evict_first')
+        a_scale = tl.load(a_scale_base + (k // 128) * stride_as0, mask=m_mask, other=0.0, eviction_policy='evict_first')
+        b_1 = tl.load(b_base_1 + rk[:, None] * stride_bh, eviction_policy='evict_last')
+        b_3 = tl.load(b_base_3 + rk[:, None] * stride_bh, eviction_policy='evict_last')
+        b_scale_1 = tl.load(b_scale_base_1 + (k // 128) * stride_bsh, eviction_policy='evict_last')
+        b_scale_3 = tl.load(b_scale_base_3 + (k // 128) * stride_bsh, eviction_policy='evict_last')
         partial_1 = tl.dot(a, b_1, out_dtype=tl.float32)
         partial_3 = tl.dot(a, b_3, out_dtype=tl.float32)
         acc_1 += partial_1 * (a_scale[:, None] * b_scale_1)
@@ -1436,7 +1460,7 @@ def _t1_fused_gemm1_swiglu_kernel(
 
     swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, swiglu_out)
+    tl.store(c_ptrs, swiglu_out, eviction_policy='evict_first')
 
 
 @triton.autotune(
@@ -1537,6 +1561,12 @@ def _t1_generic_gemm1_swiglu_kernel(
         triton.Config({'BLOCK_N': 256, 'GROUP_M': 1}, num_warps=8, num_stages=2),
         triton.Config({'BLOCK_N': 256, 'GROUP_M': 2}, num_warps=8, num_stages=2),
         triton.Config({'BLOCK_N': 256, 'GROUP_M': 4}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'GROUP_M': 4}, num_warps=8, num_stages=6),
+        triton.Config({'BLOCK_N': 128, 'GROUP_M': 4}, num_warps=8, num_stages=7),
+        triton.Config({'BLOCK_N': 128, 'GROUP_M': 4}, num_warps=8, num_stages=8),
+        triton.Config({'BLOCK_N': 256, 'GROUP_M': 4}, num_warps=8, num_stages=6),
+        triton.Config({'BLOCK_N': 256, 'GROUP_M': 4}, num_warps=8, num_stages=7),
+        triton.Config({'BLOCK_N': 256, 'GROUP_M': 4}, num_warps=8, num_stages=8),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
 )
@@ -1591,14 +1621,14 @@ def _t1_generic_gemm2_kernel(
 
     for k in range(0, K, BLOCK_K):
         rk = k + tl.arange(0, BLOCK_K)
-        a = tl.load(a_base + rk[None, :] * stride_ak)
-        b = tl.load(b_base + rk[:, None] * stride_bk)
-        b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk)
+        a = tl.load(a_base + rk[None, :] * stride_ak, eviction_policy='evict_first')
+        b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
+        b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
         acc += tl.dot(a, b.to(tl.float32), out_dtype=tl.float32) * b_scale
 
     out = acc * token_weights[:, None]
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, out)
+    tl.store(c_ptrs, out, eviction_policy='evict_first')
 
 # ═══════════════════════════════════════════════════════════════
 # Pre-allocated buffer cache — reuse output_fp32/Intermediate
