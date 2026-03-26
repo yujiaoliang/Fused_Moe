@@ -246,6 +246,7 @@ mlsys_note/
 | 关闭 Triton LSR 优化 | ✅ Mean +4.9% | 缓解 SwiGLU 复杂寻址带来的寄存器溢出问题 |
 | 编译器 L2 非对称 eviction | ✅ 叠加在上面 | 契合 MoE 专家权重高频重用，显著提升 L2 Hit Rate |
 | 极深流水线 (num_stages=6-8) | ✅ Mean +2.1% | 掩盖 GEMM2 中 Intermediate 访存延迟，惠及 Medium-T |
+| 2D Tiled Token Reduce (BLOCK_T=16/32) | ✅ Large-T +2.9% | 削减 10x Grid Launch 开销，靠 ILP 打通 HBM Reduce 延迟墙 |
 
 ---
 
@@ -277,9 +278,10 @@ mlsys_note/
 | `9447f19` | Bugfix: exact-dispatch | ✅ | 正确性修复 |
 | `9b341bc` | Buffer cache | ⚠️ | torch.compile 部分回退 |
 | `0c6eeee` | FA4 GROUP_M=16 | ⚠️ | 仅加 config |
-| (今日) | 关闭 Triton LSR 优化 | ✅✅ | 峰值/均值显著提升 (+4.9%) |
-| (今日) | 非对称 eviction_policy | ✅✅ | 同上 |
-| (今日) | 极深流水线 GEMM2 | ✅ | 均值 +2.1%，有效隐藏访存延迟 |
+| `93e3a84` | 关闭 Triton LSR 优化 | ✅✅ | 峰值/均值显著提升 (+4.9%) |
+| `93e3a84` | 非对称 eviction_policy | ✅✅ | 同上 |
+| `93e3a84` | 极深流水线 GEMM2 | ✅ | 均值 +2.1%，有效隐藏访存延迟 |
+| `f49c5ab` | 2D Tiled Token Reduce | ✅ | 结构性优化，大型 Workload (T>8000) 净提速 +2.5%~2.9% |
 
 **结论：当前主线中所有生效改动都是 ✅ 或 ✅✅ 确定真实的。**
 
