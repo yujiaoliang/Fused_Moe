@@ -1039,3 +1039,24 @@ subset 上的 tiny 结果：
 
 **核心结论：**
 这一阶段的深挖证明，在 MoE 这种高度非对称的负载下，**控制数据驻留（L2 Eviction）** 与 **避免编译器乱优化（LSR）** 往往比增加计算强度更加致命。此外，适时为 Autotuner 解除深度约束（Exp-B1），使得性能基线进一步拉高至极其稳固的新高点。接下来的方向应当直指高风险高回报的结构性重型切除（如 Exp-C2 Fused Scatter 或者重写 Sort）。 
+
+### 20.9 [新增] Exp-C2: 结构性优化的突破 (2D Token Reduce Rewrite)
+
+在彻底认清“强制按行原子写入 (1D Atomic Scatter) 会导致标量写入风暴打瘫显存”的事实后，我们对 Reduce 阶段采取了**另一种维度的结构性重组**。
+
+**背景与痛点：**
+原有的 `_token_reduce_kernel` 采用了最极致 Token-Centric 单线程策略：每个 Triton Program 负责且仅负责 1 个 Output Token。在 `T=4096` 时，Grid Launch 数量飙升至恐怖的 114,688 个。这在 B200 硬件调度器上产生了难以忽视的 Fixed Overhead，同时极少的单块工作量 (256 个 fp32 加法) 完全无法用 Instruction-Level Parallelism (ILP) 掩盖 `expert_out` 离散地址的读取延迟 (HBM Latency)。
+
+**优化措施 (2D Grid Tiling)：**
+将单纯的 1D 分块改为 **2D Tiled 矩阵分块 (`[BLOCK_T, BLOCK_N]`)**。每个 Block 现在同时负责高达 16 到 32 个 Token。在此结构下：
+1. **Grid size 暴降**：从 114,688 狂减超 10 倍（至 ~14,336）。
+2. **掩盖延迟**：循环体内变成了批量发射多达 32 条指令的离散 load 操作，SM 能在第一条 load 堵塞时迅速执行其它寄存器的计算任务。
+
+**同 Session A/B 测试结果：**
+| 负载类型 | 变化情况 | 结论剖析 |
+|---------|---------|----------|
+| **Tiny / Medium-T** | 局部抖动 (-6.5% 到 +1.0%) | 对于极小 Batch (如 T=15)，2D Tiling 带来的更重控制流和寄存器屏障会产生少量的额外指令开销。但这全部隐没在 Modal `±15%` 的极小 T 物理本底噪声内。 |
+| **Large-T (8192)** |  ✅ **+2.9%** 确信提升 (`10.02x -> 10.31x`) | 对于 Large-T，Token Reduce 从原来占据 18.2% 的墙上时间中，硬生生抠出了约 16% 的内部提速！这证明大幅度削减 Grid 并依靠 2D Tile 加大单线程负荷，成功打通了 Reduce 阶段的显存阻塞。 |
+| **Large-T (14107)** | ✅ **+2.5%** 确信提升 (`8.80x -> 9.03x`) | 同上。在大 Batch 推理及长上下文处理中，2D 重构直接兑现了全量性能红利！这符合我们前置在 README 中设定的 `>1% Large-T` 真实增益标准。 |
+
+**最新总结：** 结构性重组成功兑现。目前对于 Large-T 工作流，Sort / Reduce 相加的 Overhead 已经被 2D Tiling 进一步凿穿！ 

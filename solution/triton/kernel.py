@@ -1307,10 +1307,20 @@ def _t1_fused_gemm2_reduce_kernel(
 
 
 # ═══════════════════════════════════════════════════════════════
-# Triton Kernel 3: Token-Centric Reduce (zero-free, atomic-free, bf16 fused)
-# For each output token, sums its TOP_K expert contributions and writes bf16.
+# Triton Kernel 3: Token-Centric Reduce (2D Tiled, zero-free, bf16 fused)
+# For each 2D tile (BLOCK_T x BLOCK_N), sums TOP_K expert contributions.
 # ═══════════════════════════════════════════════════════════════
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_T': 16, 'BLOCK_N': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_T': 16, 'BLOCK_N': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_T': 8, 'BLOCK_N': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_T': 32, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_T': 16, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
+    ],
+    key=['T_val', 'N'],
+)
 @triton.jit
 def _token_reduce_kernel(
     expert_out_ptr,   # [num_padded, N] fp32
@@ -1321,39 +1331,50 @@ def _token_reduce_kernel(
     TOP_K: tl.constexpr,
     stride_em, stride_en,
     stride_ot, stride_on,
+    BLOCK_T: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
     """
-    Grid: T_val * cdiv(N, BLOCK_N)
-    Each program handles one token's BLOCK_N columns.
+    Grid: cdiv(T_val, BLOCK_T) * cdiv(N, BLOCK_N)
+    Each program handles a ([BLOCK_T], [BLOCK_N]) block of the output.
     Iterates over TOP_K expert slots, sums contributions, stores bf16.
     """
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
     
-    pid_t = pid // num_pid_n
-    pid_n = pid % num_pid_n
+    pid_t = (pid // num_pid_n) * BLOCK_T
+    pid_n = (pid % num_pid_n) * BLOCK_N
     
-    if pid_t >= T_val:
-        return
+    rt = pid_t + tl.arange(0, BLOCK_T)
+    rn = pid_n + tl.arange(0, BLOCK_N)
     
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    t_mask = rt < T_val
     n_mask = rn < N
     
-    # Accumulate over TOP_K expert contributions
-    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    # Accumulate over TOP_K expert contributions: [BLOCK_T, BLOCK_N]
+    acc = tl.zeros((BLOCK_T, BLOCK_N), dtype=tl.float32)
     
-    base_idx = pid_t * TOP_K
     for k in tl.static_range(TOP_K):
-        pos = tl.load(scatter_map_ptr + base_idx + k)
-        if pos >= 0:
-            e_ptrs = expert_out_ptr + pos * stride_em + rn * stride_en
-            vals = tl.load(e_ptrs, mask=n_mask, other=0.0, eviction_policy='evict_first')
-            acc += vals
+        # Read scattering positions for all tokens in block: [BLOCK_T]
+        pos_idx = rt * TOP_K + k
+        pos = tl.load(scatter_map_ptr + pos_idx, mask=t_mask, other=-1)
+        
+        # Valid mask
+        valid_pos = (pos >= 0) & t_mask
+        
+        # 2D mask: [BLOCK_T, BLOCK_N]
+        load_mask = valid_pos[:, None] & n_mask[None, :]
+        
+        # 2D pointers
+        e_ptrs = expert_out_ptr + pos[:, None] * stride_em + rn[None, :] * stride_en
+        
+        # Load up to BLOCK_T rows of size BLOCK_N
+        vals = tl.load(e_ptrs, mask=load_mask, other=0.0, eviction_policy='evict_first')
+        acc += vals
     
     # Store directly as bf16
-    o_ptrs = output_ptr + pid_t * stride_ot + rn * stride_on
-    tl.store(o_ptrs, acc.to(tl.bfloat16), mask=n_mask, eviction_policy='evict_first')
+    o_ptrs = output_ptr + rt[:, None] * stride_ot + rn[None, :] * stride_on
+    tl.store(o_ptrs, acc.to(tl.bfloat16), mask=(t_mask[:, None] & n_mask[None, :]), eviction_policy='evict_first')
 
 
 @triton.autotune(
@@ -1985,9 +2006,7 @@ def kernel(
     )
 
     # -- 6. Token-Centric Reduce (zero-free, atomic-free, bf16 fused) --
-    RS_BLOCK_N = 256
-    num_n_blocks = triton.cdiv(7168, RS_BLOCK_N)
-    grid3 = (T * num_n_blocks,)
+    grid3 = lambda META: (triton.cdiv(T, META['BLOCK_T']) * triton.cdiv(7168, META['BLOCK_N']),)
 
     _token_reduce_kernel[grid3](
         expert_out_ptr=expert_out,
@@ -1998,8 +2017,6 @@ def kernel(
         TOP_K=TOP_K,
         stride_em=expert_out.stride(0), stride_en=expert_out.stride(1),
         stride_ot=output.stride(0), stride_on=output.stride(1),
-        BLOCK_N=RS_BLOCK_N,
-        num_warps=4,
     )
 
     return output
