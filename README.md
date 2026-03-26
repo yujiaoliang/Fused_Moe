@@ -241,12 +241,13 @@ mlsys_note/
 | 实验 | 结果 | 结论 |
 |------|------|------|
 | bf16 Intermediate | ❌ 9/19 精度失败 | SwiGLU 动态范围太大，abs_err 2048-4096 >> atol=1 |
-| expert_out bf16 | ⚠️ 19/19 通过，perf 中性 | cast 开销抵消带宽节省 |
+| expert_out bf16 (在优化后的GEMM2复测) | ❌ Mean -2.1% | 显式强转向 bf16 会阻塞 HBM Store 破坏流水线，带宽收益无法弥补 Cast 延迟 |
 | GEMM1 BLOCK_N=32 | ⚠️ 19/19 通过，autotuner 未选中 | 更小 tile 无优势 |
 | 关闭 Triton LSR 优化 | ✅ Mean +4.9% | 缓解 SwiGLU 复杂寻址带来的寄存器溢出问题 |
 | 编译器 L2 非对称 eviction | ✅ 叠加在上面 | 契合 MoE 专家权重高频重用，显著提升 L2 Hit Rate |
 | 极深流水线 (num_stages=6-8) | ✅ Mean +2.1% | 掩盖 GEMM2 中 Intermediate 访存延迟，惠及 Medium-T |
 | 2D Tiled Token Reduce (BLOCK_T=16/32) | ✅ Large-T +2.9% | 削减 10x Grid Launch 开销，靠 ILP 打通 HBM Reduce 延迟墙 |
+| Column-Major 调度与并行 Dispatch | ✅ Medium-T 最高 +8.9% | 消除 GEMM1 计算依赖并提高权重 Cache 命中，精准打击中等 T 的延迟瓶颈 |
 
 ---
 
@@ -282,6 +283,7 @@ mlsys_note/
 | `93e3a84` | 非对称 eviction_policy | ✅✅ | 同上 |
 | `93e3a84` | 极深流水线 GEMM2 | ✅ | 均值 +2.1%，有效隐藏访存延迟 |
 | `f49c5ab` | 2D Tiled Token Reduce | ✅ | 结构性优化，大型 Workload (T>8000) 净提速 +2.5%~2.9% |
+| (待提交) | Medium-T Column-Major | ✅ | `GROUP_M=32/64` 列排布与并行扫描，Medium-T 最高提速 +8.9% |
 
 **结论：当前主线中所有生效改动都是 ✅ 或 ✅✅ 确定真实的。**
 

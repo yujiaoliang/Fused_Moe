@@ -898,6 +898,10 @@ def _fused_moe_gemm2_kernel(
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=2, num_stages=3),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=4, num_stages=2),
+        # Exp-B2: Column-Major scheduling for small/medium batches (mimicking PyTorch Labs)
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=2, num_stages=2),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
     restore_value=['C_ptr'],
@@ -940,16 +944,12 @@ def _small_medium_fused_moe_gemm1_swiglu_kernel(
     pid_m = first_pid_m + (pid % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
 
-    # Small-medium batches are fixed-cost sensitive, so avoid a full 32-way scan here.
-    lo = pid_m - pid_m
-    hi = lo + E_LOCAL
-    for _ in tl.static_range(0, 6):
-        mid = (lo + hi) // 2
-        upper = tl.load(block_offsets_ptr + mid + 1)
-        go_left = pid_m < upper
-        hi = tl.where(go_left, mid, hi)
-        lo = tl.where(go_left, lo, mid + 1)
-    expert_id = lo
+    # Replace binary search with parallel 32-way vectorized load for better memory concurrency
+    e_idx = tl.arange(0, E_LOCAL)
+    b_start = tl.load(block_offsets_ptr + e_idx)
+    b_end = tl.load(block_offsets_ptr + e_idx + 1)
+    valid = (b_start <= pid_m) & (pid_m < b_end)
+    expert_id = tl.argmax(valid.to(tl.int32), axis=0)
 
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -1001,6 +1001,10 @@ def _small_medium_fused_moe_gemm1_swiglu_kernel(
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=4),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=5),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=6),
+        # Exp-B2: Column-Major scheduling
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=4, num_stages=4),
+        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=2, num_stages=3),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
     restore_value=['C_ptr'],
