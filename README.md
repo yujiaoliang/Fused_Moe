@@ -283,7 +283,7 @@ mlsys_note/
 | `93e3a84` | 非对称 eviction_policy | ✅✅ | 同上 |
 | `93e3a84` | 极深流水线 GEMM2 | ✅ | 均值 +2.1%，有效隐藏访存延迟 |
 | `f49c5ab` | 2D Tiled Token Reduce | ✅ | 结构性优化，大型 Workload (T>8000) 净提速 +2.5%~2.9% |
-| (待提交) | Medium-T Column-Major | ✅ | `GROUP_M=32/64` 列排布与并行扫描，Medium-T 最高提速 +8.9% |
+| `9d5a2f8` | Medium-T Column-Major | ✅ | `GROUP_M=32/64` 列排布与并行扫描，Medium-T 最高提速 +8.9% |
 
 **结论：当前主线中所有生效改动都是 ✅ 或 ✅✅ 确定真实的。**
 
