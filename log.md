@@ -117,7 +117,7 @@
 
 ### 0218_log
 * 构造了一个脚本但是没有print出trace信息。打印如下：
-  ```
+
   Loading solution...
 Loaded: my-team-solution-v1 (moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048)
 
@@ -130,7 +130,7 @@ Shutting down worker
 moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
 Stopping app - local entrypoint completed.
 ✓ App completed. View run at https://modal.com/apps/jiaoliangyu968/main/ap-18ebzVjg2AzpsDJekZi9oV
-```
+
 没有trace信息，定位中。。。
 
 
@@ -204,6 +204,7 @@ key=['num_padded', ...] 改为 key=['MAX_PID_M', ...]。—— 无明显优化
 
 
 ### 对T>4096进行3-phase优化，
+
 moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
   Workload b8f4f012...: PASSED | 0.172 ms | 68.13x speedup | abs_err=2.05e+03, rel_err=5.43e+00
   Workload e05c6c03...: PASSED | 0.128 ms | 86.69x speedup | abs_err=5.12e+02, rel_err=8.06e-03
@@ -292,6 +293,8 @@ moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
   Workload f7d6ac7c...: PASSED | 0.220 ms | 55.52x speedup | abs_err=2.05e+03, rel_err=4.73e+01
 
 
+
+
 ### 2026-03-23 保留优化：large-T exact dispatch
 
 #### 背景
@@ -372,3 +375,21 @@ moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
   Workload 76010cb4...: PASSED | 0.255 ms | 54.44x speedup | abs_err=4.10e+03, rel_err=8.51e+01
   Workload fc378037...: PASSED | 0.261 ms | 54.65x speedup | abs_err=4.10e+03, rel_err=4.72e+01
   Workload f7d6ac7c...: PASSED | 0.222 ms | 58.14x speedup | abs_err=2.05e+03, rel_err=1.17e+02
+
+
+### 0326 尝试对gemm1_swiglu的kernel做进一步的优化
+
+* 实验：把w1 和 w3 分别计算，避免双路acc的压力。
+* 结论: 拿掉w3后，耗时降低接近一半，说明并没有严重的register bound
+
+* 实验：把swiglu拿掉，看看swiglu是不是引入了太多开销
+* 结论：实际上也没有，看起来swiglu不是瓶颈
+
+* 实验：拆分full block和tail block
+* 结论：对于类似T=80这样的case，基本没有full block，所以会变成全是碎的tail block，所以不是个优化方案
+
+### 0328 继续对gemm相关的实验
+
+* 实验：把32路scan expert id的方式换成 预计算和look up
+* 结论：us级别的优化，几乎很像噪声
+

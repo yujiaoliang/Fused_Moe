@@ -34,11 +34,9 @@ BLOCK_M_TINY = 16   # for medium-T regimes where padding dominates GEMM efficien
 BLOCK_M_SMALL = 32  # for moderate batches
 BLOCK_M_LARGE = 64  # default tile for larger batches
 BLOCK_M_XLARGE = 128 # for very large batches (T>=2048, better K-loop reuse)
-BLOCK_M_CANDIDATES = (16, 32, 64, 128)
 TINY_BATCH_TOPK_TOKENS = 1024  # if T * TOP_K <= this, prefer the smallest padding tile
 SMALL_BATCH_TOPK_TOKENS = 4096  # if T * TOP_K <= this, use BLOCK_M_SMALL
 LARGE_BATCH_TOPK_TOKENS = 16384 # if T * TOP_K > this, use BLOCK_M_XLARGE
-HISTOGRAM_BLOCK_M_MAX_TOPK_TOKENS = 8192
 SMALL_MEDIUM_T_MIN = 32
 SMALL_MEDIUM_T_MAX = 64
 UPPER_MEDIUM_T_MIN = 65
@@ -48,7 +46,6 @@ EXACT_WORKLOAD_DISPATCH_T_MIN = 4096
 # A second guard keeps boundary workloads on the base path unless the overlaunch upper bound is large enough.
 EXACT_WORKLOAD_DISPATCH_MIN_PID_M = 640
 BLOCK_K = 128  # K-block (must equal QBLOCK for scale alignment)
-GROUP_SIZE_M = 8  # L2 cache reuse grouping
 SORT_BLOCK_ITEMS = 256
 PARALLEL_SORT_MIN_TILES = 128
 T1_GENERIC_BLOCK_M = 16
@@ -515,7 +512,6 @@ def triton_sort_scatter_kernel(
         tl.store(scatter_map_ptr + idx, dest, mask=is_local)
         running += is_match.to(tl.int32) * is_local.to(tl.int32)
 
-
 def parallel_sort_and_scatter(
     topk_idx,
     topk_wts,
@@ -598,7 +594,6 @@ def parallel_sort_and_scatter(
         BLOCK_ITEMS=SORT_BLOCK_ITEMS,
         num_warps=4,
     )
-
 
 # ═══════════════════════════════════════════════════════════════
 # Triton Kernel 1: Fused GEMM1 + SwiGLU
@@ -1244,20 +1239,22 @@ def _medium_fused_moe_gemm2_kernel(
 
 @triton.autotune(
     configs=[
+        # Legacy T=1 generic GEMM2 path configs, merged into the specialized T=1 reduce path.
         triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=2),
         triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=4),
         triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=6),
         triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=7),
         triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=8),
         triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=6),
         triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=7),
         triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=8),
+        # Reduce-only T=1 follow-up configs.
+        triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=4),
     ],
     key=['N', 'K'],
 )
@@ -1399,6 +1396,10 @@ def _token_reduce_kernel(
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=4),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=4),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=5),
+        # Legacy T=1 generic GEMM1 path configs that showed stronger T=1 autotune choices.
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=3),
@@ -1486,175 +1487,6 @@ def _t1_fused_gemm1_swiglu_kernel(
     swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     tl.store(c_ptrs, swiglu_out, eviction_policy='evict_first')
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_N': 256, 'GROUP_M': 1}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 256, 'GROUP_M': 1}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_N': 256, 'GROUP_M': 2}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 256, 'GROUP_M': 4}, num_warps=8, num_stages=3),
-    ],
-    key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
-)
-@triton.jit
-def _t1_generic_gemm1_swiglu_kernel(
-    A_ptr,
-    A_scale_ptr,
-    B_ptr,
-    C_ptr,
-    B_scale_ptr,
-    token_ids_ptr,
-    block_offsets_ptr,
-    total_blocks_ptr,
-    MAX_PID_M: tl.constexpr,
-    T: tl.constexpr,
-    H: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    stride_at, stride_ah,
-    stride_as0, stride_as1,
-    stride_be, stride_bn, stride_bh,
-    stride_cm, stride_cn,
-    stride_bse, stride_bsn, stride_bsh,
-    E_LOCAL: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    N_OUT = N // 2
-    num_pid_n = tl.cdiv(N_OUT, BLOCK_N)
-    total_blocks = tl.load(total_blocks_ptr)
-    if total_blocks <= 0:
-        return
-    if pid >= total_blocks * num_pid_n:
-        return
-    num_pid_m = total_blocks
-    num_pid_in_group = GROUP_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    e_idx = tl.arange(0, E_LOCAL)
-    b_start = tl.load(block_offsets_ptr + e_idx)
-    b_end = tl.load(block_offsets_ptr + e_idx + 1)
-    valid = (b_start <= pid_m) & (pid_m < b_end)
-    expert_id = tl.argmax(valid.to(tl.int32), axis=0)
-
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    rn_1 = rn
-    rn_3 = rn + N_OUT
-    token_idx = tl.load(token_ids_ptr + rm)
-    m_mask = token_idx < T
-    safe_token_idx = tl.where(m_mask, token_idx, 0)
-
-    acc_1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    acc_3 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    a_base = A_ptr + safe_token_idx[:, None] * stride_at
-    a_scale_base = A_scale_ptr + safe_token_idx * stride_as1
-    b_base_1 = B_ptr + expert_id * stride_be + rn_1[None, :] * stride_bn
-    b_base_3 = B_ptr + expert_id * stride_be + rn_3[None, :] * stride_bn
-    b_scale_base_1 = B_scale_ptr + expert_id * stride_bse + (rn_1[None, :] // 128) * stride_bsn
-    b_scale_base_3 = B_scale_ptr + expert_id * stride_bse + (rn_3[None, :] // 128) * stride_bsn
-
-    for k in range(0, K, BLOCK_K):
-        rk = k + tl.arange(0, BLOCK_K)
-        a = tl.load(a_base + rk[None, :] * stride_ah, mask=m_mask[:, None], other=0.0)
-        a_scale = tl.load(a_scale_base + (k // 128) * stride_as0, mask=m_mask, other=0.0)
-        b_1 = tl.load(b_base_1 + rk[:, None] * stride_bh)
-        b_3 = tl.load(b_base_3 + rk[:, None] * stride_bh)
-        b_scale_1 = tl.load(b_scale_base_1 + (k // 128) * stride_bsh)
-        b_scale_3 = tl.load(b_scale_base_3 + (k // 128) * stride_bsh)
-        partial_1 = tl.dot(a, b_1, out_dtype=tl.float32)
-        partial_3 = tl.dot(a, b_3, out_dtype=tl.float32)
-        acc_1 += partial_1 * (a_scale[:, None] * b_scale_1)
-        acc_3 += partial_3 * (a_scale[:, None] * b_scale_3)
-
-    swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1
-    c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, swiglu_out)
-
-
-@triton.autotune(
-    configs=[
-        triton.Config({'BLOCK_N': 128, 'GROUP_M': 1}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 128, 'GROUP_M': 2}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_N': 128, 'GROUP_M': 4}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 256, 'GROUP_M': 1}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 256, 'GROUP_M': 2}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 256, 'GROUP_M': 4}, num_warps=8, num_stages=3),
-        triton.Config({'BLOCK_N': 128, 'GROUP_M': 4}, num_warps=8, num_stages=6),
-        triton.Config({'BLOCK_N': 128, 'GROUP_M': 4}, num_warps=8, num_stages=7),
-        triton.Config({'BLOCK_N': 128, 'GROUP_M': 4}, num_warps=8, num_stages=8),
-        triton.Config({'BLOCK_N': 256, 'GROUP_M': 4}, num_warps=8, num_stages=6),
-        triton.Config({'BLOCK_N': 256, 'GROUP_M': 4}, num_warps=8, num_stages=7),
-        triton.Config({'BLOCK_N': 256, 'GROUP_M': 4}, num_warps=8, num_stages=8),
-    ],
-    key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
-)
-@triton.jit
-def _t1_generic_gemm2_kernel(
-    A_ptr,
-    B_ptr,
-    C_ptr,
-    B_scale_ptr,
-    token_weights_ptr,
-    block_offsets_ptr,
-    total_blocks_ptr,
-    MAX_PID_M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    stride_am, stride_ak,
-    stride_be, stride_bn, stride_bk,
-    stride_cm, stride_cn,
-    stride_bse, stride_bsn, stride_bsk,
-    E_LOCAL: tl.constexpr,
-    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    num_pid_n = tl.cdiv(N, BLOCK_N)
-    total_blocks = tl.load(total_blocks_ptr)
-    if total_blocks <= 0:
-        return
-    if pid >= total_blocks * num_pid_n:
-        return
-    num_pid_m = total_blocks
-    num_pid_in_group = GROUP_M * num_pid_n
-    group_id = pid // num_pid_in_group
-    first_pid_m = group_id * GROUP_M
-    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
-    pid_m = first_pid_m + (pid % group_size_m)
-    pid_n = (pid % num_pid_in_group) // group_size_m
-
-    e_idx = tl.arange(0, E_LOCAL)
-    b_start = tl.load(block_offsets_ptr + e_idx)
-    b_end = tl.load(block_offsets_ptr + e_idx + 1)
-    valid = (b_start <= pid_m) & (pid_m < b_end)
-    expert_id = tl.argmax(valid.to(tl.int32), axis=0)
-
-    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    token_weights = tl.load(token_weights_ptr + rm)
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    a_base = A_ptr + rm[:, None] * stride_am
-    b_base = B_ptr + expert_id * stride_be + rn[None, :] * stride_bn
-    b_scale_base = B_scale_ptr + expert_id * stride_bse + (rn[None, :] // 128) * stride_bsn
-
-    for k in range(0, K, BLOCK_K):
-        rk = k + tl.arange(0, BLOCK_K)
-        a = tl.load(a_base + rk[None, :] * stride_ak, eviction_policy='evict_first')
-        b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
-        b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
-        acc += tl.dot(a, b.to(tl.float32), out_dtype=tl.float32) * b_scale
-
-    out = acc * token_weights[:, None]
-    c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, out, eviction_policy='evict_first')
-
 # ═══════════════════════════════════════════════════════════════
 # Pre-allocated buffer cache — reuse output_fp32/Intermediate
 # ═══════════════════════════════════════════════════════════════
@@ -1671,28 +1503,6 @@ def _select_block_m(num_topk_tokens: int) -> int:
     if num_topk_tokens > LARGE_BATCH_TOPK_TOKENS:
         return BLOCK_M_XLARGE
     return BLOCK_M_LARGE
-
-
-def _select_block_m_from_histogram(topk_idx: torch.Tensor, local_start: int) -> tuple[int, int]:
-    num_topk_tokens = int(topk_idx.numel())
-    fallback_block_m = _select_block_m(num_topk_tokens)
-    if num_topk_tokens > HISTOGRAM_BLOCK_M_MAX_TOPK_TOKENS:
-        return fallback_block_m, num_topk_tokens + E_LOCAL * fallback_block_m
-
-    local_mask = (topk_idx >= local_start) & (topk_idx < local_start + E_LOCAL)
-    local_ids = (topk_idx[local_mask] - local_start).to(torch.int64)
-    if local_ids.numel() == 0:
-        return fallback_block_m, 0
-
-    counts = torch.bincount(local_ids, minlength=E_LOCAL)
-    best_block_m = fallback_block_m
-    best_padded = None
-    for candidate in BLOCK_M_CANDIDATES:
-        padded = int((((counts + (candidate - 1)) // candidate) * candidate).sum().item())
-        if best_padded is None or padded < best_padded or (padded == best_padded and candidate < best_block_m):
-            best_block_m = candidate
-            best_padded = padded
-    return best_block_m, int(best_padded)
 
 
 def _use_small_medium_gemm_bucket(t: int) -> bool:

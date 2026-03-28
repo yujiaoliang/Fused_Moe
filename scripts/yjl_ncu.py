@@ -56,7 +56,7 @@ def _get_cpu_us(event) -> float:
 
 def _classify_event(name: str) -> str:
     name_l = name.lower()
-    if "_fused_moe_gemm1_swiglu_kernel" in name_l or "_t1_fused_gemm1_swiglu_kernel" in name_l:
+    if "_fused_moe_gemm1_swiglu_kernel" in name_l or "_t1_fused_gemm1_swiglu_kernel" in name_l or "_medium_no_swiglu_gemm1_kernel" in name_l:
         return "gemm1"
     if "_t1_fused_gemm2_reduce_kernel" in name_l:
         return "gemm2"
@@ -284,10 +284,18 @@ def run_profile(solution_json: str) -> str:
             log(f"Trace loading failed, fallback to synthetic inputs: {exc}")
         return trace_inputs
 
-    def infer_num_padded(args) -> tuple[int | None, int | None]:
+    def infer_padding_stats(args) -> dict[str, int | None]:
         # Uses the same Triton kernels as runtime path, so this is exact for current input.
+        stats = {
+            "total_blocks": None,
+            "num_padded": None,
+            "num_local_rows": None,
+            "tail_rows": None,
+            "tail_experts": None,
+            "block_m": None,
+        }
         if not hasattr(module, "ds_routing"):
-            return None, None
+            return stats
         try:
             def _to_int(v):
                 if torch.is_tensor(v):
@@ -311,6 +319,19 @@ def run_profile(solution_json: str) -> str:
                 block_m = int(module._select_block_m(t * TOP_K))
             else:
                 block_m = BLOCK_M
+            stats["block_m"] = block_m
+
+            local_end = local_expert_offset + E_LOCAL
+            local_mask = (topk_idx >= local_expert_offset) & (topk_idx < local_end)
+            local_ids = (topk_idx[local_mask] - local_expert_offset).to(torch.int64)
+            num_local_rows = int(local_ids.numel())
+            stats["num_local_rows"] = num_local_rows
+            if num_local_rows > 0:
+                local_counts = torch.bincount(local_ids, minlength=E_LOCAL)
+            else:
+                local_counts = torch.zeros((E_LOCAL,), dtype=torch.int64, device="cuda")
+            tail_experts = int(((local_counts > 0) & ((local_counts % block_m) != 0)).sum().item())
+            stats["tail_experts"] = tail_experts
 
             max_padded = t * TOP_K + E_LOCAL * block_m
             sorted_token_ids = torch.empty((max_padded,), dtype=torch.int64, device="cuda")
@@ -361,11 +382,16 @@ def run_profile(solution_json: str) -> str:
                     num_warps=8,
                 )
             else:
-                return None, None
+                return stats
             tb = int(total_blocks.item())
-            return tb, tb * block_m
+            num_padded = tb * block_m
+            stats["total_blocks"] = tb
+            stats["num_padded"] = num_padded
+            if stats["num_local_rows"] is not None:
+                stats["tail_rows"] = num_padded - stats["num_local_rows"]
+            return stats
         except Exception:
-            return None, None
+            return stats
 
     trace_inputs_by_t = build_trace_inputs_by_t()
     if trace_inputs_by_t:
@@ -388,9 +414,19 @@ def run_profile(solution_json: str) -> str:
             log(f"Input source: synthetic fallback (T={t})")
         output = args[-1]
 
-        total_blocks, num_padded = infer_num_padded(args)
+        padding_stats = infer_padding_stats(args)
+        total_blocks = padding_stats["total_blocks"]
+        num_padded = padding_stats["num_padded"]
+        num_local_rows = padding_stats["num_local_rows"]
+        tail_rows = padding_stats["tail_rows"]
+        tail_experts = padding_stats["tail_experts"]
+        block_m = padding_stats["block_m"]
         if total_blocks is not None:
-            log(f"Inferred padding: total_blocks={total_blocks}, num_padded={num_padded}")
+            log(
+                "Inferred padding: "
+                f"block_m={block_m}, total_blocks={total_blocks}, num_padded={num_padded}, "
+                f"num_local_rows={num_local_rows}, tail_rows={tail_rows}, tail_experts={tail_experts}"
+            )
         else:
             log("Inferred padding: unavailable (fallback to N/A FLOP metrics)")
 
@@ -532,7 +568,10 @@ def run_profile(solution_json: str) -> str:
                 "sorting_ms": totals_us["sorting"] / ITERS / 1000.0,
                 "gemm1_ms": totals_us["gemm1"] / ITERS / 1000.0,
                 "gemm2_ms": totals_us["gemm2"] / ITERS / 1000.0,
+                "num_local_rows": num_local_rows if num_local_rows is not None else -1,
                 "num_padded": num_padded if num_padded is not None else -1,
+                "tail_rows": tail_rows if tail_rows is not None else -1,
+                "tail_experts": tail_experts if tail_experts is not None else -1,
                 "gemm1_tflops": gemm1_tflops if gemm1_tflops is not None else -1.0,
                 "gemm2_tflops": gemm2_tflops if gemm2_tflops is not None else -1.0,
             }
@@ -545,17 +584,21 @@ def run_profile(solution_json: str) -> str:
     log("=" * 96)
     log(
         f"{'T':>6s} | {'Wall':>7s} | {'CUDA':>7s} | {'CPU':>7s} | {'CPU API':>7s} | {'CPU Prf':>7s} | {'Route':>7s} | "
-        f"{'Sort':>7s} | {'GEMM1':>7s} | {'GEMM2':>7s} | {'num_pad':>8s} | {'G1 TF':>8s} | {'G2 TF':>8s}"
+        f"{'Sort':>7s} | {'GEMM1':>7s} | {'GEMM2':>7s} | {'local':>8s} | {'num_pad':>8s} | "
+        f"{'tail':>8s} | {'tail_e':>6s} | {'G1 TF':>8s} | {'G2 TF':>8s}"
     )
     for row in summary_rows:
         g1 = f"{row['gemm1_tflops']:.1f}" if row["gemm1_tflops"] >= 0 else "N/A"
         g2 = f"{row['gemm2_tflops']:.1f}" if row["gemm2_tflops"] >= 0 else "N/A"
+        nlocal = str(row["num_local_rows"]) if row["num_local_rows"] >= 0 else "N/A"
         npad = str(row["num_padded"]) if row["num_padded"] >= 0 else "N/A"
+        tail = str(row["tail_rows"]) if row["tail_rows"] >= 0 else "N/A"
+        tail_e = str(row["tail_experts"]) if row["tail_experts"] >= 0 else "N/A"
         log(
             f"{row['T']:6d} | {row['wall_ms']:7.3f} | {row['cuda_ms']:7.3f} | {row['cpu_ms']:7.3f} | "
             f"{row['cpu_api_ms']:7.3f} | {row['cpu_profile_ms']:7.3f} | "
             f"{row['routing_ms']:7.3f} | {row['sorting_ms']:7.3f} | {row['gemm1_ms']:7.3f} | "
-            f"{row['gemm2_ms']:7.3f} | {npad:>8s} | {g1:>8s} | {g2:>8s}"
+            f"{row['gemm2_ms']:7.3f} | {nlocal:>8s} | {npad:>8s} | {tail:>8s} | {tail_e:>6s} | {g1:>8s} | {g2:>8s}"
         )
 
     # Optional hardware counters
