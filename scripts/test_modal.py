@@ -17,7 +17,8 @@ TRACE_SET_PATH = "/data/mlsys26-contest"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "cuda-python", "nvidia-cutlass-dsl>=0.1.0")
+    .env({"CUTE_DEBUG_PHASE": "6", "CUDA_LAUNCH_BLOCKING": "1"})
 )
 
 
@@ -64,6 +65,7 @@ def run_test(solution_json: str) -> str:
     log(f"\n=== Results ({len(traces)} traces) ===")
 
     pass_count = 0
+    fail_detail_count = 0
     for trace in traces:
         if trace.evaluation:
             ev = trace.evaluation
@@ -80,17 +82,33 @@ def run_test(solution_json: str) -> str:
             if status == "PASSED":
                 pass_count += 1
             elif ev.log:
+                fail_detail_count += 1
                 log_text = ev.log.strip()
-                log_lines = log_text.split("\n")
-                # Show first 5 lines + last 3 lines 
-                for line in log_lines[:5]:
-                    log(f"    LOG: {line}")
-                if len(log_lines) > 8:
-                    log(f"    ... ({len(log_lines) - 8} lines omitted) ...")
-                for line in log_lines[-3:]:
-                    log(f"    LOG: {line}")
+                if fail_detail_count <= 3:
+                    # Show FULL log for first 3 failures
+                    log(f"    === FULL ERROR LOG ({wl_uuid}) ===")
+                    for line in log_text.split("\n"):
+                        log(f"    {line}")
+                    log(f"    === END ERROR LOG ===")
+                else:
+                    log_lines = log_text.split("\n")
+                    for line in log_lines[-5:]:
+                        log(f"    LOG: {line}")
 
     log(f"\n=== Summary: {pass_count}/{len(traces)} PASSED ===")
+    
+    import glob
+    import os
+    log("\n=== WORKER CRASH LOGS (/tmp/flashinfer_bench) ===")
+    for log_file in glob.glob("/tmp/flashinfer_bench/*.log"):
+        log(f"\n--- {log_file} ---")
+        try:
+            with open(log_file, "r") as f:
+                content = f.read()
+                log(content[-4000:]) # last 4000 chars
+        except Exception as e:
+            log(f"Error reading {log_file}: {e}")
+            
     return "\n".join(lines)
 
 

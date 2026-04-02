@@ -1684,6 +1684,9 @@ def kernel(
             output,
         )
 
+    # ==== CuTe DSL Integration: Only replaces GEMM1+SwiGLU ====
+    # (moved to after routing + sorting, before GEMM2)
+
     rkey = T
     if rkey in _routing_cache:
         topk_idx_ws, topk_wts_ws = _routing_cache[rkey]
@@ -1766,32 +1769,48 @@ def kernel(
         use_upper_medium_gemm = _use_upper_medium_gemm_bucket(T)
 
     # -- 4. Fused GEMM1 + SwiGLU --
-    grid1 = lambda META: (exact_pid_m * triton.cdiv(2048, META['BLOCK_N']),)
+    # Try CuTe path for GEMM1 only (replaces the Triton GEMM1 kernel)
+    _used_cute_gemm1 = False
+    if T > 1 and block_m >= 128:
+        from .cute_fused_gemm import _USE_CUTE, run_cute_path, _CUTE_DEBUG_PHASE
+        if _USE_CUTE:
+            cute_intermediate = run_cute_path(
+                hidden_states, hidden_states_scale,
+                gemm1_weights, gemm1_weights_scale,
+                sorted_token_ids, block_offsets, total_blocks,
+                Intermediate, block_m
+            )
+            if cute_intermediate is not None:
+                _used_cute_gemm1 = True
+                Intermediate = cute_intermediate
 
-    if use_small_medium_gemm:
-        gemm1_kernel = _small_medium_fused_moe_gemm1_swiglu_kernel
-    elif use_upper_medium_gemm:
-        gemm1_kernel = _medium_fused_moe_gemm1_swiglu_kernel
-    else:
-        gemm1_kernel = _fused_moe_gemm1_swiglu_kernel
-    gemm1_kernel[grid1](
-        A_ptr=hidden_states,
-        A_scale_ptr=hidden_states_scale,
-        B_ptr=gemm1_weights,
-        C_ptr=Intermediate,
-        B_scale_ptr=gemm1_weights_scale,
-        token_ids_ptr=sorted_token_ids,
-        block_offsets_ptr=block_offsets,
-        total_blocks_ptr=total_blocks,
-        MAX_PID_M=exact_pid_m, T=T, H=7168, N=4096, K=7168,
-        stride_at=hidden_states.stride(0), stride_ah=hidden_states.stride(1),
-        stride_as0=hidden_states_scale.stride(0), stride_as1=hidden_states_scale.stride(1),
-        stride_be=gemm1_weights.stride(0), stride_bn=gemm1_weights.stride(1), stride_bh=gemm1_weights.stride(2),
-        stride_cm=Intermediate.stride(0), stride_cn=Intermediate.stride(1),
-        stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
-        E_LOCAL=E_LOCAL,
-        BLOCK_M=block_m,
-    )
+    if not _used_cute_gemm1:
+        grid1 = lambda META: (exact_pid_m * triton.cdiv(2048, META['BLOCK_N']),)
+
+        if use_small_medium_gemm:
+            gemm1_kernel = _small_medium_fused_moe_gemm1_swiglu_kernel
+        elif use_upper_medium_gemm:
+            gemm1_kernel = _medium_fused_moe_gemm1_swiglu_kernel
+        else:
+            gemm1_kernel = _fused_moe_gemm1_swiglu_kernel
+        gemm1_kernel[grid1](
+            A_ptr=hidden_states,
+            A_scale_ptr=hidden_states_scale,
+            B_ptr=gemm1_weights,
+            C_ptr=Intermediate,
+            B_scale_ptr=gemm1_weights_scale,
+            token_ids_ptr=sorted_token_ids,
+            block_offsets_ptr=block_offsets,
+            total_blocks_ptr=total_blocks,
+            MAX_PID_M=exact_pid_m, T=T, H=7168, N=4096, K=7168,
+            stride_at=hidden_states.stride(0), stride_ah=hidden_states.stride(1),
+            stride_as0=hidden_states_scale.stride(0), stride_as1=hidden_states_scale.stride(1),
+            stride_be=gemm1_weights.stride(0), stride_bn=gemm1_weights.stride(1), stride_bh=gemm1_weights.stride(2),
+            stride_cm=Intermediate.stride(0), stride_cn=Intermediate.stride(1),
+            stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
+            E_LOCAL=E_LOCAL,
+            BLOCK_M=block_m,
+        )
 
     # -- 5. GEMM2 (non-atomic, writes to expert_out) --
     grid2 = lambda META: (exact_pid_m * triton.cdiv(7168, META['BLOCK_N']),)
@@ -1834,3 +1853,4 @@ def kernel(
     )
 
     return output
+
