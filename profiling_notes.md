@@ -1089,3 +1089,29 @@ subset 上的 tiny 结果：
 - **整体全量负载 Mean**：+0.7% (因为我们的 Large-T 核心逻辑已经摸顶未变，所以增益仅在 Medium-T 小范围体现，但在这个区间内表现极为确信且亮眼！)。
 
 **结论：** 这是一个毫无代价的纯机制剥削优化，精准狙击了我们此前提到的“Medium-T 受寄存器/缓存调度效率制约”的技术盲区，并且通过 A/B 确信提升。完全值得直接合入主分支！
+
+---
+
+## Phase 10: MOE.md v2 的执行与验证 (2026-03-29)
+
+基于 `tcgen05.mma` 作为 128x128 脉动阵列的新硬件认知，实施了一系列针对性优化：
+
+### 10.1 [回滚] Exp-D2: 全局 BLOCK_M=128
+**动机**：SM100 的 Tensor Core 处理 `< 128` 的块时会浪费算力，而处理 Masked rows（不足 128 补零的部分）在硬件上看似是完全免费的。因此，尝试将 `_select_block_m()` 强制修改为对于所有非 T=1 的负载，统一返回 `BLOCK_M=128`。
+**结果**：19/19 PASSED，但**性能断崖式暴跌 (-63.8% Mean)**，绝大部分基准测试速度严重退化！
+**原因分析**：虽然在单条 `mma` 指令上，利用 Mask 补零处理无效行确实是免费的，但在 **Memory Bandwidth** 层面它是一场灾难！由于我们是在动态 Padding 下的 MoE，如果 `BLOCK_M=128` 并且一个 Expert 只分到了 1 个 Token，内核依然会用 128x128 的大小进行点积，并且将 **1 行有效结果和 127 行零垃圾** 直接写入 HBM 中的 `Intermediate` Buffer。GEMM2 然后也会从 HBM 中读取这 128 行并写回。这就使得小型和中型批处理量的**全局显存带宽读写压力激增了最高 8 倍**。由于我们的网络早已是极度的 Memory Bound，这点 Tensor Core 利用率提升完全被指数级增长的显存 I/O 阻塞吞噬殆尽。**实测证实不可行，已回滚全量 BLOCK_M 分桶逻辑。**
+
+### 10.2 [回滚] Exp-D1: Fused Routing + Histogram
+**动机**：将 Histogram 统计直接通过 `tl.atomic_add` 融入 Routing kernel，从而砍掉独立的 `histogram_kernel`，减少 Launch 开销和首尾访存。
+**结果**：19/19 PASSED，但**性能雪崩 (-2.4% Mean)**，有 11 个 workload 退化！
+**原因分析**：当前的 `parallel_sort` 算法强依赖于基于**Tile（固定大小的 token 块）**的 Prefix Sum 来确定 Scatter 时的 offset。如果只使用 Routing kernel 层面的 Global atomic count，就丢失了 Per-tile 内部的 offset 信息（`partial_counts`），导致 Scatter 逻辑必须退回低效。如果要保留 Tile offset 就必须保留 Histogram kernel。由于改变 sort_and_scatter 机制风险过大且原子冲突很高，该方向**证实不通，已回滚。**
+
+### 10.3 [回滚] Exp-D3: 添加 BLOCK_K=256 减半 K-Loop
+**动机**：使 K-loop 从 56 次迭代降为 28 次，通过增大块大小更充分地利用单次内层循环，从而隐藏访存同步开销。
+**结果**：`INCORRECT_NUMERICAL`！算力测试全红失败。
+**原因分析**：本竞赛强制要求使用的 Tensor 格式中，`fp8_scale` 是按照 **128 尺度 (K // 128)** 切分的 Block Scale 阵列。如果强制设置 `BLOCK_K=256`，单次 `tl.dot(a, b)` 将直接完成 256 长宽的点积并吐出一个 FP32 scalar，**完全越过了这中间的 128-block 边界**。此时在后处理 `partial * b_scale` 时，只能用一个缩放系数，直接丢失了另一半数据的对应 Scale。Triton 无法在单个 `.dot` 中挂载多个 scale——这是基于 FP8 Block Scale 量化算法的物理瓶颈。因此，不能也不该突破 `BLOCK_K=128` 的硬性约束。**证实不通，已回滚。**
+
+### 10.4 [跳过] Exp-D4: GEMM2 Atomic Contention Tile Reordering
+**结论**：跳过。
+**原因分析**：该方向假定我们在采用 `Exp-H1` (直接在 GEMM2 里用 `tl.atomic_add` 规约到 Global output) 的技术栈，通过 Reverse-wave scheduling 减少 L2 bank 排队瓶颈。但在之前的优化中，我们已经使用 `expert_out` zero-free buffer 和专门的 `_token_reduce_kernel` 替代了它。当前在主分支执行时，GEMM2 完全没有 Atomic 操作（直接写临时 Buffer），Reduce Kernel 也完全并行（`+=` 局部规约），不会有原子冲突。因此不需要进行 Host-side Tile Reordering。
+
