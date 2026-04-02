@@ -56,7 +56,12 @@ def _get_cpu_us(event) -> float:
 
 def _classify_event(name: str) -> str:
     name_l = name.lower()
-    if "_fused_moe_gemm1_swiglu_kernel" in name_l or "_t1_fused_gemm1_swiglu_kernel" in name_l or "_medium_no_swiglu_gemm1_kernel" in name_l:
+    if (
+        "_fused_moe_gemm1_swiglu_kernel" in name_l
+        or "_mapped_small_fused_moe_gemm1_swiglu_kernel" in name_l
+        or "_t1_fused_gemm1_swiglu_kernel" in name_l
+        or "_medium_no_swiglu_gemm1_kernel" in name_l
+    ):
         return "gemm1"
     if "_t1_fused_gemm2_reduce_kernel" in name_l:
         return "gemm2"
@@ -64,7 +69,20 @@ def _classify_event(name: str) -> str:
         return "gemm2"
     if "triton_ds_routing_kernel" in name_l or "triton_ds_routing_t1_local_kernel" in name_l:
         return "routing"
-    if "triton_sort_and_scatter_kernel" in name_l or "triton_sort_histogram_kernel" in name_l or "triton_sort_layout_kernel" in name_l or "triton_sort_scatter_kernel" in name_l or "triton_init_sorted_buffers_kernel" in name_l:
+    if (
+        "triton_sort_and_scatter_kernel" in name_l
+        or "triton_sort_histogram_kernel" in name_l
+        or "triton_sort_layout_kernel" in name_l
+        or "triton_sort_scatter_kernel" in name_l
+        or "triton_init_sorted_buffers_kernel" in name_l
+        or "triton_dual_bucket_layout_kernel" in name_l
+        or "triton_dual_sort_scatter_kernel" in name_l
+        or "triton_small_expert_layout_kernel" in name_l
+        or "triton_small_tile_offsets_kernel" in name_l
+        or "triton_init_token_ids_kernel" in name_l
+        or "triton_small_sort_scatter_kernel" in name_l
+        or "triton_small_row_map_kernel" in name_l
+    ):
         return "sorting"
     if any(x in name_l for x in ("copy", "zero_", "fill_", "memset", "memcpy")):
         return "memops"
@@ -293,6 +311,13 @@ def run_profile(solution_json: str) -> str:
             "tail_rows": None,
             "tail_experts": None,
             "block_m": None,
+            "dual_threshold": None,
+            "dual_small_experts": None,
+            "dual_small_rows": None,
+            "dual_small_padded": None,
+            "dual_normal_experts": None,
+            "dual_normal_rows": None,
+            "dual_normal_padded": None,
         }
         if not hasattr(module, "ds_routing"):
             return stats
@@ -332,6 +357,38 @@ def run_profile(solution_json: str) -> str:
                 local_counts = torch.zeros((E_LOCAL,), dtype=torch.int64, device="cuda")
             tail_experts = int(((local_counts > 0) & ((local_counts % block_m) != 0)).sum().item())
             stats["tail_experts"] = tail_experts
+            dual_threshold = int(getattr(module, "DUAL_BUCKET_THRESHOLD", 0))
+            dual_small_block = int(getattr(module, "DUAL_SMALL_BLOCK_M", 16))
+            dual_normal_block = int(getattr(module, "DUAL_NORMAL_BLOCK_M", 64))
+            if dual_threshold > 0:
+                small_mask = (local_counts > 0) & (local_counts <= dual_threshold)
+                normal_mask = local_counts > dual_threshold
+                small_rows = int(local_counts[small_mask].sum().item())
+                normal_rows = int(local_counts[normal_mask].sum().item())
+                small_padded = int((((local_counts[small_mask] + (dual_small_block - 1)) // dual_small_block) * dual_small_block).sum().item())
+                normal_padded = int((((local_counts[normal_mask] + (dual_normal_block - 1)) // dual_normal_block) * dual_normal_block).sum().item())
+                stats["dual_threshold"] = dual_threshold
+                stats["dual_small_experts"] = int(small_mask.sum().item())
+                stats["dual_small_rows"] = small_rows
+                stats["dual_small_padded"] = small_padded
+                stats["dual_normal_experts"] = int(normal_mask.sum().item())
+                stats["dual_normal_rows"] = normal_rows
+                stats["dual_normal_padded"] = normal_padded
+
+                use_exact_dispatch = False
+                if hasattr(module, "_use_exact_workload_dispatch"):
+                    max_pid_m = (t * TOP_K + E_LOCAL * block_m) // block_m
+                    use_exact_dispatch = bool(module._use_exact_workload_dispatch(t, max_pid_m))
+                if hasattr(module, "_use_dual_expert_bucket_large_t_override") and bool(
+                    module._use_dual_expert_bucket_large_t_override(t, block_m, use_exact_dispatch)
+                ):
+                    small_tail_experts = int(((local_counts[small_mask] % dual_small_block) != 0).sum().item())
+                    normal_tail_experts = int(((local_counts[normal_mask] % dual_normal_block) != 0).sum().item())
+                    stats["total_blocks"] = (small_padded // dual_small_block) + (normal_padded // dual_normal_block)
+                    stats["num_padded"] = small_padded + normal_padded
+                    stats["tail_rows"] = stats["num_padded"] - num_local_rows
+                    stats["tail_experts"] = small_tail_experts + normal_tail_experts
+                    return stats
 
             max_padded = t * TOP_K + E_LOCAL * block_m
             sorted_token_ids = torch.empty((max_padded,), dtype=torch.int64, device="cuda")
@@ -427,6 +484,17 @@ def run_profile(solution_json: str) -> str:
                 f"block_m={block_m}, total_blocks={total_blocks}, num_padded={num_padded}, "
                 f"num_local_rows={num_local_rows}, tail_rows={tail_rows}, tail_experts={tail_experts}"
             )
+            if padding_stats["dual_threshold"] is not None:
+                log(
+                    "Dual-bucket stats: "
+                    f"threshold<={padding_stats['dual_threshold']}, "
+                    f"small_experts={padding_stats['dual_small_experts']}, "
+                    f"small_rows={padding_stats['dual_small_rows']}, "
+                    f"small_padded={padding_stats['dual_small_padded']}, "
+                    f"normal_experts={padding_stats['dual_normal_experts']}, "
+                    f"normal_rows={padding_stats['dual_normal_rows']}, "
+                    f"normal_padded={padding_stats['dual_normal_padded']}"
+                )
         else:
             log("Inferred padding: unavailable (fallback to N/A FLOP metrics)")
 
@@ -636,7 +704,7 @@ def run_profile(solution_json: str) -> str:
         cmd = [
             ncu_path,
             "--kernel-name",
-            "regex:.*(fused_moe|t1_fused_gemm2_reduce|triton_ds_routing|triton_sort_).*",
+            "regex:.*(fused_moe|t1_fused_gemm2_reduce|triton_ds_routing|triton_sort_|triton_dual_).*",
             "--metrics",
             ",".join(
                 [

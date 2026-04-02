@@ -50,6 +50,8 @@ SORT_BLOCK_ITEMS = 256
 PARALLEL_SORT_MIN_TILES = 128
 T1_GENERIC_BLOCK_M = 16
 T1_GENERIC_MAX_PADDED = TOP_K * T1_GENERIC_BLOCK_M
+REMAPPED_GEMM1_BLOCK_M = 64
+REMAPPED_GEMM1_MAX_EXTRA = E_LOCAL * (REMAPPED_GEMM1_BLOCK_M - 1)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -457,6 +459,56 @@ def triton_sort_layout_kernel(
 
 
 @triton.jit
+def triton_sort_layout_with_remap_kernel(
+    partial_counts_ptr,
+    tile_offsets_ptr,
+    block_offsets_ptr,
+    total_blocks_ptr,
+    remapped_block_offsets_ptr,
+    remapped_total_blocks_ptr,
+    num_tiles,
+    E_LOCAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    REMAPPED_BLOCK_M: tl.constexpr,
+):
+    e_idx = tl.arange(0, E_LOCAL)
+    total_counts = tl.zeros((E_LOCAL,), dtype=tl.int32)
+
+    tile = 0
+    while tile < num_tiles:
+        total_counts += tl.load(partial_counts_ptr + tile * E_LOCAL + e_idx)
+        tile += 1
+
+    blocks = (total_counts + (BLOCK_M - 1)) // BLOCK_M
+    padded_counts = blocks * BLOCK_M
+    inc_sum = tl.cumsum(padded_counts, axis=0)
+    global_offsets = inc_sum - padded_counts
+    total_blocks = tl.sum(blocks, axis=0)
+
+    tl.store(block_offsets_ptr + e_idx, global_offsets // BLOCK_M)
+    tl.store(block_offsets_ptr + E_LOCAL, total_blocks)
+    tl.store(total_blocks_ptr, total_blocks)
+
+    remapped_blocks = (total_counts + (REMAPPED_BLOCK_M - 1)) // REMAPPED_BLOCK_M
+    remapped_padded = remapped_blocks * REMAPPED_BLOCK_M
+    remapped_inc_sum = tl.cumsum(remapped_padded, axis=0)
+    remapped_offsets = remapped_inc_sum - remapped_padded
+    remapped_total_blocks = tl.sum(remapped_blocks, axis=0)
+
+    tl.store(remapped_block_offsets_ptr + e_idx, remapped_offsets // REMAPPED_BLOCK_M)
+    tl.store(remapped_block_offsets_ptr + E_LOCAL, remapped_total_blocks)
+    tl.store(remapped_total_blocks_ptr, remapped_total_blocks)
+
+    running = tl.zeros((E_LOCAL,), dtype=tl.int32)
+    tile = 0
+    while tile < num_tiles:
+        counts = tl.load(partial_counts_ptr + tile * E_LOCAL + e_idx)
+        tl.store(tile_offsets_ptr + tile * E_LOCAL + e_idx, global_offsets + running)
+        running += counts
+        tile += 1
+
+
+@triton.jit
 def triton_init_sorted_buffers_kernel(
     sorted_tokens_ptr,
     sorted_weights_ptr,
@@ -527,6 +579,8 @@ def parallel_sort_and_scatter(
     block_m,
     max_padded,
     counts_workspace=None,
+    remapped_block_offsets=None,
+    remapped_total_blocks=None,
 ):
     num_items = T * TOP_K
     num_tiles = triton.cdiv(num_items, SORT_BLOCK_ITEMS)
@@ -559,16 +613,31 @@ def parallel_sort_and_scatter(
         BLOCK_ITEMS=SORT_BLOCK_ITEMS,
         num_warps=4,
     )
-    triton_sort_layout_kernel[(1,)](
-        partial_counts,
-        tile_offsets,
-        block_offsets,
-        total_blocks,
-        num_tiles,
-        E_LOCAL=E_LOCAL,
-        BLOCK_M=block_m,
-        num_warps=1,
-    )
+    if remapped_block_offsets is not None and remapped_total_blocks is not None:
+        triton_sort_layout_with_remap_kernel[(1,)](
+            partial_counts,
+            tile_offsets,
+            block_offsets,
+            total_blocks,
+            remapped_block_offsets,
+            remapped_total_blocks,
+            num_tiles,
+            E_LOCAL=E_LOCAL,
+            BLOCK_M=block_m,
+            REMAPPED_BLOCK_M=REMAPPED_GEMM1_BLOCK_M,
+            num_warps=1,
+        )
+    else:
+        triton_sort_layout_kernel[(1,)](
+            partial_counts,
+            tile_offsets,
+            block_offsets,
+            total_blocks,
+            num_tiles,
+            E_LOCAL=E_LOCAL,
+            BLOCK_M=block_m,
+            num_warps=1,
+        )
 
     triton_init_sorted_buffers_kernel[(triton.cdiv(max_padded, SORT_BLOCK_ITEMS),)](
         sorted_token_ids,
@@ -756,6 +825,104 @@ def _fused_moe_gemm1_swiglu_kernel(
     
     # Store to C as fp32 (bf16 causes too much precision loss — 6/19 PASSED)
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+    tl.store(c_ptrs, swiglu_out, eviction_policy='evict_first')
+
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=4),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=3),
+    ],
+    key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
+    restore_value=['C_ptr'],
+)
+@triton.jit
+def _mapped_bucket_fused_moe_gemm1_swiglu_kernel(
+    A_ptr,
+    A_scale_ptr,
+    B_ptr,
+    C_ptr,
+    B_scale_ptr,
+    canonical_token_ids_ptr,
+    canonical_block_offsets_ptr,
+    block_offsets_ptr,
+    total_blocks_ptr,
+    MAX_PID_M: tl.constexpr, T: tl.constexpr, H: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_at, stride_ah,
+    stride_as0, stride_as1,
+    stride_be, stride_bn, stride_bh,
+    stride_cm, stride_cn,
+    stride_bse, stride_bsn, stride_bsh,
+    E_LOCAL: tl.constexpr,
+    CANONICAL_BLOCK_M: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr
+):
+    pid = tl.program_id(0)
+    N_OUT = N // 2
+    num_pid_n = tl.cdiv(N_OUT, BLOCK_N)
+
+    total_blocks = tl.load(total_blocks_ptr)
+    if total_blocks <= 0:
+        return
+    if pid >= total_blocks * num_pid_n:
+        return
+    num_pid_m = total_blocks
+
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    e_idx = tl.arange(0, E_LOCAL)
+    b_start = tl.load(block_offsets_ptr + e_idx)
+    b_end = tl.load(block_offsets_ptr + e_idx + 1)
+    valid = (b_start <= pid_m) & (pid_m < b_end)
+    expert_id = tl.argmax(valid.to(tl.int32), axis=0)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    remapped_start = tl.load(block_offsets_ptr + expert_id) * BLOCK_M
+    canonical_start = tl.load(canonical_block_offsets_ptr + expert_id) * CANONICAL_BLOCK_M
+    out_rm = canonical_start + (rm - remapped_start)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    rn_1 = rn
+    rn_3 = rn + N_OUT
+    token_idx = tl.load(canonical_token_ids_ptr + out_rm)
+    m_mask = token_idx < T
+    safe_token_idx = tl.where(m_mask, token_idx, 0)
+
+    acc_1 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc_3 = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    a_base = A_ptr + safe_token_idx[:, None] * stride_at
+    a_scale_base = A_scale_ptr + safe_token_idx * stride_as1
+    b_base_1 = B_ptr + expert_id * stride_be + rn_1[None, :] * stride_bn
+    b_base_3 = B_ptr + expert_id * stride_be + rn_3[None, :] * stride_bn
+    b_scale_base_1 = B_scale_ptr + expert_id * stride_bse + (rn_1[None, :] // 128) * stride_bsn
+    b_scale_base_3 = B_scale_ptr + expert_id * stride_bse + (rn_3[None, :] // 128) * stride_bsn
+
+    for k in range(0, K, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+        a = tl.load(a_base + rk[None, :] * stride_ah, mask=m_mask[:, None], other=0.0, eviction_policy='evict_first')
+        a_scale = tl.load(a_scale_base + (k // 128) * stride_as0, mask=m_mask, other=0.0, eviction_policy='evict_first')
+        b_1 = tl.load(b_base_1 + rk[:, None] * stride_bh, eviction_policy='evict_last')
+        b_3 = tl.load(b_base_3 + rk[:, None] * stride_bh, eviction_policy='evict_last')
+        b_scale_1 = tl.load(b_scale_base_1 + (k // 128) * stride_bsh, eviction_policy='evict_last')
+        b_scale_3 = tl.load(b_scale_base_3 + (k // 128) * stride_bsh, eviction_policy='evict_last')
+        partial_1 = tl.dot(a, b_1, out_dtype=tl.float32)
+        partial_3 = tl.dot(a, b_3, out_dtype=tl.float32)
+        acc_1 += partial_1 * (a_scale[:, None] * b_scale_1)
+        acc_3 += partial_3 * (a_scale[:, None] * b_scale_3)
+
+    sig_out = 1.0 / (1.0 + tl.exp(-acc_3))
+    swiglu_out = (acc_3 * sig_out) * acc_1
+    c_ptrs = C_ptr + out_rm[:, None] * stride_cm + rn[None, :] * stride_cn
     tl.store(c_ptrs, swiglu_out, eviction_policy='evict_first')
 
 
@@ -1494,6 +1661,7 @@ def _t1_fused_gemm1_swiglu_kernel(
 _buf_cache = {}
 _routing_cache = {}
 _sort_cache = {}
+_remapped_gemm1_cache = {}
 _t1_cache = {}
 def _select_block_m(num_topk_tokens: int) -> int:
     if num_topk_tokens <= TINY_BATCH_TOPK_TOKENS:
@@ -1533,6 +1701,14 @@ def _select_gemm_buckets_from_workload(t: int, block_m: int, total_blocks: int) 
     return False, False
 
 
+def _use_remapped_gemm1_large_t_override(
+    t: int,
+    block_m: int,
+    use_exact_dispatch: bool,
+) -> bool:
+    return use_exact_dispatch and block_m == BLOCK_M_XLARGE and t > UPPER_MEDIUM_T_MAX
+
+
 _host_scalar_cache = {}
 
 
@@ -1545,6 +1721,95 @@ def _cached_host_scalar(x, cast_fn):
         _host_scalar_cache[key] = v
         return v
     return cast_fn(x)
+
+
+def _kernel_large_t_remapped_gemm1(
+    sorted_token_ids,
+    sorted_weights,
+    scatter_map,
+    block_offsets,
+    total_blocks,
+    exact_pid_m,
+    block_m,
+    use_small_medium_gemm,
+    use_upper_medium_gemm,
+    remapped_block_offsets,
+    remapped_total_blocks,
+    Intermediate,
+    expert_out,
+    hidden_states,
+    hidden_states_scale,
+    gemm1_weights,
+    gemm1_weights_scale,
+    gemm2_weights,
+    gemm2_weights_scale,
+    output,
+):
+    t = int(output.shape[0])
+    remapped_total_blocks_host = int(remapped_total_blocks.item())
+    if exact_pid_m <= 0:
+        return output
+    if remapped_total_blocks_host <= 0:
+        return output
+
+    grid1 = lambda META: (remapped_total_blocks_host * triton.cdiv(I_SIZE, META['BLOCK_N']),)
+    _mapped_bucket_fused_moe_gemm1_swiglu_kernel[grid1](
+        A_ptr=hidden_states,
+        A_scale_ptr=hidden_states_scale,
+        B_ptr=gemm1_weights,
+        C_ptr=Intermediate,
+        B_scale_ptr=gemm1_weights_scale,
+        canonical_token_ids_ptr=sorted_token_ids,
+        canonical_block_offsets_ptr=block_offsets,
+        block_offsets_ptr=remapped_block_offsets,
+        total_blocks_ptr=remapped_total_blocks,
+        MAX_PID_M=remapped_total_blocks_host, T=t, H=H, N=4096, K=H,
+        stride_at=hidden_states.stride(0), stride_ah=hidden_states.stride(1),
+        stride_as0=hidden_states_scale.stride(0), stride_as1=hidden_states_scale.stride(1),
+        stride_be=gemm1_weights.stride(0), stride_bn=gemm1_weights.stride(1), stride_bh=gemm1_weights.stride(2),
+        stride_cm=Intermediate.stride(0), stride_cn=Intermediate.stride(1),
+        stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
+        E_LOCAL=E_LOCAL,
+        CANONICAL_BLOCK_M=block_m,
+        BLOCK_M=REMAPPED_GEMM1_BLOCK_M,
+    )
+
+    grid2 = lambda META: (exact_pid_m * triton.cdiv(H, META['BLOCK_N']),)
+    if use_small_medium_gemm:
+        gemm2_kernel = _small_medium_fused_moe_gemm2_kernel
+    elif use_upper_medium_gemm:
+        gemm2_kernel = _medium_fused_moe_gemm2_kernel
+    else:
+        gemm2_kernel = _fused_moe_gemm2_kernel
+    gemm2_kernel[grid2](
+        A_ptr=Intermediate,
+        B_ptr=gemm2_weights,
+        C_ptr=expert_out,
+        B_scale_ptr=gemm2_weights_scale,
+        token_weights_ptr=sorted_weights,
+        block_offsets_ptr=block_offsets,
+        total_blocks_ptr=total_blocks,
+        MAX_PID_M=exact_pid_m, N=H, K=I_SIZE,
+        stride_am=Intermediate.stride(0), stride_ak=Intermediate.stride(1),
+        stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1), stride_bk=gemm2_weights.stride(2),
+        stride_cm=expert_out.stride(0), stride_cn=expert_out.stride(1),
+        stride_bse=gemm2_weights_scale.stride(0), stride_bsn=gemm2_weights_scale.stride(1), stride_bsk=gemm2_weights_scale.stride(2),
+        E_LOCAL=E_LOCAL,
+        BLOCK_M=block_m,
+    )
+
+    grid3 = lambda META: (triton.cdiv(t, META['BLOCK_T']) * triton.cdiv(H, META['BLOCK_N']),)
+    _token_reduce_kernel[grid3](
+        expert_out_ptr=expert_out,
+        output_ptr=output,
+        scatter_map_ptr=scatter_map,
+        T_val=t,
+        N=H,
+        TOP_K=TOP_K,
+        stride_em=expert_out.stride(0), stride_en=expert_out.stride(1),
+        stride_ot=output.stride(0), stride_on=output.stride(1),
+    )
+    return output
 
 
 def _kernel_t1(
@@ -1703,6 +1968,9 @@ def kernel(
     block_m = _select_block_m(T * TOP_K)
     MAX_PADDED = T * TOP_K + E_LOCAL * block_m
     MAX_PID_M = MAX_PADDED // block_m
+    use_exact_dispatch = _use_exact_workload_dispatch(T, MAX_PID_M)
+    use_remapped_gemm1 = _use_remapped_gemm1_large_t_override(T, block_m, use_exact_dispatch)
+
     bkey = (T, block_m)
 
     if bkey in _buf_cache:
@@ -1728,6 +1996,15 @@ def kernel(
             sorted_token_ids, sorted_weights, scatter_map,
             block_offsets, total_blocks, counts_workspace, partial_counts, tile_offsets,
         )
+    remapped_block_offsets = None
+    remapped_total_blocks = None
+    if use_remapped_gemm1:
+        if bkey in _remapped_gemm1_cache:
+            remapped_block_offsets, remapped_total_blocks = _remapped_gemm1_cache[bkey]
+        else:
+            remapped_block_offsets = torch.empty((E_LOCAL + 1,), dtype=torch.int32, device=device)
+            remapped_total_blocks = torch.empty((1,), dtype=torch.int32, device=device)
+            _remapped_gemm1_cache[bkey] = (remapped_block_offsets, remapped_total_blocks)
     parallel_sort_and_scatter(
         topk_idx_ws,
         topk_wts_ws,
@@ -1743,12 +2020,13 @@ def kernel(
         block_m,
         MAX_PADDED,
         counts_workspace,
+        remapped_block_offsets=remapped_block_offsets,
+        remapped_total_blocks=remapped_total_blocks,
     )
 
     # Only switch to exact workload dispatch for very large traces where the reduced overlaunch
     # amortizes the single total_blocks host read.
     exact_pid_m = MAX_PID_M
-    use_exact_dispatch = _use_exact_workload_dispatch(T, MAX_PID_M)
     if use_exact_dispatch:
         exact_pid_m = int(total_blocks.item())
         if exact_pid_m <= 0:
@@ -1765,33 +2043,90 @@ def kernel(
         use_small_medium_gemm = _use_small_medium_gemm_bucket(T)
         use_upper_medium_gemm = _use_upper_medium_gemm_bucket(T)
 
+    if use_remapped_gemm1:
+        return _kernel_large_t_remapped_gemm1(
+            sorted_token_ids,
+            sorted_weights,
+            scatter_map,
+            block_offsets,
+            total_blocks,
+            exact_pid_m,
+            block_m,
+            use_small_medium_gemm,
+            use_upper_medium_gemm,
+            remapped_block_offsets,
+            remapped_total_blocks,
+            Intermediate,
+            expert_out,
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm2_weights,
+            gemm2_weights_scale,
+            output,
+        )
+
     # -- 4. Fused GEMM1 + SwiGLU --
     grid1 = lambda META: (exact_pid_m * triton.cdiv(2048, META['BLOCK_N']),)
 
     if use_small_medium_gemm:
-        gemm1_kernel = _small_medium_fused_moe_gemm1_swiglu_kernel
+        _small_medium_fused_moe_gemm1_swiglu_kernel[grid1](
+            A_ptr=hidden_states,
+            A_scale_ptr=hidden_states_scale,
+            B_ptr=gemm1_weights,
+            C_ptr=Intermediate,
+            B_scale_ptr=gemm1_weights_scale,
+            token_ids_ptr=sorted_token_ids,
+            block_offsets_ptr=block_offsets,
+            total_blocks_ptr=total_blocks,
+            MAX_PID_M=exact_pid_m, T=T, H=7168, N=4096, K=7168,
+            stride_at=hidden_states.stride(0), stride_ah=hidden_states.stride(1),
+            stride_as0=hidden_states_scale.stride(0), stride_as1=hidden_states_scale.stride(1),
+            stride_be=gemm1_weights.stride(0), stride_bn=gemm1_weights.stride(1), stride_bh=gemm1_weights.stride(2),
+            stride_cm=Intermediate.stride(0), stride_cn=Intermediate.stride(1),
+            stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
+            E_LOCAL=E_LOCAL,
+            BLOCK_M=block_m,
+        )
     elif use_upper_medium_gemm:
-        gemm1_kernel = _medium_fused_moe_gemm1_swiglu_kernel
+        _medium_fused_moe_gemm1_swiglu_kernel[grid1](
+            A_ptr=hidden_states,
+            A_scale_ptr=hidden_states_scale,
+            B_ptr=gemm1_weights,
+            C_ptr=Intermediate,
+            B_scale_ptr=gemm1_weights_scale,
+            token_ids_ptr=sorted_token_ids,
+            block_offsets_ptr=block_offsets,
+            total_blocks_ptr=total_blocks,
+            MAX_PID_M=exact_pid_m, T=T, H=7168, N=4096, K=7168,
+            stride_at=hidden_states.stride(0), stride_ah=hidden_states.stride(1),
+            stride_as0=hidden_states_scale.stride(0), stride_as1=hidden_states_scale.stride(1),
+            stride_be=gemm1_weights.stride(0), stride_bn=gemm1_weights.stride(1), stride_bh=gemm1_weights.stride(2),
+            stride_cm=Intermediate.stride(0), stride_cn=Intermediate.stride(1),
+            stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
+            E_LOCAL=E_LOCAL,
+            BLOCK_M=block_m,
+        )
     else:
-        gemm1_kernel = _fused_moe_gemm1_swiglu_kernel
-    gemm1_kernel[grid1](
-        A_ptr=hidden_states,
-        A_scale_ptr=hidden_states_scale,
-        B_ptr=gemm1_weights,
-        C_ptr=Intermediate,
-        B_scale_ptr=gemm1_weights_scale,
-        token_ids_ptr=sorted_token_ids,
-        block_offsets_ptr=block_offsets,
-        total_blocks_ptr=total_blocks,
-        MAX_PID_M=exact_pid_m, T=T, H=7168, N=4096, K=7168,
-        stride_at=hidden_states.stride(0), stride_ah=hidden_states.stride(1),
-        stride_as0=hidden_states_scale.stride(0), stride_as1=hidden_states_scale.stride(1),
-        stride_be=gemm1_weights.stride(0), stride_bn=gemm1_weights.stride(1), stride_bh=gemm1_weights.stride(2),
-        stride_cm=Intermediate.stride(0), stride_cn=Intermediate.stride(1),
-        stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
-        E_LOCAL=E_LOCAL,
-        BLOCK_M=block_m,
-    )
+        _fused_moe_gemm1_swiglu_kernel[grid1](
+            A_ptr=hidden_states,
+            A_scale_ptr=hidden_states_scale,
+            B_ptr=gemm1_weights,
+            C_ptr=Intermediate,
+            B_scale_ptr=gemm1_weights_scale,
+            token_ids_ptr=sorted_token_ids,
+            block_offsets_ptr=block_offsets,
+            total_blocks_ptr=total_blocks,
+            MAX_PID_M=exact_pid_m, T=T, H=7168, N=4096, K=7168,
+            stride_at=hidden_states.stride(0), stride_ah=hidden_states.stride(1),
+            stride_as0=hidden_states_scale.stride(0), stride_as1=hidden_states_scale.stride(1),
+            stride_be=gemm1_weights.stride(0), stride_bn=gemm1_weights.stride(1), stride_bh=gemm1_weights.stride(2),
+            stride_cm=Intermediate.stride(0), stride_cn=Intermediate.stride(1),
+            stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
+            E_LOCAL=E_LOCAL,
+            BLOCK_M=block_m,
+        )
 
     # -- 5. GEMM2 (non-atomic, writes to expert_out) --
     grid2 = lambda META: (exact_pid_m * triton.cdiv(7168, META['BLOCK_N']),)

@@ -393,3 +393,62 @@ moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048:
 * 实验：把32路scan expert id的方式换成 预计算和look up
 * 结论：us级别的优化，几乎很像噪声
 
+### 2026-04-02 保留优化：large-T single remapped GEMM1
+
+#### 背景
+
+`0328base` 之后，large-T 路径里最有价值的剩余空间不在 lookup，也不在 cluster，而在 `GEMM1` 的 padding / tile 形态。  
+canonical large-T 路径里 `BLOCK_M=128`，对 `T=11948/14107` 这类 trace，`GEMM1` 仍有明显 padding 浪费；但如果把整条路径一起改小 tile，又会把 `GEMM2` 和整体调度一起打乱。
+
+因此最终保留下来的方案是：**只对 large-T exact-dispatch 路径的 GEMM1 做 remap，GEMM2 和最终 reduce 保持 canonical 路径不变。**
+
+#### 修改内容
+
+在 `solution/triton/kernel.py` 中最终保留了下面这组改动：
+
+* 新增 `_use_remapped_gemm1_large_t_override(t, block_m, use_exact_dispatch)`，仅在 `use_exact_dispatch && block_m == 128 && T > 128` 时启用
+* 保留现有 routing 和 canonical sort / scatter
+* 在 sort layout 阶段同时产出两套 offsets：
+  * canonical `block_offsets / total_blocks`
+  * remapped `remapped_block_offsets / remapped_total_blocks`
+* 新增 `triton_sort_layout_with_remap_kernel(...)`，把 canonical / remapped layout 合并到一次 layout kernel 中
+* `GEMM1` 改走 `_mapped_bucket_fused_moe_gemm1_swiglu_kernel`
+  * remapped `BLOCK_M = 64`
+  * token 仍然从 canonical `sorted_token_ids` 读取
+  * 输出直接写回 canonical `Intermediate`
+* 去掉显式 `row_map` buffer，改成在 kernel 内基于
+  * `canonical_block_offsets_ptr`
+  * `remapped_block_offsets_ptr`
+  做算术映射
+* `GEMM2` 继续走 canonical `_fused_moe_gemm2_kernel`
+* 最终 `token_reduce` 保持原样
+
+#### 实测效果
+
+相对 `0328base`，这条优化在 large-T 上有稳定正收益：
+
+* `T=11948`
+  * `Wall: 3.447 ms -> 3.370 ms`，约 `-2.2%`
+  * `GEMM1: 1.355 ms -> 1.268 ms`，约 `-6.4%`
+  * `GEMM2: 1.603 ms -> 1.599 ms`，基本持平
+* `T=14107`
+  * `Wall: 4.937 ms -> 4.769 ms`，约 `-3.4%`
+  * `GEMM1: 1.973 ms -> 1.819 ms`，约 `-7.8%`
+  * `GEMM2: 2.340 ms -> 2.362 ms`，约 `+0.9%`
+
+从 profiler 看，large-T 的 top GEMM1 kernel 已经切到 `_mapped_bucket_fused_moe_gemm1_swiglu_kernel`，说明收益来源比较干净，确实来自 remapped GEMM1 本体。
+
+#### 结论
+
+这条优化真正有效的点，不是 dual-bucket，也不是改 `GEMM2`，而是：
+
+* **只重排 large-T GEMM1**
+* **把 GEMM1 的 tile 从 canonical `BLOCK_M=128` 改成 remapped `BLOCK_M=64`**
+* **GEMM2 / reduce 保持 canonical，不把收益再吃回去**
+
+后续如果继续围绕这条线优化，优先级应该放在：
+
+* 继续压 remapped GEMM1 辅助路径的固定成本
+* 再评估 remapped GEMM1 的 autotune shortlist
+
+而不是重新回到 dual-bucket、cluster、lookup-only 这些已经被证伪或收益很弱的方向。
