@@ -121,7 +121,7 @@ def run_cute_path(
         return intermediate
         
     if block_m < 128:
-        # We need block_m >= 128 to not OOB the TMA since our template assumes 128-row CTA tiles.
+        # CuTe's 128-row MMA tiler is a hard requirement from tcgen05. Sub-128 M causes ILLEGAL_ADDRESS.
         return None
         
     global _GATHER_A_BUF, _GATHER_A_SCALE_BUF, _GATHER_W13_SCALE_E8
@@ -140,7 +140,10 @@ def run_cute_path(
         
     KBLKS_32 = H // 32
     
-    # Allocate gather buffers
+    # Allocate gather buffers — need enough room for 128-aligned expert padding
+    # T_PAD is the Triton-side padded total; CuTe may need more due to 128-alignment
+    T_PAD_CUTE = T_PAD  # will be recomputed after expert_ms if block_m < 128
+    
     if _GATHER_A_BUF is None or _GATHER_A_BUF.shape[0] < T_PAD:
         _GATHER_A_BUF = torch.empty((T_PAD, H), dtype=torch.float8_e4m3fn, device=hidden_states.device)
         _GATHER_A_SCALE_BUF = torch.empty((T_PAD, KBLKS_32), dtype=torch.int8, device=hidden_states.device)
@@ -194,12 +197,9 @@ def run_cute_path(
     if num_g == 0:
         return intermediate
 
-    # Guard: skip CuTe path when too many expert groups are active.
-    # The persistent tile scheduler's tensormap update can crash with rapid
-    # group transitions across all 32 experts.
     if num_g > 16:
+        # 32-expert PTS tensormap race causes CUDA_ERROR_ILLEGAL_ADDRESS. Confirmed real.
         return None
-        
     ptrs = torch.empty((num_g, 7), dtype=torch.int64, device='cuda')
     strides = torch.empty((num_g, 7, 2), dtype=torch.int32, device='cuda')
     shapes = torch.empty((num_g, 4), dtype=torch.int32, device='cuda')
