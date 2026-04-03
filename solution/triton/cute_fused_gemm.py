@@ -198,8 +198,10 @@ def run_cute_path(
         return intermediate
 
     if num_g > 16:
-        # 32-expert PTS tensormap race causes CUDA_ERROR_ILLEGAL_ADDRESS. Confirmed real.
+        # 32-expert workloads crash CuTe even with batch splitting (ILLEGAL_ADDRESS in 2nd batch).
+        # Root cause is structural in PTS — not fixable with host-side workarounds.
         return None
+        
     ptrs = torch.empty((num_g, 7), dtype=torch.int64, device='cuda')
     strides = torch.empty((num_g, 7, 2), dtype=torch.int32, device='cuda')
     shapes = torch.empty((num_g, 4), dtype=torch.int32, device='cuda')
@@ -247,10 +249,6 @@ def run_cute_path(
     _CUTE_KERNEL.tensormaps = p_tmaps
     total_tile_clusters = int(sum(((m + 127) // 128) * ((N_DIM + 127) // 128) for m in expert_list))
     
-    # ---- PHASE 4: Descriptor setup done ----
-    if _CUTE_DEBUG_PHASE <= 4:
-        raise RuntimeError(f"CUTE_PHASE_4_DESC_OK: num_g={num_g}, tiles={total_tile_clusters}")
-
     cache_key = (num_g, total_tile_clusters)
     if cache_key not in _CUTE_COMPILED_CACHE:
         try:
@@ -261,16 +259,7 @@ def run_cute_path(
             print(f"JIT compile failed for {cache_key}: {e}", flush=True)
             raise RuntimeError(f"CuTe JIT Failed: {e}")
 
-    # ---- PHASE 5: JIT done ----
-    if _CUTE_DEBUG_PHASE <= 5:
-        raise RuntimeError(f"CUTE_PHASE_5_JIT_OK: cache_key={cache_key}")
-
     _CUTE_COMPILED = _CUTE_COMPILED_CACHE[cache_key]
-    
-    # No sync before kernel
-    
     _CUTE_COMPILED(init_a, init_b_w1, init_b_w3, init_sfa, init_sfb_w1, init_sfb_w3, init_c, num_g, p_shape, p_ptrs, p_strides, total_tile_clusters, p_tmaps, _CUTE_MAX_CLUSTERS, _CUTE_STREAM)
-    
-    # No sync after kernel (stream order)
     
     return intermediate
