@@ -107,13 +107,19 @@ offset_m = e_starts[e_idx] * block_m
 **修复:** `kernel.py` 添加条件: `if T > 1 and block_m >= 128:`
 
 ### 2.8 Fix 8: Expert 数量 guard (`num_g <= 16`)
-**问题:** 当所有 32 个 expert 都有 token 时 (`num_g = 32`)，persistent tile scheduler 的 tensormap update 在频繁 group 切换时触发 `CUDA_ERROR_ILLEGAL_ADDRESS`，导致 CUDA context 不可恢复地损坏。
+**问题:** 当所有 32 个 expert 都有 token 时 (`num_g = 32`)，persistent tile scheduler 的 tensormap update 触发 `CUDA_ERROR_ILLEGAL_ADDRESS`。
 **修复:** `run_cute_path()` 中添加 guard:
 ```python
 if num_g > 16:
     return None  # 信号 caller 使用 Triton fallback
 ```
-**后续:** Guard 已移除。实测发现那两个 32-expert workload 的 `block_m < 128`，dispatch 层天然走 Triton，CuTe 路径根本不会被触发。
+**阶段二深入调查 (5 个实验全部失败):**
+- 去掉 `block_m >= 128` → tcgen05 128-row MMA 是硬件硬约束
+- 强制 `block_m = 128` → 暴露 `num_g > 16` 是独立 bug
+- 切 `TensorMapUpdateMode.GMEM` → kernel 绑定 SMEM 指令，`ILLEGAL_INSTRUCTION`
+- Batch Split (16+16) → Batch 1 ✅ Batch 2 ❌ → 不是 group count 问题
+- Batch Split + `torch.cuda.synchronize()` → 依然崩 → 不是 timing race
+- **结论:** Experts 16-31 存在结构性 ILLEGAL_ADDRESS，疑似 CuTe DSL/PTS high group_idx 内部 bug
 
 ### 2.9 Fix 9: 移除 `torch.cuda.synchronize()` (阶段一)
 **问题:** `cute_fused_gemm.py` 中有 4 处显式 `torch.cuda.synchronize()`。由于所有 kernel 都在同一个 CUDA stream 上排队，这些 sync 纯属不必要的 CPU 阻塞，且每次引入 ~20-50μs 延迟。
@@ -131,10 +137,10 @@ if num_g > 16:
 
 | 路径 | Workload 数 | 延迟范围 | 加速比 |
 |------|-----------|---------|--------|
-| CuTe | 17 | 0.284ms - 1.071ms | **28× - 46×** |
-| Triton fallback | 2 | 3.915ms - 5.529ms | **10× - 11×** |
+| CuTe | 17 | 0.245ms - 1.018ms | **29× - 53×** |
+| Triton fallback | 2 | 3.891ms - 5.425ms | **10× - 11×** |
 
-*注：两个 Triton fallback workload 是 32-expert 超大 batch，`block_m < 128`，天然走 Triton 路径。*
+*注：两个 Triton fallback workload 的 `num_g > 16`，触发 CuTe guard 走 Triton。即使用 block_m=128 + batch split 也无法解决（结构性 ILLEGAL_ADDRESS）。*
 
 ### 3.2 CuTe 路径触发条件
 
@@ -161,20 +167,21 @@ CuTe kernel 按 `(num_g, total_tile_clusters)` 做缓存。相同配置不重复
   - 移除了全部 4 处显式 sync
   - scale factor 转换结果缓存到 `_GATHER_W13_SCALE_CACHE`
 
-- [ ] **让 32-expert workload 走 CuTe 路径**
-  - 当前这两个 workload 的 `block_m < 128`，被 dispatch 层天然拦截
-  - 需要放宽 CuTe 的 `block_m >= 128` 限制，或在 kernel 内部处理 padding
-  - 前提：验证小 M 维度 tile 的 TMA 安全性
-
-- [ ] **Cluster Shape (2,1) 或 (1,2)**
-  - 当前 cluster = (1,1)，每个 CTA 独立
-  - Blackwell 支持 CTA cluster 共享 SMEM，可减少 TMA 加载量
-  - 需要调整 mcast_mask 和 共享存储 layout
+- [x] **让 32-expert workload 走 CuTe 路径** *(阶段二 — 结构性障碍，暂时搁置)*
+  - tcgen05 的 128-row MMA 是硬件硬约束 → `block_m < 128` 无法绕过
+  - `num_g > 16` 时 CuTe DSL/PTS 存在结构性 ILLEGAL_ADDRESS
+  - Batch Split、GMEM Mode、Sync 全部失败
+  - **需等待 CUTLASS 新版修复 或 NVIDIA 团队介入**
 
 - [ ] **Gather Kernel → CuTe TMA Indirect Gather (阶段三终极目标)**
   - 当前先用 Triton kernel gather 到临时 buffer，再用 CuTe kernel 读取
   - Blackwell TMA 硬件级支持 Scatter/Gather (Indirect Fetch)
   - 消除中间 buffer 和一次额外的全局内存 round-trip
+
+- [ ] **Cluster Shape (2,1) 或 (1,2) (阶段四)**
+  - 当前 cluster = (1,1)，每个 CTA 独立
+  - Blackwell 支持 CTA cluster 共享 SMEM，可减少 TMA 加载量
+  - 需要调整 mcast_mask 和 共享存储 layout
 
 ---
 
@@ -186,8 +193,12 @@ CuTe kernel 按 `(num_g, total_tile_clusters)` 做缓存。相同配置不重复
 | 2D init tensor (无 unsqueeze) | `local_tile` rank mismatch (`3 vs 2`) |
 | 硬编码 `T_PAD = total_blks * 64` | Block size mismatch → ILLEGAL_ADDRESS |
 | try/except 捕获 CUDA crash | CUDA context 损坏后所有后续操作都会失败，无法恢复 |
-| `num_g = 32` (全 expert active) | 实测 block_m < 128 天然走 Triton，CuTe 根本不触发 |
-| 32-slot SMEM tensormap buffer | 28KB SMEM 膨胀导致 ~10% 性能回退，且不影响 32-expert dispatch |
+| 32-slot SMEM tensormap buffer | 28KB SMEM 膨胀导致 ~10% 性能回退 |
+| 去掉 `block_m >= 128` guard | tcgen05 128-row MMA 是硬件硬约束，ILLEGAL_ADDRESS |
+| 强制 `block_m = 128` for all | 暴露 `num_g > 16` 独立 bug |
+| `TensorMapUpdateMode.GMEM` | kernel 代码绑定 SMEM tensormap 管理，切 GMEM → ILLEGAL_INSTRUCTION (715) |
+| Batch Split (16+16) | Batch 1 成功，Batch 2 crash → 不是 group count 问题 |
+| Batch Split + `torch.cuda.synchronize()` | 加 sync 依然结构性崩溃 → 不是 timing/race |
 
 ---
 
@@ -195,13 +206,13 @@ CuTe kernel 按 `(num_g, total_tile_clusters)` 做缓存。相同配置不重复
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| CuTe 路径入口 guard | `kernel.py` | L1774 |
-| `run_cute_path()` 主函数 | `cute_fused_gemm.py` | L111-272 |
+| CuTe 路径入口 guard | `kernel.py` | L1779 |
+| `run_cute_path()` 主函数 | `cute_fused_gemm.py` | L111-266 |
 | Gather kernel (Triton) | `cute_fused_gemm.py` | L67-109 |
 | Scale factor e8m0 转换 | `cute_fused_gemm.py` | L157-171 |
-| Per-expert ptrs/strides 构建 | `cute_fused_gemm.py` | L203-235 |
-| JIT 编译 & cache | `cute_fused_gemm.py` | L249-257 |
-| `num_g > 16` guard | `cute_fused_gemm.py` | L195-196 |
+| `num_g > 16` guard | `cute_fused_gemm.py` | L200-202 |
+| Per-expert ptrs/strides 构建 | `cute_fused_gemm.py` | L205-244 |
+| JIT 编译 & cache | `cute_fused_gemm.py` | L252-260 |
 | Kernel class 定义 | `cute_kernel.py` | L15-45 |
 | `_compute_grid` | `cute_kernel.py` | L130-146 |
 | `__call__` (JIT 入口) | `cute_kernel.py` | L148-154 |
