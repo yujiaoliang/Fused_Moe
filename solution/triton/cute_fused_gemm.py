@@ -62,7 +62,7 @@ except Exception as e:
 
 _GATHER_A_BUF = None
 _GATHER_A_SCALE_BUF = None
-_GATHER_W13_SCALE_E8 = None
+_GATHER_W13_SCALE_CACHE = {}
 
 @triton.jit
 def tma_gather_a_explicit(
@@ -120,6 +120,10 @@ def run_cute_path(
     if not _USE_CUTE:
         return intermediate
         
+    if block_m < 128:
+        # We need block_m >= 128 to not OOB the TMA since our template assumes 128-row CTA tiles.
+        return None
+        
     global _GATHER_A_BUF, _GATHER_A_SCALE_BUF, _GATHER_W13_SCALE_E8
     
     # ---- PHASE 1: Just enter and return (NO CUDA ops at all) ----
@@ -141,34 +145,35 @@ def run_cute_path(
         _GATHER_A_BUF = torch.empty((T_PAD, H), dtype=torch.float8_e4m3fn, device=hidden_states.device)
         _GATHER_A_SCALE_BUF = torch.empty((T_PAD, KBLKS_32), dtype=torch.int8, device=hidden_states.device)
     
-    torch.cuda.synchronize()
+    # (Synchronize removed to allow async execution)
     
     tma_gather_a_explicit[(triton.cdiv(T_PAD, 64),)](
         hidden_states, hidden_states_scale,
         _GATHER_A_BUF, _GATHER_A_SCALE_BUF,
         sorted_token_ids, T_PAD, T_TOTAL, H, KBLKS_32, BLOCK_M=64
     )
-    torch.cuda.synchronize()
+    # (Synchronize removed)
     
     # ---- PHASE 2: Gather done ----
     if _CUTE_DEBUG_PHASE <= 2:
         raise RuntimeError(f"CUTE_PHASE_2_GATHER_OK: T_PAD={T_PAD}, T_TOTAL={T_TOTAL}")
     
     sfa = _GATHER_A_SCALE_BUF[:T_PAD].view(torch.float8_e8m0fnu).contiguous()
-    
-    if _GATHER_W13_SCALE_E8 is None:
-        E_GLOBAL = gemm1_weights.shape[0]
-        NBLKS = gemm1_weights_scale.shape[1]
-        
+    cache_key_w = id(gemm1_weights_scale)
+    if cache_key_w not in _GATHER_W13_SCALE_CACHE:
         safe_w_scale = torch.clamp(gemm1_weights_scale, min=1e-15)
         exponent = torch.round(torch.log2(safe_w_scale)).to(torch.int32)
         e8_bytes = (exponent + 127).to(torch.uint8)
         
         expanded_e8 = e8_bytes.repeat_interleave(4, dim=1).repeat_interleave(4, dim=2)
         _GATHER_W13_SCALE_E8 = expanded_e8.view(torch.float8_e8m0fnu).contiguous()
+        
+        _GATHER_W13_SCALE_CACHE[cache_key_w] = (
+            _GATHER_W13_SCALE_E8[:, :N_DIM//32, :].contiguous(),
+            _GATHER_W13_SCALE_E8[:, N_DIM//32:, :].contiguous()
+        )
     
-    sfb_w1 = _GATHER_W13_SCALE_E8[:, :N_DIM//32, :].contiguous()
-    sfb_w3 = _GATHER_W13_SCALE_E8[:, N_DIM//32:, :].contiguous()
+    sfb_w1, sfb_w3 = _GATHER_W13_SCALE_CACHE[cache_key_w]
     
     # ---- PHASE 3: Scale conversion done ----
     if _CUTE_DEBUG_PHASE <= 3:
@@ -262,10 +267,10 @@ def run_cute_path(
 
     _CUTE_COMPILED = _CUTE_COMPILED_CACHE[cache_key]
     
-    torch.cuda.synchronize()
+    # No sync before kernel
     
     _CUTE_COMPILED(init_a, init_b_w1, init_b_w3, init_sfa, init_sfb_w1, init_sfb_w3, init_c, num_g, p_shape, p_ptrs, p_strides, total_tile_clusters, p_tmaps, _CUTE_MAX_CLUSTERS, _CUTE_STREAM)
     
-    torch.cuda.synchronize()
+    # No sync after kernel (stream order)
     
     return intermediate
