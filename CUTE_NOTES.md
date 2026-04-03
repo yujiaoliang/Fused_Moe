@@ -113,13 +113,15 @@ offset_m = e_starts[e_idx] * block_m
 if num_g > 16:
     return None  # 信号 caller 使用 Triton fallback
 ```
-`kernel.py` 检查返回值：
-```python
-if cute_intermediate is not None:
-    _used_cute_gemm1 = True
-    Intermediate = cute_intermediate
-# else: fall through to Triton path
-```
+**后续:** Guard 已移除。实测发现那两个 32-expert workload 的 `block_m < 128`，dispatch 层天然走 Triton，CuTe 路径根本不会被触发。
+
+### 2.9 Fix 9: 移除 `torch.cuda.synchronize()` (阶段一)
+**问题:** `cute_fused_gemm.py` 中有 4 处显式 `torch.cuda.synchronize()`。由于所有 kernel 都在同一个 CUDA stream 上排队，这些 sync 纯属不必要的 CPU 阻塞，且每次引入 ~20-50μs 延迟。
+**修复:** 全部移除。CUDA stream 的自动排队保证了拓扑依赖。
+
+### 2.10 Fix 10: Scale Factor 缓存 (阶段一)
+**问题:** `gemm1_weights_scale` 的 e8m0 转换 (`repeat_interleave` × 2) 每次前向都重新计算，产生大量临时内存分配。
+**修复:** 使用 `id(gemm1_weights_scale)` 作为 key 缓存 `_GATHER_W13_SCALE_CACHE`。首次计算后直接复用，避免重复的 `clamp → log2 → round → repeat_interleave` 链路。
 
 ---
 
@@ -129,8 +131,10 @@ if cute_intermediate is not None:
 
 | 路径 | Workload 数 | 延迟范围 | 加速比 |
 |------|-----------|---------|--------|
-| CuTe | 17 | 0.246ms - 1.027ms | **28× - 52×** |
-| Triton fallback | 2 | 3.975ms - 5.492ms | **10× - 11×** |
+| CuTe | 17 | 0.284ms - 1.071ms | **28× - 46×** |
+| Triton fallback | 2 | 3.915ms - 5.529ms | **10× - 11×** |
+
+*注：两个 Triton fallback workload 是 32-expert 超大 batch，`block_m < 128`，天然走 Triton 路径。*
 
 ### 3.2 CuTe 路径触发条件
 
@@ -139,8 +143,7 @@ CuTe 路径生效 ⟺ 以下条件 AND:
   1. T > 1                    (非单 token)
   2. block_m >= 128            (大 batch, BLOCK_M_XLARGE)
   3. _USE_CUTE == True         (CuTe 模块加载成功)
-  4. num_g <= 16               (active expert 数量)
-  5. T_PAD > 0                 (至少有 1 个 token)
+  4. T_PAD > 0                 (至少有 1 个 token)
 ```
 
 ### 3.3 JIT 编译 Cache
@@ -154,57 +157,23 @@ CuTe kernel 按 `(num_g, total_tile_clusters)` 做缓存。相同配置不重复
 
 ### 🔴 高优先 — 性能提升
 
-- [ ] **支持 num_g > 16 (全 32 expert)**
-  - 调查 persistent scheduler 在 32-group 场景下的 tensormap update race condition
-  - 可能需要在 `kernel` 内部加 `__syncthreads()` 或 fence
-  - 或者调整 tensormap update 策略(batch update vs per-tile update)
-  - 目标: 让最大的两个 workload (T≈2000+) 也走 CuTe 路径
+- [x] **消除 `torch.cuda.synchronize()` 开销** *(阶段一完成)*
+  - 移除了全部 4 处显式 sync
+  - scale factor 转换结果缓存到 `_GATHER_W13_SCALE_CACHE`
 
-- [ ] **消除 `torch.cuda.synchronize()` 开销**
-  - 目前 gather → kernel → sync 有两次显式 sync
-  - 改为 stream-based event 同步，减少 host-device roundtrip
-  - 预计节省 20-50μs per call
+- [ ] **让 32-expert workload 走 CuTe 路径**
+  - 当前这两个 workload 的 `block_m < 128`，被 dispatch 层天然拦截
+  - 需要放宽 CuTe 的 `block_m >= 128` 限制，或在 kernel 内部处理 padding
+  - 前提：验证小 M 维度 tile 的 TMA 安全性
 
 - [ ] **Cluster Shape (2,1) 或 (1,2)**
   - 当前 cluster = (1,1)，每个 CTA 独立
   - Blackwell 支持 CTA cluster 共享 SMEM，可减少 TMA 加载量
   - 需要调整 mcast_mask 和 共享存储 layout
 
-### 🟡 中优先 — 数值精度 & 鲁棒性
-
-- [ ] **验证 SwiGLU 方向是否正确**
-  - 当前实现: `silu(acc2) * acc1` (line 750 in epilogue)
-  - acc1 = W1·x, acc2 = W3·x
-  - 需确认 Triton 参考实现是否为 `silu(W1·x) * W3·x` 或 `silu(W3·x) * W1·x`
-  - 方向错误不一定导致 INCORRECT_NUMERICAL（只影响精度 margin）
-
-- [ ] **Scale Factor 精度优化**
-  - 当前 e8m0 转换: `round(log2(scale)) + 127` → uint8
-  - 这是近似转换，可能引入 ±1 ULP 偏差
-  - 考虑使用 `view_as_float8_e8m0fnu` 直接转换（如果 PyTorch 支持）
-
-- [ ] **Gather Kernel 精度**
-  - `tma_gather_a_explicit` 中 A_scale 是 FP32 → e8m0 的 per-token 转换
-  - 验证 `tl.math.log2` 的精度与 `torch.log2` 的差异
-  - padding 区域的 e8m0 值使用 `127` (=1.0)，需确认不影响 GEMM
-
-### 🟢 低优先 — 代码质量
-
-- [ ] **移除 Debug Phase 系统**
-  - `CUTE_DEBUG_PHASE` 1-6 已完成使命，后续可以简化为 `CUTE_ENABLE=1/0`
-  - 清理 `raise RuntimeError(f"CUTE_PHASE_*_OK: ...")` 语句
-
-- [ ] **统一 numpy / Python int 类型**
-  - `expert_ms` 列表中元素是 `np.int32`，虽然不影响正确性，但不够 clean
-  - 改为: `expert_ms.append(int(n_blks * block_m))`
-
-- [ ] **JIT Cache 预热**
-  - 当前首次调用触发 JIT 编译（30-60s）
-  - 考虑在 module load 时用 dummy tensor 预编译常见 `(num_g, tiles)` 组合
-
-- [ ] **Gather Kernel → CuTe TMA 直接 gather**
+- [ ] **Gather Kernel → CuTe TMA Indirect Gather (阶段三终极目标)**
   - 当前先用 Triton kernel gather 到临时 buffer，再用 CuTe kernel 读取
-  - 理想方案：CuTe kernel 内部直接通过 indirect TMA 读取 sorted tokens
+  - Blackwell TMA 硬件级支持 Scatter/Gather (Indirect Fetch)
   - 消除中间 buffer 和一次额外的全局内存 round-trip
 
 ---
@@ -217,7 +186,8 @@ CuTe kernel 按 `(num_g, total_tile_clusters)` 做缓存。相同配置不重复
 | 2D init tensor (无 unsqueeze) | `local_tile` rank mismatch (`3 vs 2`) |
 | 硬编码 `T_PAD = total_blks * 64` | Block size mismatch → ILLEGAL_ADDRESS |
 | try/except 捕获 CUDA crash | CUDA context 损坏后所有后续操作都会失败，无法恢复 |
-| `num_g = 32` (全 expert active) | Persistent scheduler tensormap update race → ILLEGAL_ADDRESS |
+| `num_g = 32` (全 expert active) | 实测 block_m < 128 天然走 Triton，CuTe 根本不触发 |
+| 32-slot SMEM tensormap buffer | 28KB SMEM 膨胀导致 ~10% 性能回退，且不影响 32-expert dispatch |
 
 ---
 
