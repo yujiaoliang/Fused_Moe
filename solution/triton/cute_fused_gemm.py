@@ -126,10 +126,7 @@ def run_cute_path(
         
     global _GATHER_A_BUF, _GATHER_A_SCALE_BUF, _GATHER_W13_SCALE_E8
     
-    # ---- PHASE 1: Just enter and return (NO CUDA ops at all) ----
-    if _CUTE_DEBUG_PHASE <= 1:
-        raise RuntimeError(f"CUTE_PHASE_1_ENTRY_ONLY")
-    
+    # ---- EARLY EXIT: check num_g BEFORE any GPU work ----
     total_blks_host = int(total_blocks.item())
     T_PAD = total_blks_host * block_m
     T_TOTAL, H = hidden_states.shape
@@ -137,29 +134,29 @@ def run_cute_path(
     
     if T_PAD == 0:
         return intermediate
-        
+    
+    # Check expert count early — avoid wasted gather/alloc for fallback workloads
+    e_starts = block_offsets.cpu().numpy()
+    num_experts = len(e_starts) - 1
+    num_g = sum(1 for e in range(num_experts) if (e_starts[e+1] - e_starts[e]) > 0)
+    
+    if num_g > 16:
+        # 32-expert workloads crash CuTe (structural ILLEGAL_ADDRESS).
+        # Return None BEFORE any GPU work to avoid penalizing Triton fallback.
+        return None
+    
     KBLKS_32 = H // 32
     
-    # Allocate gather buffers — need enough room for 128-aligned expert padding
-    # T_PAD is the Triton-side padded total; CuTe may need more due to 128-alignment
-    T_PAD_CUTE = T_PAD  # will be recomputed after expert_ms if block_m < 128
-    
+    # ---- Gather A into contiguous buffer ----
     if _GATHER_A_BUF is None or _GATHER_A_BUF.shape[0] < T_PAD:
         _GATHER_A_BUF = torch.empty((T_PAD, H), dtype=torch.float8_e4m3fn, device=hidden_states.device)
         _GATHER_A_SCALE_BUF = torch.empty((T_PAD, KBLKS_32), dtype=torch.int8, device=hidden_states.device)
-    
-    # (Synchronize removed to allow async execution)
     
     tma_gather_a_explicit[(triton.cdiv(T_PAD, 64),)](
         hidden_states, hidden_states_scale,
         _GATHER_A_BUF, _GATHER_A_SCALE_BUF,
         sorted_token_ids, T_PAD, T_TOTAL, H, KBLKS_32, BLOCK_M=64
     )
-    # (Synchronize removed)
-    
-    # ---- PHASE 2: Gather done ----
-    if _CUTE_DEBUG_PHASE <= 2:
-        raise RuntimeError(f"CUTE_PHASE_2_GATHER_OK: T_PAD={T_PAD}, T_TOTAL={T_TOTAL}")
     
     sfa = _GATHER_A_SCALE_BUF[:T_PAD].view(torch.float8_e8m0fnu).contiguous()
     cache_key_w = id(gemm1_weights_scale)
@@ -177,30 +174,18 @@ def run_cute_path(
         )
     
     sfb_w1, sfb_w3 = _GATHER_W13_SCALE_CACHE[cache_key_w]
-    
-    # ---- PHASE 3: Scale conversion done ----
-    if _CUTE_DEBUG_PHASE <= 3:
-        raise RuntimeError(f"CUTE_PHASE_3_SCALES_OK: sfa={sfa.shape}, sfb_w1={sfb_w1.shape}")
 
-    # Convert active blocks into ptr distributions
+    # Build per-expert pointer table
     expert_ms = []
-    e_starts = block_offsets.cpu().numpy()
-    num_experts = len(e_starts) - 1
     for e in range(num_experts):
         n_blks = e_starts[e+1] - e_starts[e]
         expert_ms.append(n_blks * block_m)
         
-    num_g = sum(1 for me in expert_ms if me > 0)
     expert_list = [me for me in expert_ms if me > 0]
     e_idx_list = [i for i, me in enumerate(expert_ms) if me > 0]
     
     if num_g == 0:
         return intermediate
-
-    if num_g > 16:
-        # 32-expert workloads crash CuTe even with batch splitting (ILLEGAL_ADDRESS in 2nd batch).
-        # Root cause is structural in PTS — not fixable with host-side workarounds.
-        return None
         
     ptrs = torch.empty((num_g, 7), dtype=torch.int64, device='cuda')
     strides = torch.empty((num_g, 7, 2), dtype=torch.int32, device='cuda')

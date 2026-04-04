@@ -24,7 +24,8 @@ TRACE_SET_PATH = "/data/mlsys26-contest"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "cuda-python", "nvidia-cutlass-dsl>=0.1.0")
+    .env({"CUTE_DEBUG_PHASE": "6", "CUDA_LAUNCH_BLOCKING": "1"})
 )
 
 

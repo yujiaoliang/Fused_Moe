@@ -2087,6 +2087,7 @@ def kernel(
                 Intermediate = cute_intermediate
 
     if not _used_cute_gemm1:
+        grid1 = lambda META: (exact_pid_m * triton.cdiv(2048, META['BLOCK_N']),)
         if use_small_medium_gemm:
             _small_medium_fused_moe_gemm1_swiglu_kernel[grid1](
                 A_ptr=hidden_states,
