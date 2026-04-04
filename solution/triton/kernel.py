@@ -2076,7 +2076,7 @@ def kernel(
     # -- 4. Fused GEMM1 + SwiGLU --
     # Try CuTe path for GEMM1 only (replaces the Triton GEMM1 kernel)
     _used_cute_gemm1 = False
-    if T > 1 and block_m >= 128:
+    if T > 1 and block_m >= 128 and not use_exact_dispatch:
         from .cute_fused_gemm import _USE_CUTE, run_cute_path, _CUTE_DEBUG_PHASE
         if _USE_CUTE:
             cute_intermediate = run_cute_path(
