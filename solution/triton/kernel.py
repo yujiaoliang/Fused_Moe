@@ -1706,7 +1706,10 @@ def _use_remapped_gemm1_large_t_override(
     block_m: int,
     use_exact_dispatch: bool,
 ) -> bool:
-    return use_exact_dispatch and block_m == BLOCK_M_XLARGE and t > UPPER_MEDIUM_T_MAX
+    # Cap at T=4096: for very large T the remapped path (BLOCK_M=64) accumulates
+    # too much FP8 precision error → INCORRECT_NUMERICAL on T=11948/14107 workloads.
+    # The non-remapped path (BLOCK_M=128) is slightly slower but numerically correct.
+    return use_exact_dispatch and block_m == BLOCK_M_XLARGE and UPPER_MEDIUM_T_MAX < t <= EXACT_WORKLOAD_DISPATCH_T_MIN
 
 
 _host_scalar_cache = {}
