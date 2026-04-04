@@ -129,18 +129,28 @@ if num_g > 16:
 **问题:** `gemm1_weights_scale` 的 e8m0 转换 (`repeat_interleave` × 2) 每次前向都重新计算，产生大量临时内存分配。
 **修复:** 使用 `id(gemm1_weights_scale)` 作为 key 缓存 `_GATHER_W13_SCALE_CACHE`。首次计算后直接复用，避免重复的 `clamp → log2 → round → repeat_interleave` 链路。
 
+### 2.11 Fix 11: `num_g > 16` 提前退出 (Early Exit)
+**问题:** `num_g > 16` guard 位于 `run_cute_path()` 的 L200（太晚），在返回 `None` 之前已经执行了：`total_blocks.item()` (CPU-GPU sync)、`_GATHER_A_BUF` 分配、完整的 Triton gather kernel、`block_offsets.cpu()` (第二次 sync)。这些无用的 GPU 工作导致那 2 个 32-expert 的 Triton fallback workload 性能从 ~43x 暴跌到 ~10x。
+**修复:** 将 `block_offsets.cpu()` 和 `num_g` 检查移到 gather kernel 之前，确保 early exit 时只有一次不可避免的 `total_blocks.item()` sync。
+
+### 2.12 Fix 12: Cherry-pick 合并丢失 `grid1` 定义
+**问题:** 将 master 的 `c7bf4ad` (large-T remapped GEMM1) cherry-pick 到 CuTe-dev 时，合并冲突解决遗漏了 `grid1 = lambda META: ...` 的定义。导致 Triton GEMM1 fallback 路径全部 `NameError: name 'grid1' is not defined`。
+**修复:** 在 `if not _used_cute_gemm1:` 块内恢复 `grid1` 定义。
+
 ---
 
 ## 3. 当前状态
 
-### 3.1 测试结果 (19/19 PASSED ✅)
+### 3.1 A/B Test 对比 (CuTe vs 纯 Triton，同一 `test_modal.py` 环境)
 
-| 路径 | Workload 数 | 延迟范围 | 加速比 |
-|------|-----------|---------|--------|
-| CuTe | 17 | 0.245ms - 1.018ms | **29× - 53×** |
-| Triton fallback | 2 | 3.891ms - 5.425ms | **10× - 11×** |
+| 指标 | A: Pure Triton (main) | B: CuTe+Triton (CuTe-dev) |
+|------|----------------------|---------------------------|
+| PASSED | 17/19 | 17/19 |
+| Mean (17 passed) | 43.23× | **45.62×** (+5.5%) |
+| Peak | 48.73× | **52.19×** |
+| Median | 43.71× | **45.95×** |
 
-*注：两个 Triton fallback workload 的 `num_g > 16`，触发 CuTe guard 走 Triton。即使用 block_m=128 + batch split 也无法解决（结构性 ILLEGAL_ADDRESS）。*
+*CuTe 在全部 17 个 PASSED workload 上赢或持平。2 个 INCORRECT_NUMERICAL workload (5e8dc11c, 58a34f27) 在纯 Triton 下也同样失败 — 不是 CuTe 引入的问题。*
 
 ### 3.2 CuTe 路径触发条件
 
@@ -149,7 +159,8 @@ CuTe 路径生效 ⟺ 以下条件 AND:
   1. T > 1                    (非单 token)
   2. block_m >= 128            (大 batch, BLOCK_M_XLARGE)
   3. _USE_CUTE == True         (CuTe 模块加载成功)
-  4. T_PAD > 0                 (至少有 1 个 token)
+  4. num_g <= 16               (active expert 数不超过 16)
+  5. T_PAD > 0                 (至少有 1 个 token)
 ```
 
 ### 3.3 JIT 编译 Cache
@@ -199,6 +210,7 @@ CuTe kernel 按 `(num_g, total_tile_clusters)` 做缓存。相同配置不重复
 | `TensorMapUpdateMode.GMEM` | kernel 代码绑定 SMEM tensormap 管理，切 GMEM → ILLEGAL_INSTRUCTION (715) |
 | Batch Split (16+16) | Batch 1 成功，Batch 2 crash → 不是 group count 问题 |
 | Batch Split + `torch.cuda.synchronize()` | 加 sync 依然结构性崩溃 → 不是 timing/race |
+| `num_g` guard 放在 gather 之后 | gather + alloc 白费 → fallback 从 43x 暴跌到 10x |
 
 ---
 
@@ -206,13 +218,14 @@ CuTe kernel 按 `(num_g, total_tile_clusters)` 做缓存。相同配置不重复
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| CuTe 路径入口 guard | `kernel.py` | L1779 |
-| `run_cute_path()` 主函数 | `cute_fused_gemm.py` | L111-266 |
+| CuTe 路径入口 guard | `kernel.py` | L2076 |
+| `run_cute_path()` 主函数 | `cute_fused_gemm.py` | L111-259 |
+| `num_g > 16` early exit | `cute_fused_gemm.py` | L142-145 |
 | Gather kernel (Triton) | `cute_fused_gemm.py` | L67-109 |
-| Scale factor e8m0 转换 | `cute_fused_gemm.py` | L157-171 |
-| `num_g > 16` guard | `cute_fused_gemm.py` | L200-202 |
-| Per-expert ptrs/strides 构建 | `cute_fused_gemm.py` | L205-244 |
-| JIT 编译 & cache | `cute_fused_gemm.py` | L252-260 |
+| Scale factor e8m0 转换 | `cute_fused_gemm.py` | L155-170 |
+| Per-expert ptrs/strides 构建 | `cute_fused_gemm.py` | L178-237 |
+| JIT 编译 & cache | `cute_fused_gemm.py` | L245-253 |
+| Triton GEMM1 fallback (`grid1`) | `kernel.py` | L2089-2150 |
 | Kernel class 定义 | `cute_kernel.py` | L15-45 |
 | `_compute_grid` | `cute_kernel.py` | L130-146 |
 | `__call__` (JIT 入口) | `cute_kernel.py` | L148-154 |
