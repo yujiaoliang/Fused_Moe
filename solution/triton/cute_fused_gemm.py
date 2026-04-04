@@ -64,6 +64,60 @@ _GATHER_A_BUF = None
 _GATHER_A_SCALE_BUF = None
 _GATHER_W13_SCALE_CACHE = {}
 
+# ---- Cached dispatch buffers (avoid per-call torch.empty) ----
+_DISPATCH_BUF_CACHE = {}  # key: num_g -> {ptrs, strides, shapes, tensormaps}
+
+def _get_dispatch_bufs(num_g, H, KBLKS_32, N_DIM):
+    """Get or create cached dispatch buffers. Strides are pre-filled (constant per model)."""
+    global _DISPATCH_BUF_CACHE
+    if num_g in _DISPATCH_BUF_CACHE:
+        bufs = _DISPATCH_BUF_CACHE[num_g]
+        # shapes columns 1-3 are constant, only column 0 (M) changes per call
+        return bufs
+    
+    ptrs = torch.empty((num_g, 7), dtype=torch.int64, device='cuda')
+    strides = torch.empty((num_g, 7, 2), dtype=torch.int32, device='cuda')
+    shapes = torch.empty((num_g, 4), dtype=torch.int32, device='cuda')
+    tensormaps = torch.empty((_CUTE_NUM_SMS, 7, 16), dtype=torch.int64, device='cuda')
+    
+    # Pre-fill constant strides (same for every call — H, KBLKS_32, N_DIM never change)
+    for g in range(num_g):
+        strides[g, 0, 0] = H;        strides[g, 0, 1] = 1  # A
+        strides[g, 1, 0] = H;        strides[g, 1, 1] = 1  # B_w1
+        strides[g, 2, 0] = H;        strides[g, 2, 1] = 1  # B_w3
+        strides[g, 3, 0] = KBLKS_32; strides[g, 3, 1] = 1  # SFA
+        strides[g, 4, 0] = KBLKS_32; strides[g, 4, 1] = 1  # SFB_w1
+        strides[g, 5, 0] = KBLKS_32; strides[g, 5, 1] = 1  # SFB_w3
+        strides[g, 6, 0] = N_DIM;    strides[g, 6, 1] = 1  # C
+    # Pre-fill constant shape columns
+    shapes[:, 1] = N_DIM
+    shapes[:, 2] = H
+    shapes[:, 3] = 1
+    
+    bufs = {'ptrs': ptrs, 'strides': strides, 'shapes': shapes, 'tensormaps': tensormaps}
+    _DISPATCH_BUF_CACHE[num_g] = bufs
+    return bufs
+
+
+# ---- Cached CuTe metadata wrappers (avoid per-call convert_cute_tensor) ----
+_META_WRAPPER_CACHE = {}  # key: (id(shapes), id(ptrs), id(strides), id(tensormaps))
+
+def _get_cute_meta_wrappers(shapes, ptrs, strides, tensormaps):
+    """Get or create cached CuTe tensor wrappers for metadata tensors."""
+    global _META_WRAPPER_CACHE
+    cache_key = (id(shapes), id(ptrs), id(strides), id(tensormaps))
+    if cache_key in _META_WRAPPER_CACHE:
+        return _META_WRAPPER_CACHE[cache_key]
+    
+    p_shape = cutlass_torch.convert_cute_tensor(shapes, cutlass_torch.cute_tensor_like(shapes, cutlass.Int32, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Int32, is_dynamic_layout=False)
+    p_ptrs = cutlass_torch.convert_cute_tensor(ptrs, cutlass_torch.cute_tensor_like(ptrs, cutlass.Int64, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Int64, is_dynamic_layout=False)
+    p_strides = cutlass_torch.convert_cute_tensor(strides, cutlass_torch.cute_tensor_like(strides, cutlass.Int32, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Int32, is_dynamic_layout=False)
+    p_tmaps = cutlass_torch.convert_cute_tensor(tensormaps, cutlass_torch.cute_tensor_like(tensormaps, cutlass.Int64, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Int64, is_dynamic_layout=False)
+    
+    result = (p_shape, p_ptrs, p_strides, p_tmaps)
+    _META_WRAPPER_CACHE[cache_key] = result
+    return result
+
 @triton.jit
 def tma_gather_a_explicit(
     src_a_ptr, src_sa_ptr,
@@ -175,76 +229,102 @@ def run_cute_path(
     
     sfb_w1, sfb_w3 = _GATHER_W13_SCALE_CACHE[cache_key_w]
 
-    # Build per-expert pointer table
-    expert_ms = []
-    for e in range(num_experts):
-        n_blks = e_starts[e+1] - e_starts[e]
-        expert_ms.append(n_blks * block_m)
-        
-    expert_list = [me for me in expert_ms if me > 0]
-    e_idx_list = [i for i, me in enumerate(expert_ms) if me > 0]
-    
-    if num_g == 0:
-        return intermediate
-        
-    ptrs = torch.empty((num_g, 7), dtype=torch.int64, device='cuda')
-    strides = torch.empty((num_g, 7, 2), dtype=torch.int32, device='cuda')
-    shapes = torch.empty((num_g, 4), dtype=torch.int32, device='cuda')
-    tensormaps = torch.empty((_CUTE_NUM_SMS, 7, 16), dtype=torch.int64, device='cuda')
-    
-    for local_g, e_idx in enumerate(e_idx_list):
-        m = expert_list[local_g]
-        shapes[local_g] = torch.tensor([m, N_DIM, H, 1], dtype=torch.int32)
-        
-        offset_m = e_starts[e_idx] * block_m
-        ptrs[local_g, 0] = _GATHER_A_BUF[offset_m:offset_m+m].data_ptr()
-        ptrs[local_g, 1] = gemm1_weights[e_idx, :N_DIM, :].data_ptr()
-        ptrs[local_g, 2] = gemm1_weights[e_idx, N_DIM:, :].data_ptr()
-        ptrs[local_g, 3] = sfa[offset_m:offset_m+m, :].data_ptr()
-        ptrs[local_g, 4] = sfb_w1[e_idx].data_ptr()
-        ptrs[local_g, 5] = sfb_w3[e_idx].data_ptr()
-        ptrs[local_g, 6] = intermediate[offset_m:offset_m+m].data_ptr()
-        
-        strides[local_g, 0] = torch.tensor([H, 1], dtype=torch.int32)
-        strides[local_g, 1] = torch.tensor([H, 1], dtype=torch.int32)
-        strides[local_g, 2] = torch.tensor([H, 1], dtype=torch.int32)
-        strides[local_g, 3] = torch.tensor([KBLKS_32, 1], dtype=torch.int32)
-        strides[local_g, 4] = torch.tensor([KBLKS_32, 1], dtype=torch.int32)
-        strides[local_g, 5] = torch.tensor([KBLKS_32, 1], dtype=torch.int32)
-        strides[local_g, 6] = torch.tensor([N_DIM, 1], dtype=torch.int32)
-        
-        if local_g == 0:
-            a_3d = _GATHER_A_BUF[offset_m:offset_m+m].unsqueeze(-1)
-            init_a = cutlass_torch.convert_cute_tensor(a_3d, cutlass_torch.cute_tensor_like(a_3d, cutlass.Float8E4M3FN, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E4M3FN, is_dynamic_layout=False)
-            b_w1_3d = gemm1_weights[e_idx, :N_DIM, :].unsqueeze(-1)
-            init_b_w1 = cutlass_torch.convert_cute_tensor(b_w1_3d, cutlass_torch.cute_tensor_like(b_w1_3d, cutlass.Float8E4M3FN, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E4M3FN, is_dynamic_layout=False)
-            b_w3_3d = gemm1_weights[e_idx, N_DIM:, :].unsqueeze(-1)
-            init_b_w3 = cutlass_torch.convert_cute_tensor(b_w3_3d, cutlass_torch.cute_tensor_like(b_w3_3d, cutlass.Float8E4M3FN, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E4M3FN, is_dynamic_layout=False)
-            c_3d = intermediate[offset_m:offset_m+m].unsqueeze(-1)
-            init_c = cutlass_torch.convert_cute_tensor(c_3d, cutlass_torch.cute_tensor_like(c_3d, cutlass.Float32, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float32, is_dynamic_layout=False)
-            init_sfa = cutlass_torch.convert_cute_tensor(sfa[offset_m:offset_m+m, :], cutlass_torch.cute_tensor_like(sfa[offset_m:offset_m+m, :], cutlass.Float8E8M0FNU, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E8M0FNU, is_dynamic_layout=False)
-            init_sfb_w1 = cutlass_torch.convert_cute_tensor(sfb_w1[e_idx], cutlass_torch.cute_tensor_like(sfb_w1[e_idx], cutlass.Float8E8M0FNU, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E8M0FNU, is_dynamic_layout=False)
-            init_sfb_w3 = cutlass_torch.convert_cute_tensor(sfb_w3[e_idx], cutlass_torch.cute_tensor_like(sfb_w3[e_idx], cutlass.Float8E8M0FNU, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E8M0FNU, is_dynamic_layout=False)
+    # ---- Build per-expert pointer table (optimized: cached buffers + pointer arithmetic) ----
+    # Reuse pre-allocated buffers instead of allocating every call
+    _dispatch_bufs = _get_dispatch_bufs(num_g, H, KBLKS_32, N_DIM)
+    ptrs = _dispatch_bufs['ptrs']
+    strides = _dispatch_bufs['strides']  # pre-filled with constant values
+    shapes = _dispatch_bufs['shapes']
+    tensormaps = _dispatch_bufs['tensormaps']
 
-    p_shape = cutlass_torch.convert_cute_tensor(shapes, cutlass_torch.cute_tensor_like(shapes, cutlass.Int32, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Int32, is_dynamic_layout=False)
-    p_ptrs = cutlass_torch.convert_cute_tensor(ptrs, cutlass_torch.cute_tensor_like(ptrs, cutlass.Int64, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Int64, is_dynamic_layout=False)
-    p_strides = cutlass_torch.convert_cute_tensor(strides, cutlass_torch.cute_tensor_like(strides, cutlass.Int32, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Int32, is_dynamic_layout=False)
-    p_tmaps = cutlass_torch.convert_cute_tensor(tensormaps, cutlass_torch.cute_tensor_like(tensormaps, cutlass.Int64, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Int64, is_dynamic_layout=False)
+    # Base pointers for arithmetic (replaces per-expert slicing + data_ptr())
+    gather_a_base = _GATHER_A_BUF.data_ptr()
+    gather_a_stride_row = H * _GATHER_A_BUF.element_size()
+    sfa_base = sfa.data_ptr()
+    sfa_stride_row = KBLKS_32 * sfa.element_size()
+    w_base = gemm1_weights.data_ptr()
+    w_expert_stride = gemm1_weights.stride(0) * gemm1_weights.element_size()
+    w_n_stride = gemm1_weights.stride(1) * gemm1_weights.element_size()
+    sfb_w1_base = sfb_w1.data_ptr()
+    sfb_w1_expert_stride = sfb_w1.stride(0) * sfb_w1.element_size()
+    sfb_w3_base = sfb_w3.data_ptr()
+    sfb_w3_expert_stride = sfb_w3.stride(0) * sfb_w3.element_size()
+    inter_base = intermediate.data_ptr()
+    inter_stride_row = N_DIM * intermediate.element_size()  # N_DIM * sizeof(float32)
+
+    local_g = 0
+    first_e_idx = -1
+    first_offset_m = 0
+    first_m = 0
+    for e in range(num_experts):
+        n_blks = int(e_starts[e+1] - e_starts[e])
+        if n_blks <= 0:
+            continue
+        m = n_blks * block_m
+        offset_m = int(e_starts[e]) * block_m
+
+        # shapes: only M changes per expert
+        shapes[local_g, 0] = m
+
+        # ptrs: use base + offset arithmetic (no slicing, no data_ptr() per expert)
+        ptrs[local_g, 0] = gather_a_base + offset_m * gather_a_stride_row
+        ptrs[local_g, 1] = w_base + e * w_expert_stride
+        ptrs[local_g, 2] = w_base + e * w_expert_stride + N_DIM * w_n_stride
+        ptrs[local_g, 3] = sfa_base + offset_m * sfa_stride_row
+        ptrs[local_g, 4] = sfb_w1_base + e * sfb_w1_expert_stride
+        ptrs[local_g, 5] = sfb_w3_base + e * sfb_w3_expert_stride
+        ptrs[local_g, 6] = inter_base + offset_m * inter_stride_row
+
+        if local_g == 0:
+            first_e_idx = e
+            first_offset_m = offset_m
+            first_m = m
+        local_g += 1
+
+    # ---- Convert metadata to CuTe tensors (cached wrappers) ----
+    p_shape, p_ptrs, p_strides, p_tmaps = _get_cute_meta_wrappers(shapes, ptrs, strides, tensormaps)
 
     _CUTE_KERNEL.tensormaps = p_tmaps
-    total_tile_clusters = int(sum(((m + 127) // 128) * ((N_DIM + 127) // 128) for m in expert_list))
     
+    # Compute total tiles for PTS scheduler
+    total_tile_clusters = 0
+    for e in range(num_experts):
+        n_blks = int(e_starts[e+1] - e_starts[e])
+        if n_blks > 0:
+            m = n_blks * block_m
+            total_tile_clusters += ((m + 127) // 128) * ((N_DIM + 127) // 128)
+    total_tile_clusters = int(total_tile_clusters)
+
     cache_key = (num_g, total_tile_clusters)
     if cache_key not in _CUTE_COMPILED_CACHE:
+        # Build init tensors ONLY for JIT compilation (first occurrence of this config)
+        m0 = first_m
+        off0 = first_offset_m
+        e0 = first_e_idx
+        a_3d = _GATHER_A_BUF[off0:off0+m0].unsqueeze(-1)
+        init_a = cutlass_torch.convert_cute_tensor(a_3d, cutlass_torch.cute_tensor_like(a_3d, cutlass.Float8E4M3FN, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E4M3FN, is_dynamic_layout=False)
+        b_w1_3d = gemm1_weights[e0, :N_DIM, :].unsqueeze(-1)
+        init_b_w1 = cutlass_torch.convert_cute_tensor(b_w1_3d, cutlass_torch.cute_tensor_like(b_w1_3d, cutlass.Float8E4M3FN, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E4M3FN, is_dynamic_layout=False)
+        b_w3_3d = gemm1_weights[e0, N_DIM:, :].unsqueeze(-1)
+        init_b_w3 = cutlass_torch.convert_cute_tensor(b_w3_3d, cutlass_torch.cute_tensor_like(b_w3_3d, cutlass.Float8E4M3FN, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E4M3FN, is_dynamic_layout=False)
+        c_3d = intermediate[off0:off0+m0].unsqueeze(-1)
+        init_c = cutlass_torch.convert_cute_tensor(c_3d, cutlass_torch.cute_tensor_like(c_3d, cutlass.Float32, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float32, is_dynamic_layout=False)
+        init_sfa = cutlass_torch.convert_cute_tensor(sfa[off0:off0+m0, :], cutlass_torch.cute_tensor_like(sfa[off0:off0+m0, :], cutlass.Float8E8M0FNU, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E8M0FNU, is_dynamic_layout=False)
+        init_sfb_w1 = cutlass_torch.convert_cute_tensor(sfb_w1[e0], cutlass_torch.cute_tensor_like(sfb_w1[e0], cutlass.Float8E8M0FNU, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E8M0FNU, is_dynamic_layout=False)
+        init_sfb_w3 = cutlass_torch.convert_cute_tensor(sfb_w3[e0], cutlass_torch.cute_tensor_like(sfb_w3[e0], cutlass.Float8E8M0FNU, is_dynamic_layout=False, assumed_align=16)[0], cutlass.Float8E8M0FNU, is_dynamic_layout=False)
+
         try:
             print(f"CuTe JIT compiling for cache_key={cache_key}", flush=True)
             _CUTE_COMPILED_CACHE[cache_key] = cute.compile(_CUTE_KERNEL, init_a, init_b_w1, init_b_w3, init_sfa, init_sfb_w1, init_sfb_w3, init_c, num_g, p_shape, p_ptrs, p_strides, total_tile_clusters, p_tmaps, _CUTE_MAX_CLUSTERS, _CUTE_STREAM)
+            # Cache init tensors for launches
+            _CUTE_COMPILED_CACHE[('inits', cache_key)] = (init_a, init_b_w1, init_b_w3, init_sfa, init_sfb_w1, init_sfb_w3, init_c)
             print(f"CuTe JIT compile succeeded for {cache_key}", flush=True)
         except Exception as e:
             print(f"JIT compile failed for {cache_key}: {e}", flush=True)
             raise RuntimeError(f"CuTe JIT Failed: {e}")
 
     _CUTE_COMPILED = _CUTE_COMPILED_CACHE[cache_key]
+    init_a, init_b_w1, init_b_w3, init_sfa, init_sfb_w1, init_sfb_w3, init_c = _CUTE_COMPILED_CACHE[('inits', cache_key)]
     _CUTE_COMPILED(init_a, init_b_w1, init_b_w3, init_sfa, init_sfb_w1, init_sfb_w3, init_c, num_g, p_shape, p_ptrs, p_strides, total_tile_clusters, p_tmaps, _CUTE_MAX_CLUSTERS, _CUTE_STREAM)
     
     return intermediate
