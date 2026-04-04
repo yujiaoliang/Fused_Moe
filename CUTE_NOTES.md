@@ -139,64 +139,151 @@ if num_g > 16:
 
 ---
 
-## 3. 当前状态
+## 3. 结论：CuTe 路径完全无效 — Post-Mortem
 
-### 3.1 A/B Test 对比 (CuTe vs 纯 Triton，同一 `test_modal.py` 环境)
+### 3.1 最终状态
 
-| 指标 | A: Pure Triton (main) | B: CuTe+Triton (CuTe-dev) |
-|------|----------------------|---------------------------|
-| PASSED | 17/19 | 17/19 |
-| Mean (17 passed) | 43.23× | **45.62×** (+5.5%) |
-| Peak | 48.73× | **52.19×** |
-| Median | 43.71× | **45.95×** |
+**CuTe 在所有 19 个 benchmark workload 上完全没有执行过。全部性能 100% 来自 Triton kernels。**
 
-*CuTe 在全部 17 个 PASSED workload 上赢或持平。2 个 INCORRECT_NUMERICAL workload (5e8dc11c, 58a34f27) 在纯 Triton 下也同样失败 — 不是 CuTe 引入的问题。*
+经过 12+ 个 bug fix、5 个失败实验、和完整的 A/B 测试后，我们发现 CuTe 集成被两个**互相矛盾的硬约束**彻底锁死。
 
-### 3.2 CuTe 路径触发条件
+### 3.2 根因分析：两个硬约束的死锁
 
 ```
-CuTe 路径生效 ⟺ 以下条件 AND:
-  1. T > 1                    (非单 token)
-  2. block_m >= 128            (大 batch, BLOCK_M_XLARGE)
-  3. _USE_CUTE == True         (CuTe 模块加载成功)
-  4. num_g <= 16               (active expert 数不超过 16)
-  5. T_PAD > 0                 (至少有 1 个 token)
+                    ┌─────────────────────────────────────────────┐
+                    │         CuTe 可执行区域 (理论上)              │
+                    │    需要同时满足:                              │
+                    │    ① block_m >= 128  (硬件约束)              │
+                    │    ② num_g <= 16     (DSL bug 约束)          │
+                    └─────────────────────────────────────────────┘
+
+                            ① block_m >= 128
+                                需要 T * TOP_K > 16384
+                                即 T > 2048
+
+                            ② num_g <= 16
+                                但 T > 2048 时, T*8/32 ≈ 500+ tokens/expert
+                                → 几乎所有 32 个 expert 都有 token
+                                → num_g ≈ 32 > 16
+
+                            ① ∧ ② = ∅  (空集)
 ```
 
-### 3.3 JIT 编译 Cache
+**约束 ①: `block_m >= 128` (tcgen05 MMA 硬件约束)**
 
-CuTe kernel 按 `(num_g, total_tile_clusters)` 做缓存。相同配置不重复编译。
-首次编译约 30-60 秒，后续调用直接复用。
+CuTe DSL 的 Blackwell tcgen05 MMA 指令要求每个 CTA 的 M 维度 tilé 固定为 128 行。这是硬件架构的刚性约束，不可通过软件绕过。当 `block_m < 128` 时（小/中 batch），每个 expert 分到的 token 行数不足 128，MMA 会越界读取 → `ILLEGAL_ADDRESS`。
+
+MoE dispatch 的 `_select_block_m()` 根据 `T * TOP_K` 选择 block_m:
+
+| T 范围 | T * TOP_K | block_m | 满足 ①? |
+|--------|----------|---------|---------|
+| 1-128 | ≤ 1024 | 16 (TINY) | ❌ |
+| 129-512 | ≤ 4096 | 32 (SMALL) | ❌ |
+| 513-2048 | ≤ 16384 | 64 (LARGE) | ❌ |
+| **2049+** | **> 16384** | **128 (XLARGE)** | **✅** |
+
+17 个 workload 的 T 值分布：1, 7, 14, 15, 16, 32, 52-62, 80, 901 — **全部 T ≤ 901，block_m 最大 64。CuTe 无法进入。**
+
+**约束 ②: `num_g <= 16` (CuTe DSL Persistent Tile Scheduler bug)**
+
+当 active expert 数 > 16，CuTe DSL 的 Persistent Tile Scheduler 触发 `CUDA_ERROR_ILLEGAL_ADDRESS`。通过 5 个系统性实验（batch split、GMEM mode、sync barrier 等），确认这是 CuTe DSL/CUTLASS 的内部 bug（疑似 tensormap 管理在 high group_idx 下的索引溢出），不可通过用户代码绕过。
+
+仅有 2 个 workload 满足约束 ①（T=11948, T=14107, block_m=128），但：
+- T=11948: 11948 × 8 / 32 ≈ **2990 tokens/expert** → 所有 32 expert 都有 token → `num_g = 32 > 16` ❌
+- T=14107: 14107 × 8 / 32 ≈ **3527 tokens/expert** → 所有 32 expert 都有 token → `num_g = 32 > 16` ❌
+
+### 3.3 全 19 workload 诊断表
+
+| UUID | T (seq_len) | block_m | CuTe 入口 | num_g 检查 | CuTe 执行? |
+|------|------------|---------|-----------|-----------|-----------|
+| b8f4f012 | 7 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| e05c6c03 | 1 | — | `T == 1` 走 T1 路径 | — | ❌ 跳过 |
+| 6230e838 | 32 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| 8f1ff9f1 | 80 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| 1a4c6ba1 | 901 | 64 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| a7c2bcfd | 16 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| 2e69caee | 15 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| 8cba5890 | 14 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| **5e8dc11c** | **14107** | **128** | ✅ 进入 | `num_g=32 > 16` ❌ | ❌ **fallback** |
+| **58a34f27** | **11948** | **128** | ✅ 进入 | `num_g=32 > 16` ❌ | ❌ **fallback** |
+| 5eadab1e | 62 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| eedc63b2 | 59 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| e626d3e6 | 58 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| 74d7ff04 | 57 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| 4822167c | 56 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| 81955b1e | 55 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| 76010cb4 | 54 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| fc378037 | 53 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+| f7d6ac7c | 52 | 16 | `block_m < 128` ❌ | — | ❌ 跳过 |
+
+**结论: 0/19 workload 执行了 CuTe 路径。**
+
+### 3.4 为什么之前的 A/B Test 显示 "+5.5%"？
+
+A/B test 对比的是 **main 分支 vs CuTe-dev 分支**的整体性能。CuTe-dev 分支从 main cherry-pick 了多个 Triton 优化（remapped GEMM1 等），这些优化提供了 +5.5% 的提升。**这个提升与 CuTe 无关。**
+
+### 3.5 CuTe 代码仍保留的原因
+
+虽然 CuTe 对当前 workload 无效，我们选择保留代码（`cute_fused_gemm.py`, `cute_kernel.py`）作为：
+- **技术存档**：12 个 bug fix 记录了 Blackwell tcgen05 + CuTe DSL 的实战经验
+- **未来参考**：如果 CUTLASS 修复了 `num_g > 16` PTS bug，或者 benchmark 增加 T ∈ [2048, ∞) 且 E_LOCAL ≤ 16 的 workload，CuTe 路径可以立即激活
+- **零性能代价**：CuTe 路径被 `block_m >= 128 and not use_exact_dispatch` 完全门控，不产生任何运行时开销
 
 ---
 
-## 4. TODO List
+## 4. 性能优化记录
 
-### 🔴 高优先 — 性能提升
+### 4.1 实际生效的优化 (全部是 Triton)
 
-- [x] **消除 `torch.cuda.synchronize()` 开销** *(阶段一完成)*
-  - 移除了全部 4 处显式 sync
-  - scale factor 转换结果缓存到 `_GATHER_W13_SCALE_CACHE`
+| 优化 | 来源 | 效果 |
+|------|------|------|
+| Remapped GEMM1 (cherry-pick from master) | `kernel.py` L844-927 | 大 T workload +5% |
+| Exact workload dispatch | `kernel.py` L2035-2040 | 减少 overlaunch |
+| 禁用 remapped GEMM1 for T>4096 | `kernel.py` L1709 | 修复 2 个 INCORRECT_NUMERICAL → 19/19 PASSED |
+| 跳过大 T 的 CuTe 调用 | `kernel.py` L2079 | 消除 2 个大 T workload 的无用 D2H sync |
 
-- [x] **让 32-expert workload 走 CuTe 路径** *(阶段二 — 结构性障碍，暂时搁置)*
-  - tcgen05 的 128-row MMA 是硬件硬约束 → `block_m < 128` 无法绕过
-  - `num_g > 16` 时 CuTe DSL/PTS 存在结构性 ILLEGAL_ADDRESS
-  - Batch Split、GMEM Mode、Sync 全部失败
-  - **需等待 CUTLASS 新版修复 或 NVIDIA 团队介入**
+### 4.2 CuTe 侧优化 (已实现但无效果)
 
-- [ ] **Gather Kernel → CuTe TMA Indirect Gather (阶段三终极目标)**
-  - 当前先用 Triton kernel gather 到临时 buffer，再用 CuTe kernel 读取
-  - Blackwell TMA 硬件级支持 Scatter/Gather (Indirect Fetch)
-  - 消除中间 buffer 和一次额外的全局内存 round-trip
+| 优化 | 文件 | 说明 |
+|------|------|------|
+| 缓存 dispatch buffers (ptrs/strides/shapes) | `cute_fused_gemm.py` L68-100 | 按 num_g 缓存，避免 per-call `torch.empty()` |
+| 预填充常量 strides | `cute_fused_gemm.py` L84-96 | H, KBLKS_32, N_DIM 只填一次 |
+| 指针算术替代 slice+data_ptr() | `cute_fused_gemm.py` L271-298 | 消除 7×num_g 次 Python 对象创建 |
+| 缓存 CuTe metadata wrappers | `cute_fused_gemm.py` L104-119 | `convert_cute_tensor` 按 tensor id 缓存 |
+| 缓存 init tensors | `cute_fused_gemm.py` L322-323 | JIT 编译后复用 init tensors |
+| GPU-side expert counting | `cute_fused_gemm.py` L125-142 | Triton kernel 替代 `block_offsets.cpu()` |
+| 传递 total_blks_host | `cute_fused_gemm.py` L192 | 消除 redundant `total_blocks.item()` |
 
-- [ ] **Cluster Shape (2,1) 或 (1,2) (阶段四)**
-  - 当前 cluster = (1,1)，每个 CTA 独立
-  - Blackwell 支持 CTA cluster 共享 SMEM，可减少 TMA 加载量
-  - 需要调整 mcast_mask 和 共享存储 layout
+**以上全部优化对性能零影响**，因为 CuTe 路径从未被执行。
 
 ---
 
-## 5. 已验证的失败方向 (勿重复)
+## 5. 教训与反思
+
+### 5.1 架构陷阱：没有提前验证 workload coverage
+
+**最大的错误**：在投入大量 CuTe 集成工作之前，没有先检查 19 个 workload 的 T 值分布。如果在第一天就运行诊断脚本打印出 T 值（1, 7, 14-16, 32, 52-62, 80, 901, 11948, 14107），就会立即发现 17/19 的 T 值远低于 CuTe 需要的 `T > 2048` 阈值。
+
+### 5.2 硬件约束 vs 软件灵活性
+
+tcgen05 MMA 的 128-row tile 是芯片级硬约束，不像 Triton 可以任意选择 BLOCK_M。这意味着 CuTe DSL 天然不适合 小 batch MoE workload（T < 2048），而比赛的 17/19 workload 恰好都在这个范围。
+
+### 5.3 Guard 的累积效应
+
+每个 guard（`block_m >= 128`, `num_g <= 16`, `T > 1`）单独看都合理且必要，但它们的 AND 组合产生了空集。这种"约束累积导致可行解空间坍缩为零"的模式是一个通用的工程教训。
+
+### 5.4 CuTe DSL 的实战评价
+
+- **优点**：接近硬件的 MMA 控制、TMA 异步 pipeline 自动管理、Persistent Tile Scheduler
+- **限制**：
+  - `num_g > 16` 的结构性 crash 无法通过用户代码绕过
+  - 128-row MMA tile 是硬约束，无法 sub-tile
+  - JIT 编译 30-60 秒，不适合 benchmark 的冷启动场景
+  - Python DSL → PTX → cubin 的工具链，调试难度极高（错误信息几乎都是 ILLEGAL_ADDRESS）
+
+---
+
+## 6. 已验证的失败方向 (勿重复)
 
 | 方向 | 失败原因 |
 |------|--------|
@@ -211,24 +298,27 @@ CuTe kernel 按 `(num_g, total_tile_clusters)` 做缓存。相同配置不重复
 | Batch Split (16+16) | Batch 1 成功，Batch 2 crash → 不是 group count 问题 |
 | Batch Split + `torch.cuda.synchronize()` | 加 sync 依然结构性崩溃 → 不是 timing/race |
 | `num_g` guard 放在 gather 之后 | gather + alloc 白费 → fallback 从 43x 暴跌到 10x |
+| CuTe 侧 Python 循环优化 | CuTe 路径从未被执行，优化无效 |
+| CuTe 侧 D2H sync 消除 | CuTe 路径从未被执行，优化无效 |
 
 ---
 
-## 6. 关键代码位置速查
+## 7. 关键代码位置速查
 
 | 功能 | 文件 | 行号 |
 |------|------|------|
-| CuTe 路径入口 guard | `kernel.py` | L2076 |
-| `run_cute_path()` 主函数 | `cute_fused_gemm.py` | L111-259 |
-| `num_g > 16` early exit | `cute_fused_gemm.py` | L142-145 |
-| Gather kernel (Triton) | `cute_fused_gemm.py` | L67-109 |
-| Scale factor e8m0 转换 | `cute_fused_gemm.py` | L155-170 |
-| Per-expert ptrs/strides 构建 | `cute_fused_gemm.py` | L178-237 |
-| JIT 编译 & cache | `cute_fused_gemm.py` | L245-253 |
-| Triton GEMM1 fallback (`grid1`) | `kernel.py` | L2089-2150 |
+| CuTe 路径入口 guard | `kernel.py` | L2076-2079 |
+| `run_cute_path()` 主函数 | `cute_fused_gemm.py` | L188-338 |
+| `num_g > 16` early exit | `cute_fused_gemm.py` | L219-223 |
+| GPU-side expert counting | `cute_fused_gemm.py` | L125-142 |
+| Cached dispatch buffers | `cute_fused_gemm.py` | L68-100 |
+| Cached CuTe metadata wrappers | `cute_fused_gemm.py` | L104-119 |
+| Gather kernel (Triton) | `cute_fused_gemm.py` | L144-187 |
+| Scale factor e8m0 转换 | `cute_fused_gemm.py` | L239-254 |
+| JIT 编译 & cache | `cute_fused_gemm.py` | L316-332 |
+| Triton GEMM1 fallback (`grid1`) | `kernel.py` | L2092-2150 |
+| Remapped GEMM1 guard (T>4096 fix) | `kernel.py` | L1704-1712 |
 | Kernel class 定义 | `cute_kernel.py` | L15-45 |
-| `_compute_grid` | `cute_kernel.py` | L130-146 |
-| `__call__` (JIT 入口) | `cute_kernel.py` | L148-154 |
 | MMA mainloop | `cute_kernel.py` | L580-640 |
 | SwiGLU epilogue | `cute_kernel.py` | L738-765 |
-| `make_tensor_for_tensormap_update` | `cute_kernel.py` | L783-831 |
+
