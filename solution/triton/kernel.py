@@ -2083,7 +2083,7 @@ def kernel(
                 hidden_states, hidden_states_scale,
                 gemm1_weights, gemm1_weights_scale,
                 sorted_token_ids, block_offsets, total_blocks,
-                Intermediate, block_m
+                Intermediate, block_m, total_blks_host=exact_pid_m
             )
             if cute_intermediate is not None:
                 _used_cute_gemm1 = True

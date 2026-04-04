@@ -118,6 +118,29 @@ def _get_cute_meta_wrappers(shapes, ptrs, strides, tensormaps):
     _META_WRAPPER_CACHE[cache_key] = result
     return result
 
+# ---- GPU-side active expert counting (eliminates block_offsets.cpu() D2H sync) ----
+_NUM_G_BUF = None
+
+@triton.jit
+def _count_active_experts_kernel(
+    block_offsets_ptr, result_ptr, E_LOCAL: tl.constexpr
+):
+    """Count experts with >0 tokens. Single-thread kernel, runs in ~1μs."""
+    e_idx = tl.arange(0, E_LOCAL)
+    starts = tl.load(block_offsets_ptr + e_idx)
+    ends = tl.load(block_offsets_ptr + e_idx + 1)
+    active = tl.where(ends > starts, 1, 0)
+    count = tl.sum(active, axis=0)
+    tl.store(result_ptr, count)
+
+def _get_num_g(block_offsets, e_local=32):
+    """Count active experts on GPU, then read single int32 (much cheaper than full block_offsets.cpu())."""
+    global _NUM_G_BUF
+    if _NUM_G_BUF is None:
+        _NUM_G_BUF = torch.empty((1,), dtype=torch.int32, device='cuda')
+    _count_active_experts_kernel[(1,)](block_offsets, _NUM_G_BUF, E_LOCAL=e_local)
+    return int(_NUM_G_BUF.item())
+
 @triton.jit
 def tma_gather_a_explicit(
     src_a_ptr, src_sa_ptr,
@@ -166,10 +189,11 @@ def run_cute_path(
     hidden_states, hidden_states_scale,
     gemm1_weights, gemm1_weights_scale,
     sorted_token_ids, block_offsets, total_blocks,
-    intermediate, block_m=128
+    intermediate, block_m=128, total_blks_host=None
 ):
     """
     Launch CuTe-based FP8 Grouped SwiGLU kernel.
+    total_blks_host: pre-computed int(total_blocks.item()) from kernel.py to avoid redundant D2H sync.
     """
     if not _USE_CUTE:
         return intermediate
@@ -180,8 +204,9 @@ def run_cute_path(
         
     global _GATHER_A_BUF, _GATHER_A_SCALE_BUF, _GATHER_W13_SCALE_E8
     
-    # ---- EARLY EXIT: check num_g BEFORE any GPU work ----
-    total_blks_host = int(total_blocks.item())
+    # ---- EARLY EXIT: reuse pre-computed total_blks from kernel.py ----
+    if total_blks_host is None:
+        total_blks_host = int(total_blocks.item())  # fallback if not provided
     T_PAD = total_blks_host * block_m
     T_TOTAL, H = hidden_states.shape
     N_DIM = gemm1_weights.shape[1] // 2
@@ -189,15 +214,17 @@ def run_cute_path(
     if T_PAD == 0:
         return intermediate
     
-    # Check expert count early — avoid wasted gather/alloc for fallback workloads
-    e_starts = block_offsets.cpu().numpy()
-    num_experts = len(e_starts) - 1
-    num_g = sum(1 for e in range(num_experts) if (e_starts[e+1] - e_starts[e]) > 0)
+    # Count active experts on GPU (no block_offsets.cpu() needed for early exit!)
+    num_g = _get_num_g(block_offsets)
     
     if num_g > 16:
         # 32-expert workloads crash CuTe (structural ILLEGAL_ADDRESS).
         # Return None BEFORE any GPU work to avoid penalizing Triton fallback.
         return None
+    
+    # Now we know we'll launch CuTe — do the D2H copy for per-expert pointers
+    e_starts = block_offsets.cpu().numpy()
+    num_experts = len(e_starts) - 1
     
     KBLKS_32 = H // 32
     
