@@ -453,35 +453,80 @@ canonical large-T 路径里 `BLOCK_M=128`，对 `T=11948/14107` 这类 trace，`
 
 而不是重新回到 dual-bucket、cluster、lookup-only 这些已经被证伪或收益很弱的方向。
 
+### 2026-04-05 负优化：small/medium GEMM1-only `BLOCK_M=128` 实验（已回退）
+
+#### 背景
+
+曾考虑利用 B200 Tensor Core 更偏好大 tile 的特点，在 `32 <= T <= 128` 的 small/medium 区间尝试
+`BLOCK_M=128`。但这条思路不能像普通 autotune 一样只加 config，因为当前实现里的 `BLOCK_M`
+同时参与了 sort/layout 的数据组织，不能直接让 canonical `BLOCK_M=16/32/64` 的 layout 被
+`GEMM1` 按 `128` 重新解释。
+
+因此这次实际做的是一个 **最小可实现版本**：
+
+* 保留 canonical sort/layout 和 canonical `GEMM2`
+* 只给 `GEMM1` 单独构建一套 `BLOCK_M=128` 的 token layout
+* 用 `row_map` 把 `GEMM1` 输出写回 canonical `Intermediate`
+
+#### 修改内容
+
+围绕 `solution/triton/kernel.py` 当时新增过下面这组实验性改动，后续已全部回退：
+
+* `triton_count_tokens_from_canonical_layout_kernel(...)`
+* `triton_scatter_canonical_to_remapped_gemm1_kernel(...)`
+* `_row_mapped_fused_moe_gemm1_swiglu_kernel`
+* `_use_small_medium_gemm1_block_m128_experiment(...)`
+* `_kernel_small_medium_gemm1_block_m128_experiment(...)`
+
+这组改动的目的，是在不动 `GEMM2` 的前提下，单独验证 `GEMM1 BLOCK_M=128` 是否能从更大的
+Tensor Core tile 中获益。
+
+#### 实测效果
+
+结果非常差，而且不是小幅回退，而是明显负优化。相对 `0402base`：
+
+* `T=32: 0.226 -> 1.112 ms`，约 `+392%`
+* `T=52: 0.208 -> 0.774 ms`，约 `+272%`
+* `T=59: 0.214 -> 1.106 ms`，约 `+417%`
+* `T=80: 0.299 -> 1.461 ms`，约 `+389%`
+
+命中实验的 `T=32/52-62/80` 共 11 个点，平均 `wall` 从约 `0.236 ms` 变成 `1.090 ms`，
+约 `+361.5%`。
+
+从 profiler 看，问题非常集中：
+
+* 新增的辅助 kernel 本身很小
+  * `triton_count_tokens_from_canonical_layout_kernel`: 约 `1.7~2.0 us`
+  * `triton_scatter_canonical_to_remapped_gemm1_kernel`: 约 `2.1~2.3 us`
+* 真正炸掉的是 `_row_mapped_fused_moe_gemm1_swiglu_kernel`
+  * `T=32: 116 us -> 992 us`
 ### 2026-04-05 保留优化：fused routing + token-major sort/layout/scatter
 
 #### 背景
 
-`0402base` 之后，large-T 路径里 `GEMM1/GEMM2` 仍然是主要大头，但 `routing + sort/layout/scatter`
-这段固定成本还存在一笔可以继续压缩的开销。此前并行 sort 路径仍然依赖：
+`0402base` 之后，large-T 路径里 `GEMM1/GEMM2` 仍然是主要大头，但 `routing + sort/layout/scatter` 这段固定成本还存在一笔可继续压缩的开销。此前并行 sort 路径仍然依赖：
 
 * routing 先产出 `topk_idx / topk_weights`
 * 再单独生成 histogram / layout
 * 最后走 tile-based scatter
 
-这条链路本身没有错，但和 `1 program = 1 token` 的 routing 主体并不完全匹配，而且 sort/scatter
-侧还有额外的 launch、重复读写和逐 item atomic 成本。
+这条链路本身没有错，但和 `1 program = 1 token` 的 routing 主体并不完全匹配，而且 sort/scatter 侧还有额外的 launch、重复读写和逐 item atomic 成本。
 
 #### 修改内容
 
-围绕 `solution/triton/kernel.py` 最终保留了下面这组改动：
+围绕 `solution/triton/kernel.py` 最终保留了下面这组修改：
 
 * 新增 `_fused_routing_histogram_kernel(...)`
   * 保持 `1 program = 1 token`
   * routing 时顺手产出 `local_topk_idx`
-  * 只对 local expert 保留 `0..31`，非本地写 `-1`
+  * 只对 local expert 保留 `0..31`，非本地记 `-1`
 * 新增 `ds_routing_with_histogram(...)` wrapper，给 large-T 并行 sort 场景提供 fused routing 入口
 * 新增 token-major sort/layout/scatter 路径：
   * `triton_token_layout_kernel(...)`
   * `triton_token_layout_with_remap_kernel(...)`
   * `triton_token_scatter_kernel(...)`
   * `token_sort_and_scatter(...)`
-* `token_scatter` 从“逐 item atomic 分配”改成“program 内局部计数 + 按 expert 成批预留区间 + 回填`
+* `token_scatter` 从“逐 item atomic 分配”改成“program 内局部计数 + 按 expert 成批预留区间 + 回填”
   * 当前 `BLOCK_TOKENS = 8`
 * host 侧新增 `_routing_hist_cache` 和 `_token_sort_cache`
 * large-T 命中条件下：
@@ -517,7 +562,46 @@ canonical large-T 路径里 `BLOCK_M=128`，对 `T=11948/14107` 这类 trace，`
 
 后续如果继续围绕这条线优化，优先级应该放在：
 
-* 继续压 `token_scatter` 的局部原子和写回开销
+* 继续压 `token_scatter` 的局部原子和回写开销
 * 评估是否还有必要进一步精简 token-major layout 的辅助 metadata
 
-而不应该再回到 tile-serial routing、global atomic histogram、或者把整条 routing 主体改成低并行度实现。
+而不应该再回到 tile-serial routing、global atomic histogram，或者把整条 routing 主体改成低并行度实现。
+
+### 2026-04-05 负优化：small/medium + medium GEMM1 `BLOCK_K=256` 实验（已回退）
+
+#### 背景
+
+希望在 `GEMM1` 的 `K=7168` 上用更大的 `BLOCK_K=256` 减少 K-loop 次数。直观上，`BLOCK_K=128` 需要 `56` 轮，若能稳定切到 `256`，外层循环可以降到 `28` 轮，从而减少 barrier、指针跃迁和 loop 壳子的开销。
+
+但当前 FP8 量化仍以 `QBLOCK=128` 为基本单位，因此 `BLOCK_K=256` 不能简单视为“一次 dot 覆盖 256 并只做一次 scale”。为了保证量化语义正确，`256` 的每一步实际上仍然需要拆成两个 `128` 子块分别做 `dot + scale` 再累加。
+
+#### 修改内容
+
+围绕 `small_medium` 和 `medium` 两条 `GEMM1` 路径做了几轮实验：
+
+* 在 autotune config 中加入 `BLOCK_K=256` 候选，并将 `num_stages` 压到 `2` 以满足 shared memory 预算
+* 第一版实现采用“外层 `BLOCK_K=256` + 内层 `128` 子块循环”的写法，保证 scale 仍按 `128` 对齐
+* 第二版将 nested loop 改成“单层外循环 + 两段显式 `128` 展开”，目的是去掉额外的 `static_range` 壳子成本
+* 后续又为部分 `256K` 配置补了 `num_stages=3`
+* 最后又做了一个 `medium-only fixed probe`，只验证 upper-medium `GEMM1` 上 `BLOCK_K=256` kernel 本体是否能打赢
+
+#### 实测效果
+
+这条线没有在目标区间形成稳定收益。
+
+* broad `BLOCK_K=256` autotune 版本在 `T=32..80` 这段仍然整体偏负
+* 把 nested loop 改成单层循环 + 两段显式展开后，表现比最初版本略有恢复，但依然没有打赢 `0402base`
+* 给 `256K` 配置补 `num_stages=3` 后，整体结果更差
+  * 平均 `wall: 0.661 ms -> 0.679 ms`
+  * 聚焦 `T=32,52-59,62,80` 的平均 `wall: 0.236 ms -> 0.253 ms`
+  * 许多 case 的 `GEMM1` 几乎没变，但 `CPU overhead` 上升，更像 autotune / host 侧成本先把潜在收益吃掉了
+* `medium-only fixed probe` 也明确失败
+  * `T=80: wall 0.299 -> 0.317 ms`
+  * `GEMM1 0.167 -> 0.186 ms`
+  * top kernel 已切到 `_medium_block_k256_probe_fused_moe_gemm1_swiglu_kernel`，说明 probe 确实命中，但 kernel 本体仍然更慢
+
+#### 结论
+
+这轮实验说明，当前 FP8 `QBLOCK=128` 的量化/scale 语义下，`BLOCK_K=256` 并没有真正减少 `128` 粒度上的 `dot + scale` 工作量；它减少的主要只是外层循环壳子的那部分成本。
+
+与之交换的是更高的资源占用、更浅的流水线选择空间，以及在 autotune / host 侧更高的额外成本，因此整体上没有形成正收益。`BLOCK_K=256` 这条 `GEMM1` 优化线已判断为负优化，并已从 `kernel.py` 中干净回退。
