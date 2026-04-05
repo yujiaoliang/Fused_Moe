@@ -47,11 +47,13 @@ EXACT_WORKLOAD_DISPATCH_T_MIN = 4096
 EXACT_WORKLOAD_DISPATCH_MIN_PID_M = 640
 BLOCK_K = 128  # K-block (must equal QBLOCK for scale alignment)
 SORT_BLOCK_ITEMS = 256
+SORT_TOKENS_PER_TILE = SORT_BLOCK_ITEMS // TOP_K
 PARALLEL_SORT_MIN_TILES = 128
 T1_GENERIC_BLOCK_M = 16
 T1_GENERIC_MAX_PADDED = TOP_K * T1_GENERIC_BLOCK_M
 REMAPPED_GEMM1_BLOCK_M = 64
 REMAPPED_GEMM1_MAX_EXTRA = E_LOCAL * (REMAPPED_GEMM1_BLOCK_M - 1)
+TOKEN_SCATTER_BLOCK_TOKENS = 8
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -155,6 +157,81 @@ def triton_ds_routing_kernel(
     tl.store(out_wts_ptrs, norm_wts, mask=k_mask)
 
 
+@triton.jit
+def _fused_routing_histogram_kernel(
+    logits_ptr,
+    bias_ptr,
+    topk_idx_ptr,
+    topk_wts_ptr,
+    local_topk_idx_ptr,
+    expert_counts_ptr,
+    scale_factor,
+    T,
+    local_start: tl.constexpr,
+    E_LOCAL: tl.constexpr,
+    E_GLOBAL: tl.constexpr,
+    TOP_K: tl.constexpr,
+    TOPK_GROUP: tl.constexpr,
+    N_GROUP: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid >= T:
+        return
+
+    tid = tl.arange(0, E_GLOBAL)
+    idx_vec = tl.arange(0, N_GROUP)
+
+    l_ptr = logits_ptr + pid * E_GLOBAL + tid
+    b_ptr = bias_ptr + tid
+    logit = tl.load(l_ptr)
+    bias = tl.load(b_ptr).to(tl.float32)
+
+    s = 1.0 / (1.0 + tl.exp(-(logit)))
+    sb = s + bias
+
+    group_sb = tl.reshape(sb, (8, 32))
+    max1 = tl.max(group_sb, axis=1)
+    group_sb_no_max1 = tl.where(group_sb < max1[:, None], group_sb, -float('inf'))
+    max2 = tl.max(group_sb_no_max1, axis=1)
+    g_scores = max1 + max2
+
+    g_mask = tl.zeros((8,), dtype=tl.int32)
+    curr_g_scores = g_scores
+    for _ in tl.static_range(TOPK_GROUP):
+        best_g_idx = tl.argmax(curr_g_scores, axis=0)
+        g_mask = tl.where(idx_vec == best_g_idx, 1, g_mask)
+        curr_g_scores = tl.where(idx_vec == best_g_idx, -float('inf'), curr_g_scores)
+
+    g_mask_2d = g_mask[:, None] * tl.full((1, 32), 1, dtype=tl.int32)
+    s_mask = tl.reshape(g_mask_2d, (256,)) != 0
+    curr_sb = tl.where(s_mask, sb, -float('inf'))
+
+    topk_wgts_sum = tl.zeros((), dtype=tl.float32)
+    for k in tl.static_range(TOP_K):
+        best_idx = tl.argmax(curr_sb, axis=0)
+        is_best = tid == best_idx
+        best_s = tl.sum(tl.where(is_best, s, 0.0), axis=0)
+
+        is_local = (best_idx >= local_start) & (best_idx < local_start + E_LOCAL)
+        local_exp = best_idx - local_start
+        local_idx = tl.where(is_local, local_exp, -1)
+
+        tl.store(topk_idx_ptr + pid * TOP_K + k, best_idx.to(tl.int32))
+        tl.store(topk_wts_ptr + pid * TOP_K + k, best_s)
+        tl.store(local_topk_idx_ptr + pid * TOP_K + k, local_idx.to(tl.int32))
+        tl.atomic_add(expert_counts_ptr + tl.where(is_local, local_exp, 0), 1, mask=is_local, sem='relaxed')
+        topk_wgts_sum += best_s
+
+        curr_sb = tl.where(is_best, -float('inf'), curr_sb)
+
+    k_tid = tl.arange(0, 16)
+    k_mask = k_tid < TOP_K
+    out_wts_ptrs = topk_wts_ptr + pid * TOP_K + k_tid
+    wts = tl.load(out_wts_ptrs, mask=k_mask)
+    norm_wts = (wts / (topk_wgts_sum + 1e-20)) * scale_factor
+    tl.store(out_wts_ptrs, norm_wts, mask=k_mask)
+
+
 def ds_routing(logits, bias, scale_factor, topk_idx=None, topk_weights=None):
     """
     Launch wrapper for Triton routing kernel.
@@ -177,6 +254,47 @@ def ds_routing(logits, bias, scale_factor, topk_idx=None, topk_weights=None):
         num_warps=8 # E_GLOBAL is 256, 8 warps = 256 threads
     )
     
+    return topk_idx, topk_weights
+
+
+def ds_routing_with_histogram(
+    logits,
+    bias,
+    scale_factor,
+    local_topk_idx,
+    expert_counts,
+    local_start,
+    topk_idx=None,
+    topk_weights=None,
+):
+    T = logits.shape[0]
+    device = logits.device
+
+    if topk_idx is None:
+        topk_idx = torch.empty((T, TOP_K), dtype=torch.int32, device=device)
+    if topk_weights is None:
+        topk_weights = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
+
+    grid = (T,)
+    expert_counts.zero_()
+    _fused_routing_histogram_kernel[grid](
+        logits,
+        bias,
+        topk_idx,
+        topk_weights,
+        local_topk_idx,
+        expert_counts,
+        float(scale_factor),
+        T=T,
+        local_start=local_start,
+        E_LOCAL=E_LOCAL,
+        E_GLOBAL=E_GLOBAL,
+        TOP_K=TOP_K,
+        TOPK_GROUP=TOPK_GROUP,
+        N_GROUP=N_GROUP,
+        num_warps=8,
+    )
+
     return topk_idx, topk_weights
 
 
@@ -509,6 +627,67 @@ def triton_sort_layout_with_remap_kernel(
 
 
 @triton.jit
+def triton_token_layout_kernel(
+    expert_counts_ptr,
+    block_offsets_ptr,
+    total_blocks_ptr,
+    write_offsets_ptr,
+    E_LOCAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+):
+    e_idx = tl.arange(0, E_LOCAL)
+    total_counts = tl.load(expert_counts_ptr + e_idx)
+
+    blocks = (total_counts + (BLOCK_M - 1)) // BLOCK_M
+    padded_counts = blocks * BLOCK_M
+    inc_sum = tl.cumsum(padded_counts, axis=0)
+    global_offsets = inc_sum - padded_counts
+    total_blocks = tl.sum(blocks, axis=0)
+
+    tl.store(block_offsets_ptr + e_idx, global_offsets // BLOCK_M)
+    tl.store(block_offsets_ptr + E_LOCAL, total_blocks)
+    tl.store(total_blocks_ptr, total_blocks)
+    tl.store(write_offsets_ptr + e_idx, global_offsets)
+
+
+@triton.jit
+def triton_token_layout_with_remap_kernel(
+    expert_counts_ptr,
+    block_offsets_ptr,
+    total_blocks_ptr,
+    write_offsets_ptr,
+    remapped_block_offsets_ptr,
+    remapped_total_blocks_ptr,
+    E_LOCAL: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    REMAPPED_BLOCK_M: tl.constexpr,
+):
+    e_idx = tl.arange(0, E_LOCAL)
+    total_counts = tl.load(expert_counts_ptr + e_idx)
+
+    blocks = (total_counts + (BLOCK_M - 1)) // BLOCK_M
+    padded_counts = blocks * BLOCK_M
+    inc_sum = tl.cumsum(padded_counts, axis=0)
+    global_offsets = inc_sum - padded_counts
+    total_blocks = tl.sum(blocks, axis=0)
+
+    tl.store(block_offsets_ptr + e_idx, global_offsets // BLOCK_M)
+    tl.store(block_offsets_ptr + E_LOCAL, total_blocks)
+    tl.store(total_blocks_ptr, total_blocks)
+    tl.store(write_offsets_ptr + e_idx, global_offsets)
+
+    remapped_blocks = (total_counts + (REMAPPED_BLOCK_M - 1)) // REMAPPED_BLOCK_M
+    remapped_padded = remapped_blocks * REMAPPED_BLOCK_M
+    remapped_inc_sum = tl.cumsum(remapped_padded, axis=0)
+    remapped_offsets = remapped_inc_sum - remapped_padded
+    remapped_total_blocks = tl.sum(remapped_blocks, axis=0)
+
+    tl.store(remapped_block_offsets_ptr + e_idx, remapped_offsets // REMAPPED_BLOCK_M)
+    tl.store(remapped_block_offsets_ptr + E_LOCAL, remapped_total_blocks)
+    tl.store(remapped_total_blocks_ptr, remapped_total_blocks)
+
+
+@triton.jit
 def triton_init_sorted_buffers_kernel(
     sorted_tokens_ptr,
     sorted_weights_ptr,
@@ -564,6 +743,56 @@ def triton_sort_scatter_kernel(
         tl.store(scatter_map_ptr + idx, dest, mask=is_local)
         running += is_match.to(tl.int32) * is_local.to(tl.int32)
 
+
+@triton.jit
+def triton_token_scatter_kernel(
+    local_topk_idx_ptr,
+    topk_wts_ptr,
+    sorted_tokens_ptr,
+    sorted_weights_ptr,
+    scatter_map_ptr,
+    write_offsets_ptr,
+    T,
+    TOP_K: tl.constexpr,
+    E_LOCAL: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    token_base = pid * BLOCK_TOKENS
+    local_e = tl.arange(0, E_LOCAL)
+    counts = tl.zeros((E_LOCAL,), dtype=tl.int32)
+
+    # First pass: count how many writes this program contributes to each expert.
+    for tok in tl.static_range(BLOCK_TOKENS):
+        token_id = token_base + tok
+        valid_token = token_id < T
+        base = token_id * TOP_K
+        for k in tl.static_range(TOP_K):
+            local_exp = tl.load(local_topk_idx_ptr + base + k, mask=valid_token, other=-1)
+            valid = valid_token & (local_exp >= 0) & (local_exp < E_LOCAL)
+            counts += tl.where(valid & (local_e == local_exp), 1, 0).to(tl.int32)
+
+    reserved = tl.atomic_add(write_offsets_ptr + local_e, counts, mask=counts > 0, sem='relaxed')
+    running = tl.zeros((E_LOCAL,), dtype=tl.int32)
+
+    # Second pass: place items into the reserved ranges.
+    for tok in tl.static_range(BLOCK_TOKENS):
+        token_id = token_base + tok
+        valid_token = token_id < T
+        base = token_id * TOP_K
+        for k in tl.static_range(TOP_K):
+            local_exp = tl.load(local_topk_idx_ptr + base + k, mask=valid_token, other=-1)
+            wgt = tl.load(topk_wts_ptr + base + k, mask=valid_token, other=0.0)
+            valid = valid_token & (local_exp >= 0) & (local_exp < E_LOCAL)
+            is_match = local_e == local_exp
+            dest = tl.sum(tl.where(is_match, reserved + running, 0), axis=0)
+
+            tl.store(scatter_map_ptr + base + k, -1, mask=valid_token)
+            tl.store(sorted_tokens_ptr + dest, token_id, mask=valid)
+            tl.store(sorted_weights_ptr + dest, wgt, mask=valid)
+            tl.store(scatter_map_ptr + base + k, dest, mask=valid)
+            running += tl.where(valid & is_match, 1, 0).to(tl.int32)
+
 def parallel_sort_and_scatter(
     topk_idx,
     topk_wts,
@@ -581,6 +810,7 @@ def parallel_sort_and_scatter(
     counts_workspace=None,
     remapped_block_offsets=None,
     remapped_total_blocks=None,
+    histogram_ready=False,
 ):
     num_items = T * TOP_K
     num_tiles = triton.cdiv(num_items, SORT_BLOCK_ITEMS)
@@ -604,15 +834,16 @@ def parallel_sort_and_scatter(
         )
         return
 
-    triton_sort_histogram_kernel[(num_tiles,)](
-        topk_idx,
-        partial_counts,
-        local_start=local_start,
-        N=num_items,
-        E_LOCAL=E_LOCAL,
-        BLOCK_ITEMS=SORT_BLOCK_ITEMS,
-        num_warps=4,
-    )
+    if not histogram_ready:
+        triton_sort_histogram_kernel[(num_tiles,)](
+            topk_idx,
+            partial_counts,
+            local_start=local_start,
+            N=num_items,
+            E_LOCAL=E_LOCAL,
+            BLOCK_ITEMS=SORT_BLOCK_ITEMS,
+            num_warps=4,
+        )
     if remapped_block_offsets is not None and remapped_total_blocks is not None:
         triton_sort_layout_with_remap_kernel[(1,)](
             partial_counts,
@@ -661,6 +892,72 @@ def parallel_sort_and_scatter(
         TOP_K=TOP_K,
         E_LOCAL=E_LOCAL,
         BLOCK_ITEMS=SORT_BLOCK_ITEMS,
+        num_warps=4,
+    )
+
+
+def token_sort_and_scatter(
+    local_topk_idx,
+    topk_wts,
+    sorted_token_ids,
+    sorted_weights,
+    scatter_map,
+    block_offsets,
+    total_blocks,
+    expert_counts,
+    write_offsets,
+    T,
+    block_m,
+    max_padded,
+    remapped_block_offsets=None,
+    remapped_total_blocks=None,
+):
+    if remapped_block_offsets is not None and remapped_total_blocks is not None:
+        triton_token_layout_with_remap_kernel[(1,)](
+            expert_counts,
+            block_offsets,
+            total_blocks,
+            write_offsets,
+            remapped_block_offsets,
+            remapped_total_blocks,
+            E_LOCAL=E_LOCAL,
+            BLOCK_M=block_m,
+            REMAPPED_BLOCK_M=REMAPPED_GEMM1_BLOCK_M,
+            num_warps=1,
+        )
+    else:
+        triton_token_layout_kernel[(1,)](
+            expert_counts,
+            block_offsets,
+            total_blocks,
+            write_offsets,
+            E_LOCAL=E_LOCAL,
+            BLOCK_M=block_m,
+            num_warps=1,
+        )
+
+    triton_init_sorted_buffers_kernel[(triton.cdiv(max_padded, SORT_BLOCK_ITEMS),)](
+        sorted_token_ids,
+        sorted_weights,
+        total_blocks,
+        T,
+        BLOCK_M=block_m,
+        MAX_PADDED=max_padded,
+        BLOCK_ITEMS=SORT_BLOCK_ITEMS,
+        num_warps=4,
+    )
+
+    triton_token_scatter_kernel[(triton.cdiv(T, TOKEN_SCATTER_BLOCK_TOKENS),)](
+        local_topk_idx,
+        topk_wts,
+        sorted_token_ids,
+        sorted_weights,
+        scatter_map,
+        write_offsets,
+        T=T,
+        TOP_K=TOP_K,
+        E_LOCAL=E_LOCAL,
+        BLOCK_TOKENS=TOKEN_SCATTER_BLOCK_TOKENS,
         num_warps=4,
     )
 
@@ -826,6 +1123,7 @@ def _fused_moe_gemm1_swiglu_kernel(
     # Store to C as fp32 (bf16 causes too much precision loss — 6/19 PASSED)
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     tl.store(c_ptrs, swiglu_out, eviction_policy='evict_first')
+
 
 @triton.autotune(
     configs=[
@@ -1660,7 +1958,9 @@ def _t1_fused_gemm1_swiglu_kernel(
 
 _buf_cache = {}
 _routing_cache = {}
+_routing_hist_cache = {}
 _sort_cache = {}
+_token_sort_cache = {}
 _remapped_gemm1_cache = {}
 _t1_cache = {}
 def _select_block_m(num_topk_tokens: int) -> int:
@@ -1962,14 +2262,6 @@ def kernel(
         topk_wts_ws = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
         _routing_cache[rkey] = (topk_idx_ws, topk_wts_ws)
 
-    ds_routing(
-        routing_logits,
-        routing_bias,
-        scale_factor,
-        topk_idx=topk_idx_ws,
-        topk_weights=topk_wts_ws,
-    )
-
     block_m = _select_block_m(T * TOP_K)
     MAX_PADDED = T * TOP_K + E_LOCAL * block_m
     MAX_PID_M = MAX_PADDED // block_m
@@ -2001,6 +2293,39 @@ def kernel(
             sorted_token_ids, sorted_weights, scatter_map,
             block_offsets, total_blocks, counts_workspace, partial_counts, tile_offsets,
         )
+
+    num_tiles = triton.cdiv(T * TOP_K, SORT_BLOCK_ITEMS)
+    use_fused_routing_histogram = num_tiles >= PARALLEL_SORT_MIN_TILES
+    if use_fused_routing_histogram:
+        if rkey in _routing_hist_cache:
+            local_topk_idx_ws = _routing_hist_cache[rkey]
+        else:
+            local_topk_idx_ws = torch.empty((T, TOP_K), dtype=torch.int32, device=device)
+            _routing_hist_cache[rkey] = local_topk_idx_ws
+        if bkey in _token_sort_cache:
+            write_offsets_ws = _token_sort_cache[bkey]
+        else:
+            write_offsets_ws = torch.empty((E_LOCAL,), dtype=torch.int32, device=device)
+            _token_sort_cache[bkey] = write_offsets_ws
+        ds_routing_with_histogram(
+            routing_logits,
+            routing_bias,
+            scale_factor,
+            local_topk_idx_ws,
+            counts_workspace,
+            local_start,
+            topk_idx=topk_idx_ws,
+            topk_weights=topk_wts_ws,
+        )
+    else:
+        ds_routing(
+            routing_logits,
+            routing_bias,
+            scale_factor,
+            topk_idx=topk_idx_ws,
+            topk_weights=topk_wts_ws,
+        )
+
     remapped_block_offsets = None
     remapped_total_blocks = None
     if use_remapped_gemm1:
@@ -2010,24 +2335,43 @@ def kernel(
             remapped_block_offsets = torch.empty((E_LOCAL + 1,), dtype=torch.int32, device=device)
             remapped_total_blocks = torch.empty((1,), dtype=torch.int32, device=device)
             _remapped_gemm1_cache[bkey] = (remapped_block_offsets, remapped_total_blocks)
-    parallel_sort_and_scatter(
-        topk_idx_ws,
-        topk_wts_ws,
-        sorted_token_ids,
-        sorted_weights,
-        scatter_map,
-        block_offsets,
-        total_blocks,
-        partial_counts,
-        tile_offsets,
-        local_start,
-        T,
-        block_m,
-        MAX_PADDED,
-        counts_workspace,
-        remapped_block_offsets=remapped_block_offsets,
-        remapped_total_blocks=remapped_total_blocks,
-    )
+    if use_fused_routing_histogram:
+        token_sort_and_scatter(
+            local_topk_idx_ws,
+            topk_wts_ws,
+            sorted_token_ids,
+            sorted_weights,
+            scatter_map,
+            block_offsets,
+            total_blocks,
+            counts_workspace,
+            write_offsets_ws,
+            T,
+            block_m,
+            MAX_PADDED,
+            remapped_block_offsets=remapped_block_offsets,
+            remapped_total_blocks=remapped_total_blocks,
+        )
+    else:
+        parallel_sort_and_scatter(
+            topk_idx_ws,
+            topk_wts_ws,
+            sorted_token_ids,
+            sorted_weights,
+            scatter_map,
+            block_offsets,
+            total_blocks,
+            partial_counts,
+            tile_offsets,
+            local_start,
+            T,
+            block_m,
+            MAX_PADDED,
+            counts_workspace,
+            remapped_block_offsets=remapped_block_offsets,
+            remapped_total_blocks=remapped_total_blocks,
+            histogram_ready=use_fused_routing_histogram,
+        )
 
     # Only switch to exact workload dispatch for very large traces where the reduced overlaunch
     # amortizes the single total_blocks host read.

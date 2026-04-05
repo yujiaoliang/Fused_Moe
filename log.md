@@ -452,3 +452,72 @@ canonical large-T 路径里 `BLOCK_M=128`，对 `T=11948/14107` 这类 trace，`
 * 再评估 remapped GEMM1 的 autotune shortlist
 
 而不是重新回到 dual-bucket、cluster、lookup-only 这些已经被证伪或收益很弱的方向。
+
+### 2026-04-05 保留优化：fused routing + token-major sort/layout/scatter
+
+#### 背景
+
+`0402base` 之后，large-T 路径里 `GEMM1/GEMM2` 仍然是主要大头，但 `routing + sort/layout/scatter`
+这段固定成本还存在一笔可以继续压缩的开销。此前并行 sort 路径仍然依赖：
+
+* routing 先产出 `topk_idx / topk_weights`
+* 再单独生成 histogram / layout
+* 最后走 tile-based scatter
+
+这条链路本身没有错，但和 `1 program = 1 token` 的 routing 主体并不完全匹配，而且 sort/scatter
+侧还有额外的 launch、重复读写和逐 item atomic 成本。
+
+#### 修改内容
+
+围绕 `solution/triton/kernel.py` 最终保留了下面这组改动：
+
+* 新增 `_fused_routing_histogram_kernel(...)`
+  * 保持 `1 program = 1 token`
+  * routing 时顺手产出 `local_topk_idx`
+  * 只对 local expert 保留 `0..31`，非本地写 `-1`
+* 新增 `ds_routing_with_histogram(...)` wrapper，给 large-T 并行 sort 场景提供 fused routing 入口
+* 新增 token-major sort/layout/scatter 路径：
+  * `triton_token_layout_kernel(...)`
+  * `triton_token_layout_with_remap_kernel(...)`
+  * `triton_token_scatter_kernel(...)`
+  * `token_sort_and_scatter(...)`
+* `token_scatter` 从“逐 item atomic 分配”改成“program 内局部计数 + 按 expert 成批预留区间 + 回填`
+  * 当前 `BLOCK_TOKENS = 8`
+* host 侧新增 `_routing_hist_cache` 和 `_token_sort_cache`
+* large-T 命中条件下：
+  * routing 走 fused 版本
+  * sort/layout/scatter 走 token-major 版本
+  * `large-T single remapped GEMM1` 路径继续保留，不改 `GEMM2 / reduce`
+
+#### 实测效果
+
+相对 `0402base`，这组修改的端到端收益不算大，但已经是稳定正收益：
+
+* 平均 `wall: 0.661211 ms -> 0.656579 ms`，约 `-0.70%`
+* `T=11948`
+  * `Wall: 3.370 ms -> 3.319 ms`，约 `-1.5%`
+* `T=14107`
+  * `Wall: 4.769 ms -> 4.730 ms`，约 `-0.8%`
+
+如果只看新 feature 命中的 `routing / sort / scatter` 这一段局部固定成本，改善幅度会更明显：
+
+* `triton_token_scatter_kernel`
+  * `T=11948: 16.82 us -> 16.58 us`
+  * `T=14107: 19.39 us -> 17.78 us`
+* large-T 下的 routing + sort/layout/scatter 子路径，整体属于约 `2%-5%` 量级的 feature 改善
+* 但端到端总收益会被 `GEMM1/GEMM2` 主体占比稀释，最终只体现为约 `0.7%` mean 改善
+
+#### 结论
+
+这条优化是有效的，而且已经可以保留进主线，但它的性质更接近：
+
+* **压缩 large-T 下 routing / sort / scatter 的固定成本**
+* **让 sort/layout/scatter 的组织方式真正和 `1 program = 1 token` 的 routing 对齐**
+* **在不破坏 `GEMM1/GEMM2` 主体的前提下拿一笔稳定小收益**
+
+后续如果继续围绕这条线优化，优先级应该放在：
+
+* 继续压 `token_scatter` 的局部原子和写回开销
+* 评估是否还有必要进一步精简 token-major layout 的辅助 metadata
+
+而不应该再回到 tile-serial routing、global atomic histogram、或者把整条 routing 主体改成低并行度实现。
