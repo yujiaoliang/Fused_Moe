@@ -1260,6 +1260,21 @@ def _mapped_bucket_fused_moe_gemm1_swiglu_kernel(
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=8, num_stages=4),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=4),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=4),
+        # --- NEW: Low-warp configs for short K=2048 loop (16 iters) ---
+        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=3),
+        # Low GROUP_M for few-block workloads (T=901: 36 blocks)
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=8, num_stages=2),
+        # Large GROUP_M for better L2 weight reuse
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=8, num_stages=3),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
     restore_value=['C_ptr'],
@@ -1465,6 +1480,20 @@ def _small_medium_fused_moe_gemm1_swiglu_kernel(
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=4, num_stages=4),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=4, num_stages=4),
         triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=2, num_stages=3),
+        # --- NEW: Low-warp / low-latency for short K=2048 loop ---
+        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=3),
+        # Higher warp counts for medium blocks
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+        # Large GROUP_M for weight L2 reuse
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=8, num_stages=3),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
     restore_value=['C_ptr'],
@@ -1637,6 +1666,20 @@ def _medium_fused_moe_gemm1_swiglu_kernel(
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=6),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=7),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=8),
+        # --- NEW: Low-warp configs for short K=2048 loop ---
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=4, num_stages=2),
+        # High-stages for pipeline fill
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=4),
+        # Large GROUP_M for weight L2 reuse
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=8, num_stages=3),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
     restore_value=['C_ptr'],

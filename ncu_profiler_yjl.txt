@@ -1,0 +1,759 @@
+GPU: NVIDIA B200
+PyTorch: 2.10.0+cu128
+Triton: 3.6.0
+Kernel loaded
+NCU: not found (skip hardware counters)
+Trace samples loaded for T values: [1, 7, 14, 15, 16, 32, 52, 53, 54, 55, 56, 57, 58, 59, 62, 80, 901, 11948, 14107]
+Using trace T values: [1, 7, 14, 15, 16, 32, 52, 53, 54, 55, 56, 57, 58, 59, 62, 80, 901, 11948, 14107]
+
+================================================================================================
+T = 1
+================================================================================================
+Input source: trace set (T=1)
+Inferred padding: block_m=16, total_blocks=3, num_padded=48, num_local_rows=3, tail_rows=45, tail_experts=3
+Wall: 0.105 ms/iter | Throughput: 9,489 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.032 ms ( 32.1%)
+  GEMM2   :    0.055 ms ( 55.1%)
+  Routing :    0.010 ms (  9.9%)
+  Sorting :    0.000 ms (  0.0%)
+  MemOps  :    0.001 ms (  1.4%)
+  Other   :    0.002 ms (  1.5%)
+  Total CUDA: 0.100 ms/iter
+  CPU overhead: 0.006 ms/iter (5.5%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.006 ms ( 12.8%)
+  Framework:    0.006 ms ( 12.4%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.034 ms ( 74.9%)
+  Total profiled CPU: 0.046 ms/iter
+Top kernels:
+  [gemm2  ]    54.87 us x 1.0 | _t1_fused_gemm2_reduce_kernel
+  [gemm1  ]    31.96 us x 1.0 | _t1_fused_gemm1_swiglu_kernel
+  [routing]     9.88 us x 1.0 | triton_ds_routing_t1_local_kernel
+  [memops ]     1.39 us x 1.0 | aten::fill_
+  [other  ]     1.39 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+  [other  ]     0.12 us x 3.0 | cuLaunchKernelEx
+  [other  ]     0.02 us x 0.0 | Activity Buffer Request
+Top CPU/API events:
+  [other    ]    21.73 us x 0.0 | Activity Buffer Request
+  [other    ]    12.53 us x 3.0 | cuLaunchKernelEx
+  [cuda_api ]     5.50 us x 1.0 | cudaLaunchKernel
+  [framework]     3.17 us x 1.0 | aten::fill_
+  [framework]     2.49 us x 1.0 | aten::zero_
+  [cuda_api ]     0.34 us x 0.0 | cudaDeviceSynchronize
+Effective TFLOPS (actual num_padded=48): GEMM1=88.2T, GEMM2=25.7T
+
+================================================================================================
+T = 7
+================================================================================================
+Input source: trace set (T=7)
+Inferred padding: block_m=16, total_blocks=7, num_padded=112, num_local_rows=7, tail_rows=105, tail_experts=7
+Wall: 0.159 ms/iter | Throughput: 44,150 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.048 ms ( 51.3%)
+  GEMM2   :    0.030 ms ( 32.2%)
+  Routing :    0.007 ms (  7.6%)
+  Sorting :    0.003 ms (  3.0%)
+  MemOps  :    0.001 ms (  1.5%)
+  Other   :    0.004 ms (  4.5%)
+  Total CUDA: 0.093 ms/iter
+  CPU overhead: 0.065 ms/iter (41.1%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.005 ms (  9.6%)
+  Framework:    0.006 ms ( 10.9%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.043 ms ( 79.5%)
+  Total profiled CPU: 0.054 ms/iter
+Top kernels:
+  [gemm1  ]    47.89 us x 1.0 | _fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    30.04 us x 1.0 | _fused_moe_gemm2_kernel
+  [routing]     7.08 us x 1.0 | triton_ds_routing_kernel
+  [sorting]     2.76 us x 1.0 | triton_sort_and_scatter_kernel
+  [other  ]     2.75 us x 1.0 | _token_reduce_kernel
+  [memops ]     1.40 us x 1.0 | aten::fill_
+  [other  ]     1.40 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [other    ]    21.56 us x 0.0 | Activity Buffer Request
+  [other    ]    21.20 us x 5.0 | cuLaunchKernelEx
+  [cuda_api ]     5.04 us x 1.0 | cudaLaunchKernel
+  [framework]     3.36 us x 1.0 | aten::fill_
+  [framework]     2.52 us x 1.0 | aten::zero_
+  [cuda_api ]     0.11 us x 0.0 | cudaDeviceSynchronize
+Effective TFLOPS (actual num_padded=112): GEMM1=137.3T, GEMM2=109.5T
+
+================================================================================================
+T = 14
+================================================================================================
+Input source: trace set (T=14)
+Inferred padding: block_m=16, total_blocks=12, num_padded=192, num_local_rows=15, tail_rows=177, tail_experts=12
+Wall: 0.158 ms/iter | Throughput: 88,734 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.068 ms ( 52.0%)
+  GEMM2   :    0.046 ms ( 35.3%)
+  Routing :    0.007 ms (  5.6%)
+  Sorting :    0.003 ms (  2.1%)
+  MemOps  :    0.001 ms (  1.1%)
+  Other   :    0.005 ms (  3.9%)
+  Total CUDA: 0.131 ms/iter
+  CPU overhead: 0.026 ms/iter (16.7%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.005 ms ( 11.7%)
+  Framework:    0.006 ms ( 12.9%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.035 ms ( 75.3%)
+  Total profiled CPU: 0.047 ms/iter
+Top kernels:
+  [gemm1  ]    68.36 us x 1.0 | _fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    46.42 us x 1.0 | _fused_moe_gemm2_kernel
+  [routing]     7.34 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     3.74 us x 1.0 | _token_reduce_kernel
+  [sorting]     2.73 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.43 us x 1.0 | aten::fill_
+  [other  ]     1.43 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [other    ]    20.56 us x 5.0 | cuLaunchKernelEx
+  [other    ]    14.63 us x 0.0 | Activity Buffer Request
+  [cuda_api ]     5.05 us x 1.0 | cudaLaunchKernel
+  [framework]     3.46 us x 1.0 | aten::fill_
+  [framework]     2.58 us x 1.0 | aten::zero_
+  [cuda_api ]     0.43 us x 0.0 | cudaDeviceSynchronize
+Effective TFLOPS (actual num_padded=192): GEMM1=164.9T, GEMM2=121.4T
+
+================================================================================================
+T = 15
+================================================================================================
+Input source: trace set (T=15)
+Inferred padding: block_m=16, total_blocks=5, num_padded=80, num_local_rows=10, tail_rows=70, tail_experts=5
+Wall: 0.160 ms/iter | Throughput: 93,930 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.046 ms ( 50.8%)
+  GEMM2   :    0.029 ms ( 32.0%)
+  Routing :    0.007 ms (  8.2%)
+  Sorting :    0.002 ms (  2.6%)
+  MemOps  :    0.001 ms (  1.6%)
+  Other   :    0.004 ms (  4.8%)
+  Total CUDA: 0.090 ms/iter
+  CPU overhead: 0.070 ms/iter (43.9%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.021 ms ( 34.1%)
+  Framework:    0.006 ms (  9.9%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.034 ms ( 56.0%)
+  Total profiled CPU: 0.061 ms/iter
+Top kernels:
+  [gemm1  ]    45.54 us x 1.0 | _fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    28.67 us x 1.0 | _fused_moe_gemm2_kernel
+  [routing]     7.39 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     2.85 us x 1.0 | _token_reduce_kernel
+  [sorting]     2.33 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.43 us x 1.0 | aten::fill_
+  [other  ]     1.43 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]    20.83 us x 1.0 | cudaLaunchKernel
+  [other    ]    20.13 us x 5.0 | cuLaunchKernelEx
+  [other    ]    14.27 us x 0.0 | Activity Buffer Request
+  [framework]     3.49 us x 1.0 | aten::fill_
+  [framework]     2.57 us x 1.0 | aten::zero_
+  [cuda_api ]     0.10 us x 0.0 | cudaDeviceSynchronize
+Effective TFLOPS (actual num_padded=80): GEMM1=103.2T, GEMM2=81.9T
+
+================================================================================================
+T = 16
+================================================================================================
+Input source: trace set (T=16)
+Inferred padding: block_m=16, total_blocks=13, num_padded=208, num_local_rows=19, tail_rows=189, tail_experts=13
+Wall: 0.156 ms/iter | Throughput: 102,592 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.072 ms ( 53.9%)
+  GEMM2   :    0.047 ms ( 34.9%)
+  Routing :    0.006 ms (  4.7%)
+  Sorting :    0.002 ms (  1.7%)
+  MemOps  :    0.001 ms (  1.1%)
+  Other   :    0.005 ms (  3.7%)
+  Total CUDA: 0.135 ms/iter
+  CPU overhead: 0.021 ms/iter (13.7%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.021 ms ( 34.4%)
+  Framework:    0.006 ms ( 10.4%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.033 ms ( 55.2%)
+  Total profiled CPU: 0.060 ms/iter
+Top kernels:
+  [gemm1  ]    72.48 us x 1.0 | _fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    46.94 us x 1.0 | _fused_moe_gemm2_kernel
+  [routing]     6.30 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     3.57 us x 1.0 | _token_reduce_kernel
+  [sorting]     2.35 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.44 us x 1.0 | aten::fill_
+  [other  ]     1.44 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [other    ]    21.21 us x 5.0 | cuLaunchKernelEx
+  [cuda_api ]    20.34 us x 1.0 | cudaLaunchKernel
+  [other    ]    12.06 us x 0.0 | Activity Buffer Request
+  [framework]     3.77 us x 1.0 | aten::fill_
+  [framework]     2.52 us x 1.0 | aten::zero_
+  [cuda_api ]     0.40 us x 0.0 | cudaDeviceSynchronize
+Effective TFLOPS (actual num_padded=208): GEMM1=168.5T, GEMM2=130.1T
+
+================================================================================================
+T = 32
+================================================================================================
+Input source: trace set (T=32)
+Inferred padding: block_m=16, total_blocks=22, num_padded=352, num_local_rows=36, tail_rows=316, tail_experts=22
+Wall: 0.228 ms/iter | Throughput: 140,430 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.121 ms ( 56.3%)
+  GEMM2   :    0.077 ms ( 35.9%)
+  Routing :    0.007 ms (  3.4%)
+  Sorting :    0.002 ms (  1.1%)
+  MemOps  :    0.001 ms (  0.7%)
+  Other   :    0.005 ms (  2.5%)
+  Total CUDA: 0.216 ms/iter
+  CPU overhead: 0.012 ms/iter (5.4%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.067 ms ( 67.8%)
+  Framework:    0.006 ms (  6.1%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.026 ms ( 26.2%)
+  Total profiled CPU: 0.099 ms/iter
+Top kernels:
+  [gemm1  ]   121.43 us x 1.0 | _small_medium_fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    77.39 us x 1.0 | _small_medium_fused_moe_gemm2_kernel
+  [routing]     7.43 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     4.00 us x 1.0 | _token_reduce_kernel
+  [sorting]     2.37 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.48 us x 1.0 | aten::fill_
+  [other  ]     1.48 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]    58.87 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    20.95 us x 5.0 | cuLaunchKernelEx
+  [cuda_api ]     8.04 us x 1.0 | cudaLaunchKernel
+  [other    ]     4.87 us x 0.0 | Activity Buffer Request
+  [framework]     3.52 us x 1.0 | aten::fill_
+  [framework]     2.47 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=352): GEMM1=170.2T, GEMM2=133.5T
+
+================================================================================================
+T = 52
+================================================================================================
+Input source: trace set (T=52)
+Inferred padding: block_m=16, total_blocks=17, num_padded=272, num_local_rows=26, tail_rows=246, tail_experts=17
+Wall: 0.188 ms/iter | Throughput: 276,072 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.096 ms ( 54.4%)
+  GEMM2   :    0.063 ms ( 35.4%)
+  Routing :    0.008 ms (  4.6%)
+  Sorting :    0.003 ms (  1.9%)
+  MemOps  :    0.002 ms (  0.8%)
+  Other   :    0.005 ms (  2.9%)
+  Total CUDA: 0.177 ms/iter
+  CPU overhead: 0.012 ms/iter (6.1%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.031 ms ( 47.8%)
+  Framework:    0.006 ms (  8.7%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.028 ms ( 43.5%)
+  Total profiled CPU: 0.065 ms/iter
+Top kernels:
+  [gemm1  ]    96.10 us x 1.0 | _small_medium_fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    62.61 us x 1.0 | _small_medium_fused_moe_gemm2_kernel
+  [routing]     8.11 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     3.54 us x 1.0 | _token_reduce_kernel
+  [sorting]     3.42 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.50 us x 1.0 | aten::fill_
+  [other  ]     1.50 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]    23.45 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    20.06 us x 5.0 | cuLaunchKernelEx
+  [other    ]     8.41 us x 0.0 | Activity Buffer Request
+  [cuda_api ]     7.79 us x 1.0 | cudaLaunchKernel
+  [framework]     3.27 us x 1.0 | aten::fill_
+  [framework]     2.40 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=272): GEMM1=166.2T, GEMM2=127.6T
+
+================================================================================================
+T = 53
+================================================================================================
+Input source: trace set (T=53)
+Inferred padding: block_m=16, total_blocks=24, num_padded=384, num_local_rows=53, tail_rows=331, tail_experts=24
+Wall: 0.241 ms/iter | Throughput: 220,108 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.125 ms ( 55.0%)
+  GEMM2   :    0.085 ms ( 37.2%)
+  Routing :    0.008 ms (  3.4%)
+  Sorting :    0.003 ms (  1.3%)
+  MemOps  :    0.002 ms (  0.7%)
+  Other   :    0.006 ms (  2.4%)
+  Total CUDA: 0.228 ms/iter
+  CPU overhead: 0.013 ms/iter (5.4%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.077 ms ( 66.4%)
+  Framework:    0.006 ms (  5.2%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.033 ms ( 28.3%)
+  Total profiled CPU: 0.115 ms/iter
+Top kernels:
+  [gemm1  ]   125.33 us x 1.0 | _small_medium_fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    84.68 us x 1.0 | _small_medium_fused_moe_gemm2_kernel
+  [routing]     7.67 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     4.01 us x 1.0 | _token_reduce_kernel
+  [sorting]     3.02 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.50 us x 1.0 | aten::fill_
+  [other  ]     1.50 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]    68.82 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    21.56 us x 5.0 | cuLaunchKernelEx
+  [other    ]    11.14 us x 0.0 | Activity Buffer Request
+  [cuda_api ]     7.81 us x 1.0 | cudaLaunchKernel
+  [framework]     3.44 us x 1.0 | aten::fill_
+  [framework]     2.60 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=384): GEMM1=179.9T, GEMM2=133.1T
+
+================================================================================================
+T = 54
+================================================================================================
+Input source: trace set (T=54)
+Inferred padding: block_m=16, total_blocks=23, num_padded=368, num_local_rows=43, tail_rows=325, tail_experts=23
+Wall: 0.230 ms/iter | Throughput: 235,055 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.122 ms ( 55.9%)
+  GEMM2   :    0.078 ms ( 35.7%)
+  Routing :    0.008 ms (  3.6%)
+  Sorting :    0.003 ms (  1.4%)
+  MemOps  :    0.001 ms (  0.7%)
+  Other   :    0.006 ms (  2.7%)
+  Total CUDA: 0.218 ms/iter
+  CPU overhead: 0.012 ms/iter (5.2%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.078 ms ( 62.7%)
+  Framework:    0.006 ms (  5.0%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.040 ms ( 32.3%)
+  Total profiled CPU: 0.124 ms/iter
+Top kernels:
+  [gemm1  ]   121.82 us x 1.0 | _small_medium_fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    77.80 us x 1.0 | _small_medium_fused_moe_gemm2_kernel
+  [routing]     7.82 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     4.48 us x 1.0 | _token_reduce_kernel
+  [sorting]     2.98 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.48 us x 1.0 | aten::fill_
+  [other  ]     1.48 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]    57.90 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    21.82 us x 5.0 | cuLaunchKernelEx
+  [cuda_api ]    19.73 us x 1.0 | cudaLaunchKernel
+  [other    ]    18.16 us x 0.0 | Activity Buffer Request
+  [framework]     3.50 us x 1.0 | aten::fill_
+  [framework]     2.66 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=368): GEMM1=177.4T, GEMM2=138.9T
+
+================================================================================================
+T = 55
+================================================================================================
+Input source: trace set (T=55)
+Inferred padding: block_m=16, total_blocks=24, num_padded=384, num_local_rows=55, tail_rows=329, tail_experts=24
+Wall: 0.241 ms/iter | Throughput: 227,846 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.125 ms ( 54.8%)
+  GEMM2   :    0.085 ms ( 37.0%)
+  Routing :    0.008 ms (  3.3%)
+  Sorting :    0.004 ms (  1.6%)
+  MemOps  :    0.001 ms (  0.6%)
+  Other   :    0.006 ms (  2.7%)
+  Total CUDA: 0.229 ms/iter
+  CPU overhead: 0.013 ms/iter (5.2%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.080 ms ( 62.4%)
+  Framework:    0.006 ms (  4.6%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.042 ms ( 32.9%)
+  Total profiled CPU: 0.127 ms/iter
+Top kernels:
+  [gemm1  ]   125.41 us x 1.0 | _small_medium_fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    84.71 us x 1.0 | _small_medium_fused_moe_gemm2_kernel
+  [routing]     7.58 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     4.63 us x 1.0 | _token_reduce_kernel
+  [sorting]     3.60 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.47 us x 1.0 | aten::fill_
+  [other  ]     1.47 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]    71.77 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    21.32 us x 5.0 | cuLaunchKernelEx
+  [other    ]    20.65 us x 0.0 | Activity Buffer Request
+  [cuda_api ]     7.76 us x 1.0 | cudaLaunchKernel
+  [framework]     3.45 us x 1.0 | aten::fill_
+  [framework]     2.47 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=384): GEMM1=179.8T, GEMM2=133.1T
+
+================================================================================================
+T = 56
+================================================================================================
+Input source: trace set (T=56)
+Inferred padding: block_m=16, total_blocks=26, num_padded=416, num_local_rows=72, tail_rows=344, tail_experts=26
+Wall: 0.252 ms/iter | Throughput: 222,504 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.134 ms ( 56.1%)
+  GEMM2   :    0.087 ms ( 36.2%)
+  Routing :    0.008 ms (  3.3%)
+  Sorting :    0.003 ms (  1.3%)
+  MemOps  :    0.001 ms (  0.6%)
+  Other   :    0.006 ms (  2.5%)
+  Total CUDA: 0.240 ms/iter
+  CPU overhead: 0.012 ms/iter (4.8%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.088 ms ( 66.2%)
+  Framework:    0.006 ms (  4.5%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.039 ms ( 29.3%)
+  Total profiled CPU: 0.133 ms/iter
+Top kernels:
+  [gemm1  ]   134.39 us x 1.0 | _small_medium_fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    86.64 us x 1.0 | _small_medium_fused_moe_gemm2_kernel
+  [routing]     7.92 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     4.55 us x 1.0 | _token_reduce_kernel
+  [sorting]     3.10 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.48 us x 1.0 | aten::fill_
+  [other  ]     1.48 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]    80.45 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    20.71 us x 5.0 | cuLaunchKernelEx
+  [other    ]    18.34 us x 0.0 | Activity Buffer Request
+  [cuda_api ]     7.72 us x 1.0 | cudaLaunchKernel
+  [framework]     3.43 us x 1.0 | aten::fill_
+  [framework]     2.58 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=416): GEMM1=181.8T, GEMM2=141.0T
+
+================================================================================================
+T = 57
+================================================================================================
+Input source: trace set (T=57)
+Inferred padding: block_m=16, total_blocks=25, num_padded=400, num_local_rows=63, tail_rows=337, tail_experts=25
+Wall: 0.247 ms/iter | Throughput: 230,897 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.130 ms ( 55.6%)
+  GEMM2   :    0.086 ms ( 36.5%)
+  Routing :    0.008 ms (  3.4%)
+  Sorting :    0.003 ms (  1.3%)
+  MemOps  :    0.001 ms (  0.6%)
+  Other   :    0.006 ms (  2.5%)
+  Total CUDA: 0.235 ms/iter
+  CPU overhead: 0.012 ms/iter (5.0%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.084 ms ( 72.7%)
+  Framework:    0.006 ms (  5.1%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.026 ms ( 22.2%)
+  Total profiled CPU: 0.116 ms/iter
+Top kernels:
+  [gemm1  ]   130.49 us x 1.0 | _small_medium_fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    85.60 us x 1.0 | _small_medium_fused_moe_gemm2_kernel
+  [routing]     8.09 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     4.45 us x 1.0 | _token_reduce_kernel
+  [sorting]     2.97 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.50 us x 1.0 | aten::fill_
+  [other  ]     1.50 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]    76.36 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    21.70 us x 5.0 | cuLaunchKernelEx
+  [cuda_api ]     8.05 us x 1.0 | cudaLaunchKernel
+  [other    ]     4.04 us x 0.0 | Activity Buffer Request
+  [framework]     3.38 us x 1.0 | aten::fill_
+  [framework]     2.54 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=400): GEMM1=180.0T, GEMM2=137.2T
+
+================================================================================================
+T = 58
+================================================================================================
+Input source: trace set (T=58)
+Inferred padding: block_m=16, total_blocks=26, num_padded=416, num_local_rows=77, tail_rows=339, tail_experts=26
+Wall: 0.252 ms/iter | Throughput: 229,819 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.135 ms ( 56.1%)
+  GEMM2   :    0.086 ms ( 35.8%)
+  Routing :    0.008 ms (  3.4%)
+  Sorting :    0.003 ms (  1.4%)
+  MemOps  :    0.001 ms (  0.6%)
+  Other   :    0.006 ms (  2.6%)
+  Total CUDA: 0.241 ms/iter
+  CPU overhead: 0.011 ms/iter (4.4%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.090 ms ( 65.8%)
+  Framework:    0.006 ms (  4.3%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.041 ms ( 29.9%)
+  Total profiled CPU: 0.137 ms/iter
+Top kernels:
+  [gemm1  ]   135.24 us x 1.0 | _small_medium_fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    86.44 us x 1.0 | _small_medium_fused_moe_gemm2_kernel
+  [routing]     8.27 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     4.77 us x 1.0 | _token_reduce_kernel
+  [sorting]     3.48 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.47 us x 1.0 | aten::fill_
+  [other  ]     1.47 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]    82.48 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    22.09 us x 5.0 | cuLaunchKernelEx
+  [other    ]    18.98 us x 0.0 | Activity Buffer Request
+  [cuda_api ]     7.96 us x 1.0 | cudaLaunchKernel
+  [framework]     3.36 us x 1.0 | aten::fill_
+  [framework]     2.52 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=416): GEMM1=180.6T, GEMM2=141.3T
+
+================================================================================================
+T = 59
+================================================================================================
+Input source: trace set (T=59)
+Inferred padding: block_m=16, total_blocks=19, num_padded=304, num_local_rows=41, tail_rows=263, tail_experts=19
+Wall: 0.203 ms/iter | Throughput: 290,088 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.104 ms ( 54.3%)
+  GEMM2   :    0.069 ms ( 36.3%)
+  Routing :    0.008 ms (  4.0%)
+  Sorting :    0.004 ms (  1.8%)
+  MemOps  :    0.001 ms (  0.8%)
+  Other   :    0.005 ms (  2.9%)
+  Total CUDA: 0.191 ms/iter
+  CPU overhead: 0.013 ms/iter (6.2%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.042 ms ( 46.2%)
+  Framework:    0.006 ms (  6.3%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.044 ms ( 47.5%)
+  Total profiled CPU: 0.092 ms/iter
+Top kernels:
+  [gemm1  ]   103.53 us x 1.0 | _small_medium_fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    69.16 us x 1.0 | _small_medium_fused_moe_gemm2_kernel
+  [routing]     7.54 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     3.97 us x 1.0 | _token_reduce_kernel
+  [sorting]     3.51 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.50 us x 1.0 | aten::fill_
+  [other  ]     1.50 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]    34.20 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    22.26 us x 5.0 | cuLaunchKernelEx
+  [other    ]    21.25 us x 0.0 | Activity Buffer Request
+  [cuda_api ]     8.11 us x 1.0 | cudaLaunchKernel
+  [framework]     3.32 us x 1.0 | aten::fill_
+  [framework]     2.46 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=304): GEMM1=172.4T, GEMM2=129.0T
+
+================================================================================================
+T = 62
+================================================================================================
+Input source: trace set (T=62)
+Inferred padding: block_m=16, total_blocks=18, num_padded=288, num_local_rows=59, tail_rows=229, tail_experts=18
+Wall: 0.195 ms/iter | Throughput: 317,718 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.100 ms ( 55.0%)
+  GEMM2   :    0.063 ms ( 34.6%)
+  Routing :    0.008 ms (  4.4%)
+  Sorting :    0.003 ms (  1.8%)
+  MemOps  :    0.001 ms (  0.8%)
+  Other   :    0.006 ms (  3.5%)
+  Total CUDA: 0.182 ms/iter
+  CPU overhead: 0.013 ms/iter (6.6%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.048 ms ( 55.5%)
+  Framework:    0.006 ms (  6.8%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.033 ms ( 37.7%)
+  Total profiled CPU: 0.087 ms/iter
+Top kernels:
+  [gemm1  ]   100.19 us x 1.0 | _small_medium_fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    63.01 us x 1.0 | _small_medium_fused_moe_gemm2_kernel
+  [routing]     8.10 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     4.82 us x 1.0 | _token_reduce_kernel
+  [sorting]     3.20 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.50 us x 1.0 | aten::fill_
+  [other  ]     1.50 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]    28.26 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    20.49 us x 5.0 | cuLaunchKernelEx
+  [cuda_api ]    19.83 us x 1.0 | cudaLaunchKernel
+  [other    ]    12.15 us x 0.0 | Activity Buffer Request
+  [framework]     3.39 us x 1.0 | aten::fill_
+  [framework]     2.54 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=288): GEMM1=168.8T, GEMM2=134.2T
+
+================================================================================================
+T = 80
+================================================================================================
+Input source: trace set (T=80)
+Inferred padding: block_m=16, total_blocks=28, num_padded=448, num_local_rows=109, tail_rows=339, tail_experts=28
+Wall: 0.290 ms/iter | Throughput: 275,673 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.166 ms ( 61.0%)
+  GEMM2   :    0.088 ms ( 32.2%)
+  Routing :    0.008 ms (  2.8%)
+  Sorting :    0.003 ms (  1.0%)
+  MemOps  :    0.002 ms (  0.6%)
+  Other   :    0.007 ms (  2.4%)
+  Total CUDA: 0.273 ms/iter
+  CPU overhead: 0.018 ms/iter (6.1%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.127 ms ( 76.6%)
+  Framework:    0.006 ms (  3.5%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.033 ms ( 20.0%)
+  Total profiled CPU: 0.165 ms/iter
+Top kernels:
+  [gemm1  ]   166.15 us x 1.0 | _medium_fused_moe_gemm1_swiglu_kernel
+  [gemm2  ]    87.70 us x 1.0 | _medium_fused_moe_gemm2_kernel
+  [routing]     7.66 us x 1.0 | triton_ds_routing_kernel
+  [other  ]     5.11 us x 1.0 | _token_reduce_kernel
+  [sorting]     2.84 us x 1.0 | triton_sort_and_scatter_kernel
+  [memops ]     1.53 us x 1.0 | aten::fill_
+  [other  ]     1.53 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]   118.43 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    21.47 us x 5.0 | cuLaunchKernelEx
+  [other    ]    11.56 us x 0.0 | Activity Buffer Request
+  [cuda_api ]     8.20 us x 1.0 | cudaLaunchKernel
+  [framework]     3.28 us x 1.0 | aten::fill_
+  [framework]     2.43 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=448): GEMM1=158.3T, GEMM2=150.0T
+
+================================================================================================
+T = 901
+================================================================================================
+Input source: trace set (T=901)
+Inferred padding: block_m=64, total_blocks=36, num_padded=2304, num_local_rows=1331, tail_rows=973, tail_experts=32
+Wall: 0.808 ms/iter | Throughput: 1,114,823 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    0.279 ms ( 35.4%)
+  GEMM2   :    0.453 ms ( 57.6%)
+  Routing :    0.016 ms (  2.0%)
+  Sorting :    0.018 ms (  2.3%)
+  MemOps  :    0.005 ms (  0.6%)
+  Other   :    0.016 ms (  2.1%)
+  Total CUDA: 0.787 ms/iter
+  CPU overhead: 0.021 ms/iter (2.6%)
+CPU/API breakdown (per iter):
+  CUDA API :    0.648 ms ( 94.3%)
+  Framework:    0.006 ms (  0.8%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.033 ms (  4.9%)
+  Total profiled CPU: 0.688 ms/iter
+Top kernels:
+  [gemm2  ]   453.48 us x 1.0 | _fused_moe_gemm2_kernel
+  [gemm1  ]   278.62 us x 1.0 | _fused_moe_gemm1_swiglu_kernel
+  [sorting]    18.15 us x 1.0 | triton_sort_and_scatter_kernel
+  [routing]    15.84 us x 1.0 | triton_ds_routing_kernel
+  [other  ]    11.74 us x 1.0 | _token_reduce_kernel
+  [memops ]     4.52 us x 1.0 | aten::fill_
+  [other  ]     4.52 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+Top CPU/API events:
+  [cuda_api ]   640.66 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    21.14 us x 5.0 | cuLaunchKernelEx
+  [other    ]    12.23 us x 0.0 | Activity Buffer Request
+  [cuda_api ]     7.71 us x 1.0 | cudaLaunchKernel
+  [framework]     3.34 us x 1.0 | aten::fill_
+  [framework]     2.49 us x 1.0 | aten::zero_
+Effective TFLOPS (actual num_padded=2304): GEMM1=485.6T, GEMM2=149.2T
+
+================================================================================================
+T = 11948
+================================================================================================
+Input source: trace set (T=11948)
+Inferred padding: block_m=128, total_blocks=96, num_padded=12288, num_local_rows=10416, tail_rows=1872, tail_experts=32
+Wall: 3.478 ms/iter | Throughput: 3,435,190 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    1.350 ms ( 39.6%)
+  GEMM2   :    1.660 ms ( 48.7%)
+  Routing :    0.126 ms (  3.7%)
+  Sorting :    0.074 ms (  2.2%)
+  MemOps  :    0.047 ms (  1.4%)
+  Other   :    0.149 ms (  4.4%)
+  Total CUDA: 3.406 ms/iter
+  CPU overhead: 0.072 ms/iter (2.1%)
+CPU/API breakdown (per iter):
+  CUDA API :    3.249 ms ( 97.8%)
+  Framework:    0.015 ms (  0.5%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.057 ms (  1.7%)
+  Total profiled CPU: 3.322 ms/iter
+Top kernels:
+  [gemm2  ]  1660.18 us x 1.0 | _fused_moe_gemm2_kernel
+  [gemm1  ]  1349.98 us x 1.0 | _fused_moe_gemm1_swiglu_kernel
+  [routing]   125.61 us x 1.0 | triton_ds_routing_kernel
+  [other  ]   102.34 us x 1.0 | _token_reduce_kernel
+  [memops ]    43.46 us x 1.0 | aten::fill_
+  [other  ]    43.46 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+  [sorting]    36.24 us x 1.0 | triton_sort_scatter_kernel
+  [sorting]    31.63 us x 1.0 | triton_sort_layout_kernel
+Top CPU/API events:
+  [cuda_api ]  3184.49 us x 1.0 | cudaStreamSynchronize
+  [other    ]    42.98 us x 8.0 | cuLaunchKernelEx
+  [cuda_api ]    38.02 us x 0.0 | cudaDeviceSynchronize
+  [cuda_api ]    21.98 us x 1.0 | cudaLaunchKernel
+  [other    ]    14.47 us x 0.0 | Activity Buffer Request
+  [framework]     5.76 us x 1.0 | aten::_local_scalar_dense
+  [framework]     4.68 us x 1.0 | aten::fill_
+  [cuda_api ]     4.65 us x 1.0 | cudaMemcpyAsync
+Effective TFLOPS (actual num_padded=12288): GEMM1=534.5T, GEMM2=217.3T
+
+================================================================================================
+T = 14107
+================================================================================================
+Input source: trace set (T=14107)
+Inferred padding: block_m=128, total_blocks=143, num_padded=18304, num_local_rows=16103, tail_rows=2201, tail_experts=32
+Wall: 4.995 ms/iter | Throughput: 2,824,188 tok/s
+CUDA breakdown (per iter):
+  GEMM1   :    2.017 ms ( 40.5%)
+  GEMM2   :    2.484 ms ( 49.9%)
+  Routing :    0.149 ms (  3.0%)
+  Sorting :    0.082 ms (  1.6%)
+  MemOps  :    0.055 ms (  1.1%)
+  Other   :    0.189 ms (  3.8%)
+  Total CUDA: 4.976 ms/iter
+  CPU overhead: 0.019 ms/iter (0.4%)
+CPU/API breakdown (per iter):
+  CUDA API :    4.751 ms ( 98.4%)
+  Framework:    0.015 ms (  0.3%)
+  MemOps   :    0.000 ms (  0.0%)
+  Other    :    0.060 ms (  1.2%)
+  Total profiled CPU: 4.825 ms/iter
+Top kernels:
+  [gemm2  ]  2484.19 us x 1.0 | _fused_moe_gemm2_kernel
+  [gemm1  ]  2017.06 us x 1.0 | _fused_moe_gemm1_swiglu_kernel
+  [routing]   149.06 us x 1.0 | triton_ds_routing_kernel
+  [other  ]   134.32 us x 1.0 | _token_reduce_kernel
+  [memops ]    51.69 us x 1.0 | aten::fill_
+  [other  ]    51.69 us x 1.0 | void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>, 
+  [sorting]    38.09 us x 1.0 | triton_sort_layout_kernel
+  [sorting]    37.11 us x 1.0 | triton_sort_scatter_kernel
+Top CPU/API events:
+  [cuda_api ]  4667.77 us x 1.0 | cudaStreamSynchronize
+  [cuda_api ]    56.48 us x 0.0 | cudaDeviceSynchronize
+  [other    ]    38.94 us x 8.0 | cuLaunchKernelEx
+  [cuda_api ]    21.93 us x 1.0 | cudaLaunchKernel
+  [other    ]    20.58 us x 0.0 | Activity Buffer Request
+  [framework]     6.09 us x 1.0 | aten::_local_scalar_dense
+  [framework]     4.75 us x 1.0 | aten::fill_
+  [cuda_api ]     4.40 us x 1.0 | cudaMemcpyAsync
+Effective TFLOPS (actual num_padded=18304): GEMM1=532.9T, GEMM2=216.3T
+
+================================================================================================
+SUMMARY
+================================================================================================
+     T |    Wall |    CUDA |     CPU | CPU API | CPU Prf |   Route |    Sort |   GEMM1 |   GEMM2 |    local |  num_pad |     tail | tail_e |    G1 TF |    G2 TF
+     1 |   0.105 |   0.100 |   0.006 |   0.006 |   0.046 |   0.010 |   0.000 |   0.032 |   0.055 |        3 |       48 |       45 |      3 |     88.2 |     25.7
+     7 |   0.159 |   0.093 |   0.065 |   0.005 |   0.054 |   0.007 |   0.003 |   0.048 |   0.030 |        7 |      112 |      105 |      7 |    137.3 |    109.5
+    14 |   0.158 |   0.131 |   0.026 |   0.005 |   0.047 |   0.007 |   0.003 |   0.068 |   0.046 |       15 |      192 |      177 |     12 |    164.9 |    121.4
+    15 |   0.160 |   0.090 |   0.070 |   0.021 |   0.061 |   0.007 |   0.002 |   0.046 |   0.029 |       10 |       80 |       70 |      5 |    103.2 |     81.9
+    16 |   0.156 |   0.135 |   0.021 |   0.021 |   0.060 |   0.006 |   0.002 |   0.072 |   0.047 |       19 |      208 |      189 |     13 |    168.5 |    130.1
+    32 |   0.228 |   0.216 |   0.012 |   0.067 |   0.099 |   0.007 |   0.002 |   0.121 |   0.077 |       36 |      352 |      316 |     22 |    170.2 |    133.5
+    52 |   0.188 |   0.177 |   0.012 |   0.031 |   0.065 |   0.008 |   0.003 |   0.096 |   0.063 |       26 |      272 |      246 |     17 |    166.2 |    127.6
+    53 |   0.241 |   0.228 |   0.013 |   0.077 |   0.115 |   0.008 |   0.003 |   0.125 |   0.085 |       53 |      384 |      331 |     24 |    179.9 |    133.1
+    54 |   0.230 |   0.218 |   0.012 |   0.078 |   0.124 |   0.008 |   0.003 |   0.122 |   0.078 |       43 |      368 |      325 |     23 |    177.4 |    138.9
+    55 |   0.241 |   0.229 |   0.013 |   0.080 |   0.127 |   0.008 |   0.004 |   0.125 |   0.085 |       55 |      384 |      329 |     24 |    179.8 |    133.1
+    56 |   0.252 |   0.240 |   0.012 |   0.088 |   0.133 |   0.008 |   0.003 |   0.134 |   0.087 |       72 |      416 |      344 |     26 |    181.8 |    141.0
+    57 |   0.247 |   0.235 |   0.012 |   0.084 |   0.116 |   0.008 |   0.003 |   0.130 |   0.086 |       63 |      400 |      337 |     25 |    180.0 |    137.2
+    58 |   0.252 |   0.241 |   0.011 |   0.090 |   0.137 |   0.008 |   0.003 |   0.135 |   0.086 |       77 |      416 |      339 |     26 |    180.6 |    141.3
+    59 |   0.203 |   0.191 |   0.013 |   0.042 |   0.092 |   0.008 |   0.004 |   0.104 |   0.069 |       41 |      304 |      263 |     19 |    172.4 |    129.0
+    62 |   0.195 |   0.182 |   0.013 |   0.048 |   0.087 |   0.008 |   0.003 |   0.100 |   0.063 |       59 |      288 |      229 |     18 |    168.8 |    134.2
+    80 |   0.290 |   0.273 |   0.018 |   0.127 |   0.165 |   0.008 |   0.003 |   0.166 |   0.088 |      109 |      448 |      339 |     28 |    158.3 |    150.0
+   901 |   0.808 |   0.787 |   0.021 |   0.648 |   0.688 |   0.016 |   0.018 |   0.279 |   0.453 |     1331 |     2304 |      973 |     32 |    485.6 |    149.2
+ 11948 |   3.478 |   3.406 |   0.072 |   3.249 |   3.322 |   0.126 |   0.074 |   1.350 |   1.660 |    10416 |    12288 |     1872 |     32 |    534.5 |    217.3
+ 14107 |   4.995 |   4.976 |   0.019 |   4.751 |   4.825 |   0.149 |   0.082 |   2.017 |   2.484 |    16103 |    18304 |     2201 |     32 |    532.9 |    216.3
