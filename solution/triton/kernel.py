@@ -1706,7 +1706,12 @@ def _use_remapped_gemm1_large_t_override(
     block_m: int,
     use_exact_dispatch: bool,
 ) -> bool:
-    return use_exact_dispatch and block_m == BLOCK_M_XLARGE and t > UPPER_MEDIUM_T_MAX
+    # Remapped GEMM1 disabled: the original condition (t > 128 with exact_dispatch)
+    # only fires for T >= 4096, but those workloads accumulate too much FP8 error
+    # in the BLOCK_M=64 remapped path → INCORRECT_NUMERICAL.
+    # Capping at T <= 4096 makes the condition unsatisfiable (exact_dispatch requires T >= 4096).
+    # Net effect: remapped path is dead code. Disable cleanly.
+    return False
 
 
 _host_scalar_cache = {}
