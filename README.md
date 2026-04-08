@@ -71,15 +71,16 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 | T > 2048 | 128 | `_fused_moe_*` (generic) |
 | T ≥ 4096 | dynamic | Exact dispatch (`total_blocks.item()`) |
 
-### Profiling 瓶颈分布 (NCU, B200)
+### Profiling 瓶颈分布 (`yjl_ncu.py`, B200, 19 real traces)
 
-| 阶段 | T=64 占比 | T=4096 占比 |
-|------|----------|------------|
-| **GEMM1** | **54.5%** | — |
-| GEMM2 | 30.6% | **31.7%** |
-| Reduce | — | 18.2% |
-| Sort | — | 12.4% |
-| Routing | — | 11.6% |
+| T 范围 | GEMM1 占比 | GEMM2 占比 | Routing+Sort | Reduce | 瓶颈 |
+|--------|-----------|-----------|-------------|--------|------|
+| T=1 | 32% | **55%** | 10% | (fused) | GEMM2 |
+| T=7-80 | **51-61%** | 32-37% | 5-10% | 2% | GEMM1 |
+| T=901 | 35% | **58%** | 4% | 1.5% | GEMM2 |
+| T=11948-14107 | 40% | **49-50%** | 5-6% | 3% | GEMM2 |
+
+> GEMM1 TFLOPS: 103-182T (小T) / 485-535T (大T)。GEMM2 TFLOPS: 82-150T (小T) / 216T (大T)。
 
 ---
 
@@ -248,6 +249,7 @@ mlsys_note/
 | 极深流水线 (num_stages=6-8) | ✅ Mean +2.1% | 掩盖 GEMM2 中 Intermediate 访存延迟，惠及 Medium-T |
 | 2D Tiled Token Reduce (BLOCK_T=16/32) | ✅ Large-T +2.9% | 削减 10x Grid Launch 开销，靠 ILP 打通 HBM Reduce 延迟墙 |
 | Column-Major 调度与并行 Dispatch | ✅ Medium-T 最高 +8.9% | 消除 GEMM1 计算依赖并提高权重 Cache 命中，精准打击中等 T 的延迟瓶颈 |
+| **GEMM2 Autotune 扩展** | ✅ AB-test Mean +2.1%，8/19 improved | 低 warp / GROUP_M=4/64 等新 configs 覆盖 GEMM2 短 K-loop (K=2048) |
 
 ---
 
@@ -284,6 +286,8 @@ mlsys_note/
 | `93e3a84` | 极深流水线 GEMM2 | ✅ | 均值 +2.1%，有效隐藏访存延迟 |
 | `f49c5ab` | 2D Tiled Token Reduce | ✅ | 结构性优化，大型 Workload (T>8000) 净提速 +2.5%~2.9% |
 | `9d5a2f8` | Medium-T Column-Major | ✅ | `GROUP_M=32/64` 列排布与并行扫描，Medium-T 最高提速 +8.9% |
+| `c19336d` | Fused Routing+Histogram | ✅ | Token-major sort/layout/scatter，large-T routing/sort 开销 -1.5% |
+| (pending) | **GEMM2 autotune 扩展** | ✅ | AB-test mean +2.1%，8/19 improved，0 regressed |
 
 **结论：当前主线中所有生效改动都是 ✅ 或 ✅✅ 确定真实的。**
 

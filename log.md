@@ -452,3 +452,228 @@ canonical large-T 路径里 `BLOCK_M=128`，对 `T=11948/14107` 这类 trace，`
 * 再评估 remapped GEMM1 的 autotune shortlist
 
 而不是重新回到 dual-bucket、cluster、lookup-only 这些已经被证伪或收益很弱的方向。
+
+### 2026-04-05 负优化：small/medium GEMM1-only `BLOCK_M=128` 实验（已回退）
+
+#### 背景
+
+曾考虑利用 B200 Tensor Core 更偏好大 tile 的特点，在 `32 <= T <= 128` 的 small/medium 区间尝试
+`BLOCK_M=128`。但这条思路不能像普通 autotune 一样只加 config，因为当前实现里的 `BLOCK_M`
+同时参与了 sort/layout 的数据组织，不能直接让 canonical `BLOCK_M=16/32/64` 的 layout 被
+`GEMM1` 按 `128` 重新解释。
+
+因此这次实际做的是一个 **最小可实现版本**：
+
+* 保留 canonical sort/layout 和 canonical `GEMM2`
+* 只给 `GEMM1` 单独构建一套 `BLOCK_M=128` 的 token layout
+* 用 `row_map` 把 `GEMM1` 输出写回 canonical `Intermediate`
+
+#### 修改内容
+
+围绕 `solution/triton/kernel.py` 当时新增过下面这组实验性改动，后续已全部回退：
+
+* `triton_count_tokens_from_canonical_layout_kernel(...)`
+* `triton_scatter_canonical_to_remapped_gemm1_kernel(...)`
+* `_row_mapped_fused_moe_gemm1_swiglu_kernel`
+* `_use_small_medium_gemm1_block_m128_experiment(...)`
+* `_kernel_small_medium_gemm1_block_m128_experiment(...)`
+
+这组改动的目的，是在不动 `GEMM2` 的前提下，单独验证 `GEMM1 BLOCK_M=128` 是否能从更大的
+Tensor Core tile 中获益。
+
+#### 实测效果
+
+结果非常差，而且不是小幅回退，而是明显负优化。相对 `0402base`：
+
+* `T=32: 0.226 -> 1.112 ms`，约 `+392%`
+* `T=52: 0.208 -> 0.774 ms`，约 `+272%`
+* `T=59: 0.214 -> 1.106 ms`，约 `+417%`
+* `T=80: 0.299 -> 1.461 ms`，约 `+389%`
+
+命中实验的 `T=32/52-62/80` 共 11 个点，平均 `wall` 从约 `0.236 ms` 变成 `1.090 ms`，
+约 `+361.5%`。
+
+从 profiler 看，问题非常集中：
+
+* 新增的辅助 kernel 本身很小
+  * `triton_count_tokens_from_canonical_layout_kernel`: 约 `1.7~2.0 us`
+  * `triton_scatter_canonical_to_remapped_gemm1_kernel`: 约 `2.1~2.3 us`
+* 真正炸掉的是 `_row_mapped_fused_moe_gemm1_swiglu_kernel`
+  * `T=32: 116 us -> 992 us`
+### 2026-04-05 保留优化：fused routing + token-major sort/layout/scatter
+
+#### 背景
+
+`0402base` 之后，large-T 路径里 `GEMM1/GEMM2` 仍然是主要大头，但 `routing + sort/layout/scatter` 这段固定成本还存在一笔可继续压缩的开销。此前并行 sort 路径仍然依赖：
+
+* routing 先产出 `topk_idx / topk_weights`
+* 再单独生成 histogram / layout
+* 最后走 tile-based scatter
+
+这条链路本身没有错，但和 `1 program = 1 token` 的 routing 主体并不完全匹配，而且 sort/scatter 侧还有额外的 launch、重复读写和逐 item atomic 成本。
+
+#### 修改内容
+
+围绕 `solution/triton/kernel.py` 最终保留了下面这组修改：
+
+* 新增 `_fused_routing_histogram_kernel(...)`
+  * 保持 `1 program = 1 token`
+  * routing 时顺手产出 `local_topk_idx`
+  * 只对 local expert 保留 `0..31`，非本地记 `-1`
+* 新增 `ds_routing_with_histogram(...)` wrapper，给 large-T 并行 sort 场景提供 fused routing 入口
+* 新增 token-major sort/layout/scatter 路径：
+  * `triton_token_layout_kernel(...)`
+  * `triton_token_layout_with_remap_kernel(...)`
+  * `triton_token_scatter_kernel(...)`
+  * `token_sort_and_scatter(...)`
+* `token_scatter` 从“逐 item atomic 分配”改成“program 内局部计数 + 按 expert 成批预留区间 + 回填”
+  * 当前 `BLOCK_TOKENS = 8`
+* host 侧新增 `_routing_hist_cache` 和 `_token_sort_cache`
+* large-T 命中条件下：
+  * routing 走 fused 版本
+  * sort/layout/scatter 走 token-major 版本
+  * `large-T single remapped GEMM1` 路径继续保留，不改 `GEMM2 / reduce`
+
+#### 实测效果
+
+相对 `0402base`，这组修改的端到端收益不算大，但已经是稳定正收益：
+
+* 平均 `wall: 0.661211 ms -> 0.656579 ms`，约 `-0.70%`
+* `T=11948`
+  * `Wall: 3.370 ms -> 3.319 ms`，约 `-1.5%`
+* `T=14107`
+  * `Wall: 4.769 ms -> 4.730 ms`，约 `-0.8%`
+
+如果只看新 feature 命中的 `routing / sort / scatter` 这一段局部固定成本，改善幅度会更明显：
+
+* `triton_token_scatter_kernel`
+  * `T=11948: 16.82 us -> 16.58 us`
+  * `T=14107: 19.39 us -> 17.78 us`
+* large-T 下的 routing + sort/layout/scatter 子路径，整体属于约 `2%-5%` 量级的 feature 改善
+* 但端到端总收益会被 `GEMM1/GEMM2` 主体占比稀释，最终只体现为约 `0.7%` mean 改善
+
+#### 结论
+
+这条优化是有效的，而且已经可以保留进主线，但它的性质更接近：
+
+* **压缩 large-T 下 routing / sort / scatter 的固定成本**
+* **让 sort/layout/scatter 的组织方式真正和 `1 program = 1 token` 的 routing 对齐**
+* **在不破坏 `GEMM1/GEMM2` 主体的前提下拿一笔稳定小收益**
+
+后续如果继续围绕这条线优化，优先级应该放在：
+
+* 继续压 `token_scatter` 的局部原子和回写开销
+* 评估是否还有必要进一步精简 token-major layout 的辅助 metadata
+
+而不应该再回到 tile-serial routing、global atomic histogram，或者把整条 routing 主体改成低并行度实现。
+
+### 2026-04-05 负优化：small/medium + medium GEMM1 `BLOCK_K=256` 实验（已回退）
+
+#### 背景
+
+希望在 `GEMM1` 的 `K=7168` 上用更大的 `BLOCK_K=256` 减少 K-loop 次数。直观上，`BLOCK_K=128` 需要 `56` 轮，若能稳定切到 `256`，外层循环可以降到 `28` 轮，从而减少 barrier、指针跃迁和 loop 壳子的开销。
+
+但当前 FP8 量化仍以 `QBLOCK=128` 为基本单位，因此 `BLOCK_K=256` 不能简单视为“一次 dot 覆盖 256 并只做一次 scale”。为了保证量化语义正确，`256` 的每一步实际上仍然需要拆成两个 `128` 子块分别做 `dot + scale` 再累加。
+
+#### 修改内容
+
+围绕 `small_medium` 和 `medium` 两条 `GEMM1` 路径做了几轮实验：
+
+* 在 autotune config 中加入 `BLOCK_K=256` 候选，并将 `num_stages` 压到 `2` 以满足 shared memory 预算
+* 第一版实现采用“外层 `BLOCK_K=256` + 内层 `128` 子块循环”的写法，保证 scale 仍按 `128` 对齐
+* 第二版将 nested loop 改成“单层外循环 + 两段显式 `128` 展开”，目的是去掉额外的 `static_range` 壳子成本
+* 后续又为部分 `256K` 配置补了 `num_stages=3`
+* 最后又做了一个 `medium-only fixed probe`，只验证 upper-medium `GEMM1` 上 `BLOCK_K=256` kernel 本体是否能打赢
+
+#### 实测效果
+
+这条线没有在目标区间形成稳定收益。
+
+* broad `BLOCK_K=256` autotune 版本在 `T=32..80` 这段仍然整体偏负
+* 把 nested loop 改成单层循环 + 两段显式展开后，表现比最初版本略有恢复，但依然没有打赢 `0402base`
+* 给 `256K` 配置补 `num_stages=3` 后，整体结果更差
+  * 平均 `wall: 0.661 ms -> 0.679 ms`
+  * 聚焦 `T=32,52-59,62,80` 的平均 `wall: 0.236 ms -> 0.253 ms`
+  * 许多 case 的 `GEMM1` 几乎没变，但 `CPU overhead` 上升，更像 autotune / host 侧成本先把潜在收益吃掉了
+* `medium-only fixed probe` 也明确失败
+  * `T=80: wall 0.299 -> 0.317 ms`
+  * `GEMM1 0.167 -> 0.186 ms`
+  * top kernel 已切到 `_medium_block_k256_probe_fused_moe_gemm1_swiglu_kernel`，说明 probe 确实命中，但 kernel 本体仍然更慢
+
+#### 结论
+
+这轮实验说明，当前 FP8 `QBLOCK=128` 的量化/scale 语义下，`BLOCK_K=256` 并没有真正减少 `128` 粒度上的 `dot + scale` 工作量；它减少的主要只是外层循环壳子的那部分成本。
+
+与之交换的是更高的资源占用、更浅的流水线选择空间，以及在 autotune / host 侧更高的额外成本，因此整体上没有形成正收益。`BLOCK_K=256` 这条 `GEMM1` 优化线已判断为负优化，并已从 `kernel.py` 中干净回退。
+
+### 2026-04-05 Profiling：yjl_ncu.py GEMM1 vs GEMM2 时间分解
+
+#### 工具
+
+使用 `scripts/yjl_ncu.py` 在 Modal B200 上对所有 19 个 trace workload 做 per-kernel 时间分解（15 warmup + 80 iters）。
+
+#### Summary Table (ms/iter)
+
+| T | Wall | GEMM1 | GEMM2 | Reduce | Route | Sort | GEMM1% | GEMM2% | G1 TF | G2 TF |
+|---|------|-------|-------|--------|-------|------|--------|--------|-------|-------|
+| 1 | 0.105 | 0.032 | 0.055 | (fused) | 0.010 | 0.000 | 32% | **55%** | 88 | 26 |
+| 7 | 0.159 | 0.048 | 0.030 | 0.003 | 0.007 | 0.003 | **51%** | 32% | 137 | 110 |
+| 14 | 0.158 | 0.068 | 0.046 | 0.004 | 0.007 | 0.003 | **52%** | 35% | 165 | 121 |
+| 15 | 0.160 | 0.046 | 0.029 | 0.003 | 0.007 | 0.002 | **51%** | 32% | 103 | 82 |
+| 16 | 0.156 | 0.072 | 0.047 | 0.004 | 0.006 | 0.002 | **54%** | 35% | 169 | 130 |
+| 32 | 0.228 | 0.121 | 0.077 | 0.004 | 0.007 | 0.002 | **56%** | 36% | 170 | 134 |
+| 52 | 0.188 | 0.096 | 0.063 | 0.004 | 0.008 | 0.003 | **54%** | 35% | 166 | 128 |
+| 56 | 0.252 | 0.134 | 0.087 | 0.005 | 0.008 | 0.003 | **56%** | 36% | 182 | 141 |
+| 62 | 0.195 | 0.100 | 0.063 | 0.005 | 0.008 | 0.003 | **55%** | 35% | 169 | 134 |
+| 80 | 0.290 | 0.166 | 0.088 | 0.005 | 0.008 | 0.003 | **61%** | 32% | 158 | 150 |
+| 901 | 0.808 | 0.279 | 0.453 | 0.012 | 0.016 | 0.018 | 35% | **58%** | 486 | 149 |
+| 11948 | 3.478 | 1.350 | 1.660 | 0.102 | 0.126 | 0.074 | 40% | **49%** | 535 | 217 |
+| 14107 | 4.995 | 2.017 | 2.484 | 0.134 | 0.149 | 0.082 | 40% | **50%** | 533 | 216 |
+
+#### 核心发现
+
+* **小/中 T (7-80)**: GEMM1 是瓶颈 (51-61%)
+* **T=901 和大 T**: GEMM2 是瓶颈 (49-58%)
+* **Padding 浪费严重**: T=52 only 26 local rows but padded to 272 (10.5× waste)
+* **Reduce kernel 很轻**: 2-5μs，不值得单独优化
+* **GEMM1 TFLOPS 小 T 效率低**: 103-182T vs 峰值 1200T（只有 8-15%）
+* **GEMM2 输入是 fp32**: 不能用 FP8 tensor core，是 GEMM2 TFLOPS 的根本限制
+
+---
+
+### 2026-04-05 保留优化：GEMM2 autotune 扩展
+
+#### 背景
+
+profiling 发现 GEMM2 在 T=901 占 58%、大 T 占 49-50% 时间，但 GEMM2 的 autotune configs 相对少，TFLOPS 只有 82-150T（小/中T）。扩展 autotune search space 是零风险的提升方式。
+
+#### 修改内容
+
+在 `solution/triton/kernel.py` 中，对三个 GEMM2 kernel 的 `@triton.autotune` configs 都做了扩展：
+
+* `_fused_moe_gemm2_kernel`：从 24 个 configs 扩展到 38 个
+* `_small_medium_fused_moe_gemm2_kernel`：从 16 个扩展到 27 个
+* `_medium_fused_moe_gemm2_kernel`：从 12 个扩展到 23 个
+
+新增 configs 分三类：
+
+1. **低 warp 数 / 低延迟**：`num_warps=2/4, num_stages=2`，适合 K=2048 只有 16 次 K-loop 的短循环
+2. **低 GROUP_M (1/2/4)**：适合 few-block workloads（T=901 只有 36 blocks）
+3. **高 GROUP_M (16/64)**：增强 L2 cache weight tile 复用
+
+#### AB-Test 实测效果（同 GPU 同环境对比）
+
+```
+Mean speedup: A=42.51x  B=43.40x  Delta=+2.1%
+Summary: 8 improved, 0 regressed, 11 neutral (±2% threshold)
+```
+
+代表性提升：
+* `b8f4f012 (T=7)`: `56.57x -> 59.72x (+5.6%)`
+* `2e69caee (T=15)`: `55.20x -> 57.44x (+4.1%)`
+* `a7c2bcfd (T=16)`: `51.79x -> 53.29x (+2.9%)`
+* `74d7ff04 (T=57)`: `43.71x -> 44.89x (+2.7%)`
+
+#### 结论
+
+这是一个纯 autotune search space 扩展，没有改任何 kernel 逻辑。零退化、8 workload 显著提升。后续可以结合 profiling 继续针对 GEMM2 的 memory-bound 特性做更深层优化（如 Intermediate fp32→bf16）。
