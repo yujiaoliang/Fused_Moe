@@ -677,3 +677,51 @@ Summary: 8 improved, 0 regressed, 11 neutral (±2% threshold)
 #### 结论
 
 这是一个纯 autotune search space 扩展，没有改任何 kernel 逻辑。零退化、8 workload 显著提升。后续可以结合 profiling 继续针对 GEMM2 的 memory-bound 特性做更深层优化（如 Intermediate fp32→bf16）。
+
+### 2026-04-08 CuTe-dev 分支：Main Sync + 归档验证
+
+#### 操作
+
+1. 将 `main` 分支 9 个最新 commit merge 到 `CuTe-dev` 分支
+   - 冲突文件全部取 `main` 版本（`kernel.py`, `log.md`, `profiling_notes.md`, `solution.json`）
+   - merge 后 `kernel.py` 完全是 main 版本（含 GEMM2 autotune、fused routing+histogram、dead code cleanup）
+   - CuTe 代码只保留在 `cute_fused_gemm.py` 和 `cute_kernel.py` 中
+
+2. 打包并在 Modal B200 上跑完整 19/19 benchmark 验证
+
+#### 验证结果
+
+```
+GPU: NVIDIA B200, CUDA (10, 0), PyTorch 2.11.0+cu130
+Solution sources: ['cute_fused_gemm.py', 'cute_kernel.py', 'kernel.py']
+
+19/19 PASSED
+
+  b8f4f012 (T=7):     0.314ms | 43.78x
+  e05c6c03 (T=1):     0.243ms | 52.43x
+  6230e838 (T=32):    0.429ms | 43.28x
+  8f1ff9f1 (T=80):    0.510ms | 43.94x
+  1a4c6ba1 (T=901):   0.999ms | 28.14x
+  a7c2bcfd (T=16):    0.392ms | 40.32x
+  2e69caee (T=15):    0.287ms | 47.84x
+  8cba5890 (T=14):    0.346ms | 44.32x
+  5e8dc11c (T=14107): 5.121ms | 10.54x
+  58a34f27 (T=11948): 3.599ms | 12.15x
+  5eadab1e (T=55):    0.395ms | 45.83x
+  eedc63b2 (T=53):    0.432ms | 41.63x
+  e626d3e6 (T=56):    0.481ms | 45.41x
+  74d7ff04 (T=57):    0.449ms | 46.46x
+  4822167c (T=54):    0.450ms | 45.99x
+  81955b1e (T=58):    0.441ms | 44.96x
+  76010cb4 (T=62):    0.434ms | 44.65x
+  fc378037 (T=59):    0.443ms | 45.11x
+  f7d6ac7c (T=52):    0.378ms | 45.27x
+```
+
+#### 结论
+
+- **19/19 PASSED**，merge 后没有正确性 bug
+- CuTe 路径零执行（`kernel.py` 来自 main，无 CuTe dispatch 入口）
+- 性能与 main 分支一致，全部 100% Triton
+- **CuTe-dev 分支正式进入维护/归档模式**
+- 详见 `CUTE_NOTES.md` Section 8

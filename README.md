@@ -4,7 +4,8 @@
 > **硬件:** NVIDIA B200 (Blackwell, sm100)  
 > **状态:** ✅ 19/19 PASSED  
 > **当前可复现口径 (Modal B200):** peak ~55-65x, mean ~43-45x  
-> **历史最佳 (Round 15, Modal 好运时段):** peak 106.65x, mean 55.77x
+> **历史最佳 (Round 15, Modal 好运时段):** peak 106.65x, mean 55.77x  
+> **分支:** `main` (纯 Triton) / `CuTe-dev` (已归档，含 CuTe DSL 代码 + 完整开发记录)
 
 > ⚠️ **关于绝对 speedup 数值**：Modal B200 共享实例无锁频，同一代码不同时段的 speedup 可波动 20-30%。
 > 官方评测在裸金属 B200 + 锁频 (`nvidia-smi -ac 3996,1965`) 下运行，结果更稳定。
@@ -163,7 +164,10 @@ git push origin submission-vX
 ```
 mlsys_note/
 ├── solution/
-│   ├── triton/kernel.py         # ← 主力 Triton kernel
+│   ├── triton/
+│   │   ├── kernel.py            # ← 主力 Triton kernel (main 分支)
+│   │   ├── cute_fused_gemm.py   # CuTe host dispatch (仅 CuTe-dev 分支)
+│   │   └── cute_kernel.py       # CuTe DSL kernel 类 (仅 CuTe-dev 分支)
 │   └── cuda/
 │       ├── binding.py           # CUDA baseline (PyTorch/cuBLAS, 19/19 PASSED)
 │       └── kernel.cu            # CUDA kernel 模板 (已废弃, Modal 无 nvcc)
@@ -177,6 +181,7 @@ mlsys_note/
 │   └── ncu_profile_modal.py     # per-kernel 时间分解
 ├── config.toml                  # 配置（队名、赛道）
 ├── profiling_notes.md           # Profiling 分析 & 优化记录
+├── CUTE_NOTES.md                # CuTe 开发笔记 (仅 CuTe-dev 分支)
 ├── log.md                       # 详细实验日志
 ├── solution.json                # 打包后的提交文件
 └── mlsys26-contest/             # 比赛数据集
@@ -320,11 +325,14 @@ mlsys_note/
 
 | 尝试 | 结果 | 原因 |
 |------|------|------|
+| CuTe DSL GEMM1 替换 | 0/19 执行 | 三个 guard 的 AND=空集 (详见 `CuTe-dev` 分支 `CUTE_NOTES.md`) |
 | Persistent GEMM2 | 52x→15.6x | 丧失张量级并行度，内存延迟暴露 |
 | TMA Accelerator | -1~2% | HBM 带宽已被 LDG 指令榨干 |
 | 1D Atomic Scatter | 8.3x→5.37x | 标量原子风暴打瘫内存控制器 |
 | Token Reduce 融合进 GEMM2 | TIMEOUT | Triton 2D tile 无法逐行 scatter |
 | CUDA 自定义 C++ 扩展 | Modal 失败 | 评测沙盒无 nvcc |
+
+> **CuTe DSL 详情**：CuTe (CUTLASS 4.x) 利用 Blackwell tcgen05.mma 异步 pipeline 在 GEMM1 上达到 2013 TFLOPS (80% peak)，是 Triton 的 4×。但受限于两个无法绕过的硬约束：① tcgen05 MMA 要求 M≥128（block_m ≥ 128 → T > 2048，17/19 workload 不满足）；② CuTe DSL Persistent Tile Scheduler 在 num_g > 16 时结构性 crash（5 个实验证实无法绕过）。完整记录见 `CuTe-dev` 分支的 `CUTE_NOTES.md`（12 bug fix + 5 failed experiments + post-mortem）。
 
 ### Microbatch 调度失败 (Direction 4)
 
