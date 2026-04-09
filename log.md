@@ -725,3 +725,53 @@ Solution sources: ['cute_fused_gemm.py', 'cute_kernel.py', 'kernel.py']
 - 性能与 main 分支一致，全部 100% Triton
 - **CuTe-dev 分支正式进入维护/归档模式**
 - 详见 `CUTE_NOTES.md` Section 8
+
+### 2026-04-08 终止 CuTe Remap 实验并全面转向 Direction 1
+
+#### 实验设计
+- **动机**：验证 `num_g > 16` 的崩溃是否为 CuTe PTS 内部超过 16 组的 offset 计算错误（通过将 32 experts 拆分为 2 个 <=16 experts 的 chunk 来调用）。
+- **代码变更**：`cute_fused_gemm.py` 移除 `num_g > 16` 的 early exit guard，改为 `for chunk_start in range(0, num_experts, 16):` 循环，每个 chunk 独立构建 ptrs/shapes/strides 表并独立 JIT 编译 + launch。每个 chunk 的 `local_g` 从 0 开始，确保 PTS 只看到 `group_idx ∈ [0, 15]`。
+
+#### Benchmark 结果 (Modal B200)
+
+```
+GPU: NVIDIA B200, CUDA (10, 0), PyTorch 2.11.0+cu130
+19/19 PASSED
+
+  b8f4f012 (T=7):     0.343ms | 40.82x
+  e05c6c03 (T=1):     0.256ms | 51.06x
+  6230e838 (T=32):    0.436ms | 43.66x
+  8f1ff9f1 (T=80):    0.500ms | 45.90x
+  1a4c6ba1 (T=901):   0.997ms | 28.74x
+  a7c2bcfd (T=16):    0.353ms | 45.89x
+  2e69caee (T=15):    0.290ms | 47.38x
+  8cba5890 (T=14):    0.362ms | 43.30x
+  5e8dc11c (T=14107): 5.121ms | 10.57x  ← CuTe 未执行
+  58a34f27 (T=11948): 3.606ms | 12.26x  ← CuTe 未执行
+  5eadab1e (T=55):    0.398ms | 46.48x
+  eedc63b2 (T=53):    0.404ms | 45.54x
+  e626d3e6 (T=56):    0.459ms | 47.63x
+  74d7ff04 (T=57):    0.456ms | 46.09x
+  4822167c (T=54):    0.464ms | 46.01x
+  81955b1e (T=58):    0.446ms | 45.64x
+  76010cb4 (T=62):    0.437ms | 45.57x
+  fc378037 (T=59):    0.446ms | 45.96x
+  f7d6ac7c (T=52):    0.399ms | 44.19x
+```
+
+#### 分析
+- **CuTe 路径从未被调用**：`kernel.py` 在 main sync 后，大 T workload 不再使用 `block_m=128`（Triton autotuning 选择了更优配置），`block_m < 128` guard 直接拦截。
+- **未验证的假设**：chunked 16-expert dispatch 是否能绕过 `num_g > 16` crash 的问题**没有最终答案**。
+- **天花板分析**：即使 CuTe 完美工作，只影响 2/19 workload（T=11948, T=14107），且瓶颈在 GEMM2 (49-50%) 不在 GEMM1 (40%)，最好情况整体 mean +2~3×。
+
+#### 执行决策
+- 未继续强行修改 `kernel.py` 来迎合 CuTe 的 128 constraint
+- ROI 差距达一个数量级：Direction 1 打 17/19 workload 的 padding (75-94% waste)，CuTe 最好只打 2/19 且天花板 +2~3×
+- 根据既定 2 小时止损策略，**正式、永久关闭 CuTe 章节**
+- 详见 `CUTE_NOTES.md` Section 9
+
+#### 下一步计划 (Direction 1)
+目标：消灭小 T 场景中高达 75-94% 的 padding waste，通过 **Per-Expert BLOCK_M Packing** 将整体 mean speedup 推升至 50x 以上。
+1. **Stage 1 (数据分析)**: 分析 kernel 内部 token 到 expert 的实际分布。
+2. **Stage 2 (Bucketing Kernel)**: 将 experts 按照其真实 token 数进行分桶排序（如 `{16, 32, 64, 128}` buckets）。
+3. **Stage 3 (Triton Dispatch)**: 修改 kernel 层调度逻辑，同一桶内的 experts 共享 grid 启动，利用精确的 `block_m` 调度消灭 padding 开销。

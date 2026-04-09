@@ -325,14 +325,14 @@ mlsys_note/
 
 | 尝试 | 结果 | 原因 |
 |------|------|------|
-| CuTe DSL GEMM1 替换 | 0/19 执行 | 三个 guard 的 AND=空集 (详见 `CuTe-dev` 分支 `CUTE_NOTES.md`) |
+| CuTe DSL GEMM1 替换 | 0/19 执行 | 三个 guard 的 AND=空集；remap 实验未验证 (详见 `CUTE_NOTES.md` §3 + §9) |
 | Persistent GEMM2 | 52x→15.6x | 丧失张量级并行度，内存延迟暴露 |
 | TMA Accelerator | -1~2% | HBM 带宽已被 LDG 指令榨干 |
 | 1D Atomic Scatter | 8.3x→5.37x | 标量原子风暴打瘫内存控制器 |
 | Token Reduce 融合进 GEMM2 | TIMEOUT | Triton 2D tile 无法逐行 scatter |
 | CUDA 自定义 C++ 扩展 | Modal 失败 | 评测沙盒无 nvcc |
 
-> **CuTe DSL 详情**：CuTe (CUTLASS 4.x) 利用 Blackwell tcgen05.mma 异步 pipeline 在 GEMM1 上达到 2013 TFLOPS (80% peak)，是 Triton 的 4×。但受限于两个无法绕过的硬约束：① tcgen05 MMA 要求 M≥128（block_m ≥ 128 → T > 2048，17/19 workload 不满足）；② CuTe DSL Persistent Tile Scheduler 在 num_g > 16 时结构性 crash（5 个实验证实无法绕过）。完整记录见 `CuTe-dev` 分支的 `CUTE_NOTES.md`（12 bug fix + 5 failed experiments + post-mortem）。
+> **CuTe DSL 详情**：CuTe (CUTLASS 4.x) 利用 Blackwell tcgen05.mma 异步 pipeline 在 GEMM1 上达到 2013 TFLOPS (80% peak)，是 Triton 的 4×。但受限于两个无法绕过的硬约束：① tcgen05 MMA 要求 M≥128（block_m ≥ 128 → T > 2048，17/19 workload 不满足）；② CuTe DSL Persistent Tile Scheduler 在 num_g > 16 时结构性 crash（5 个实验证实无法绕过）。最终 remap 实验（将 32 experts 拆为 2×16 chunk 独立 dispatch）因 `block_m < 128` guard 拦截而未实际验证，但即使修好，天花板仅 +2~3× mean（只影响 2/19 workload 且瓶颈在 GEMM2 不在 GEMM1）。完整记录见 `CuTe-dev` 分支的 `CUTE_NOTES.md`（12 bug fix + 5 failed experiments + remap 实验 + post-mortem）。
 
 ### Microbatch 调度失败 (Direction 4)
 
