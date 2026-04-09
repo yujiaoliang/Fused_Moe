@@ -65,7 +65,11 @@ def _classify_event(name: str) -> str:
         return "gemm1"
     if "_t1_fused_gemm2_reduce_kernel" in name_l:
         return "gemm2"
-    if "_fused_moe_gemm2_kernel" in name_l or "_fused_moe_gemm2_scatter_kernel" in name_l:
+    if (
+        "_fused_moe_gemm2_kernel" in name_l
+        or "_fused_moe_gemm2_scatter_kernel" in name_l
+        or "_fused_moe_gemm2_t901_kernel" in name_l
+    ):
         return "gemm2"
     if "triton_ds_routing_kernel" in name_l or "triton_ds_routing_t1_local_kernel" in name_l:
         return "routing"
@@ -116,6 +120,57 @@ def _find_ncu_binary() -> str | None:
     except Exception:
         return None
     return None
+
+
+def _format_triton_config(cfg) -> str:
+    if cfg is None:
+        return "None"
+    parts = []
+    kwargs = getattr(cfg, "kwargs", None)
+    if kwargs is not None:
+        try:
+            parts.append(f"kwargs={dict(kwargs)}")
+        except Exception:
+            parts.append(f"kwargs={kwargs!r}")
+    for attr in ("num_warps", "num_stages", "num_ctas", "maxnreg"):
+        value = getattr(cfg, attr, None)
+        if value is not None:
+            parts.append(f"{attr}={value}")
+    return ", ".join(parts) if parts else repr(cfg)
+
+
+def _log_named_triton_autotune(module, kernel_name: str, prefix: str, log) -> None:
+    kernel = getattr(module, kernel_name, None)
+    if kernel is None:
+        log(f"{prefix}: kernel object not found")
+        return
+
+    log(f"{prefix} object: {type(kernel).__name__}")
+
+    configs = getattr(kernel, "configs", None)
+    if configs is not None:
+        try:
+            log(f"{prefix} candidate configs: {len(configs)}")
+        except Exception:
+            pass
+
+    best_cfg = getattr(kernel, "best_config", None)
+    if best_cfg is not None:
+        log(f"{prefix} best_config: {_format_triton_config(best_cfg)}")
+
+    cache = getattr(kernel, "cache", None)
+    if isinstance(cache, dict):
+        log(f"{prefix} autotune cache entries: {len(cache)}")
+        for idx, (key, value) in enumerate(list(cache.items())[:4]):
+            log(f"  cache[{idx}] key={key!r}")
+            log(f"  cache[{idx}] value={_format_triton_config(value)}")
+    elif cache is not None:
+        log(f"{prefix} autotune cache type: {type(cache).__name__}")
+
+
+def _log_t901_gemm2_autotune(module, log) -> None:
+    _log_named_triton_autotune(module, "_fused_moe_gemm2_t901_kernel", "T901 autotune", log)
+    _log_named_triton_autotune(module, "_fused_moe_gemm2_kernel", "Base GEMM2 autotune", log)
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOLUME_MOUNT: trace_volume})
@@ -503,6 +558,8 @@ def run_profile(solution_json: str) -> str:
             output.zero_()
             kernel_fn(*args)
         torch.cuda.synchronize()
+        if t == 901:
+            _log_t901_gemm2_autotune(module, log)
 
         # Wall time (end-to-end)
         start_ev = torch.cuda.Event(enable_timing=True)

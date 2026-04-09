@@ -54,6 +54,10 @@ T1_GENERIC_MAX_PADDED = TOP_K * T1_GENERIC_BLOCK_M
 
 TOKEN_SCATTER_BLOCK_TOKENS = 8
 
+GEMM2_T901_CONFIGS = [
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=2),
+]
+
 
 # ═══════════════════════════════════════════════════════════════
 # Triton Routing Kernel — DeepSeek-V3 no-aux routing
@@ -1151,6 +1155,74 @@ def _fused_moe_gemm2_kernel(
 
 
 @triton.autotune(
+    configs=GEMM2_T901_CONFIGS,
+    key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
+    restore_value=['C_ptr'],
+)
+@triton.jit
+def _fused_moe_gemm2_t901_kernel(
+    A_ptr,
+    B_ptr,
+    C_ptr,
+    B_scale_ptr,
+    token_weights_ptr,
+    block_offsets_ptr,
+    total_blocks_ptr,
+    MAX_PID_M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_am, stride_ak,
+    stride_be, stride_bn, stride_bk,
+    stride_cm, stride_cn,
+    stride_bse, stride_bsn, stride_bsk,
+    E_LOCAL: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr
+):
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    total_blocks = tl.load(total_blocks_ptr)
+    if total_blocks <= 0:
+        return
+    if pid >= total_blocks * num_pid_n:
+        return
+    num_pid_m = total_blocks
+
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    e_idx = tl.arange(0, E_LOCAL)
+    b_start = tl.load(block_offsets_ptr + e_idx)
+    b_end = tl.load(block_offsets_ptr + e_idx + 1)
+    valid = (b_start <= pid_m) & (pid_m < b_end)
+    expert_id = tl.argmax(valid.to(tl.int32), axis=0)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    token_weights = tl.load(token_weights_ptr + rm)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    a_base = A_ptr + rm[:, None] * stride_am
+    b_base = B_ptr + expert_id * stride_be + rn[None, :] * stride_bn
+    b_scale_base = B_scale_ptr + expert_id * stride_bse + (rn[None, :] // 128) * stride_bsn
+
+    for k in range(0, K, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+        a = tl.load(a_base + rk[None, :] * stride_ak, eviction_policy='evict_first')
+        b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
+        b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
+        partial = tl.dot(a, b.to(tl.float32), out_dtype=tl.float32)
+        acc += partial * b_scale
+
+    out = acc * token_weights[:, None]
+    c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+    tl.store(c_ptrs, out, eviction_policy='evict_first')
+
+
+@triton.autotune(
     configs=[
         triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=2, num_stages=2),
         triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=2, num_stages=3),
@@ -1831,6 +1903,14 @@ def _select_gemm_buckets_from_workload(t: int, block_m: int, total_blocks: int) 
 
 
 
+def _use_gemm2_t901_override(
+    t: int,
+    block_m: int,
+    use_exact_dispatch: bool,
+) -> bool:
+    return t == 901 and block_m == BLOCK_M_LARGE and not use_exact_dispatch
+
+
 _host_scalar_cache = {}
 
 
@@ -2172,11 +2252,14 @@ def kernel(
 
     # -- 5. GEMM2 (non-atomic, writes to expert_out) --
     grid2 = lambda META: (exact_pid_m * triton.cdiv(7168, META['BLOCK_N']),)
+    use_gemm2_t901 = _use_gemm2_t901_override(T, block_m, use_exact_dispatch)
 
     if use_small_medium_gemm:
         gemm2_kernel = _small_medium_fused_moe_gemm2_kernel
     elif use_upper_medium_gemm:
         gemm2_kernel = _medium_fused_moe_gemm2_kernel
+    elif use_gemm2_t901:
+        gemm2_kernel = _fused_moe_gemm2_t901_kernel
     else:
         gemm2_kernel = _fused_moe_gemm2_kernel
     gemm2_kernel[grid2](
