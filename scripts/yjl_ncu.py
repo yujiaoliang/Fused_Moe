@@ -173,6 +173,30 @@ def _log_t901_gemm2_autotune(module, log) -> None:
     _log_named_triton_autotune(module, "_fused_moe_gemm2_kernel", "Base GEMM2 autotune", log)
 
 
+def _log_small_t_gemm1_autotune(module, t: int, log) -> None:
+    if t <= 64:
+        _log_named_triton_autotune(
+            module,
+            "_small_medium_fused_moe_gemm1_swiglu_kernel",
+            f"T={t} GEMM1 autotune",
+            log,
+        )
+    elif t <= 128:
+        _log_named_triton_autotune(
+            module,
+            "_medium_fused_moe_gemm1_swiglu_kernel",
+            f"T={t} GEMM1 autotune",
+            log,
+        )
+    else:
+        _log_named_triton_autotune(
+            module,
+            "_fused_moe_gemm1_swiglu_kernel",
+            f"T={t} GEMM1 autotune",
+            log,
+        )
+
+
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOLUME_MOUNT: trace_volume})
 def run_profile(solution_json: str) -> str:
     import importlib.util
@@ -518,6 +542,8 @@ def run_profile(solution_json: str) -> str:
         log("=" * 96)
         log(f"T = {t}")
         log("=" * 96)
+        if t>=901:
+            continue
         if t in trace_inputs_by_t:
             args = trace_inputs_by_t[t]
             log(f"Input source: trace set (T={t})")
@@ -558,6 +584,8 @@ def run_profile(solution_json: str) -> str:
             output.zero_()
             kernel_fn(*args)
         torch.cuda.synchronize()
+        if t in (32, 52, 80):
+            _log_small_t_gemm1_autotune(module, t, log)
         if t == 901:
             _log_t901_gemm2_autotune(module, log)
 
