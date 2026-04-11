@@ -253,7 +253,8 @@ mlsys_note/
 | 2D Tiled Token Reduce (BLOCK_T=16/32) | ✅ Large-T +2.9% | 削减 10x Grid Launch 开销，靠 ILP 打通 HBM Reduce 延迟墙 |
 | Column-Major 调度与并行 Dispatch | ✅ Medium-T 最高 +8.9% | 消除 GEMM1 计算依赖并提高权重 Cache 命中，精准打击中等 T 的延迟瓶颈 |
 | **GEMM2 Autotune 扩展** | ✅ AB-test Mean +2.1%，8/19 improved | 低 warp / GROUP_M=4/64 等新 configs 覆盖 GEMM2 短 K-loop (K=2048) |
-| **T=901 GEMM2 专用 Kernel** | ✅ T=901 GEMM2 瓶颈特化 | 独立 autotune 配置 (BN=128, BK=128, GROUP_M=8)，精准优化 GEMM2 占比 58% 的中大 T 瓶颈点 |
+| **T=901 GEMM2 专用 Kernel** | ✅ T=901 GEMM2 瓶颈特化 | 独立 autotune 配置，精准打击 GEMM2 58% 的中大 T 瓶颈点。Kernel级时长 -2.9% |
+| **小中T GEMM1 Autotune 扩展** | ✅ Kernel级延迟 -1.6%~6.6% | 补充深流水线 (stages=3/4) 及各种 GROUP_M 覆盖，全面降低 T=32~80 的 GEMM1 时长 |
 
 ---
 
@@ -292,7 +293,8 @@ mlsys_note/
 | `9d5a2f8` | Medium-T Column-Major | ✅ | `GROUP_M=32/64` 列排布与并行扫描，Medium-T 最高提速 +8.9% |
 | `c19336d` | Fused Routing+Histogram | ✅ | Token-major sort/layout/scatter，large-T routing/sort 开销 -1.5% |
 | (pending) | **GEMM2 autotune 扩展** | ✅ | AB-test mean +2.1%，8/19 improved，0 regressed |
-| `67ef373` | **T=901 GEMM2 专用 Kernel** | ✅ | 独立 `_fused_moe_gemm2_t901_kernel` + 专属 autotune，打击 GEMM2 58% 瓶颈 |
+| `67ef373` | **T=901 GEMM2 专用 Kernel** | ✅ | 独立 `_fused_moe_gemm2_t901_kernel` + 专属 autotune，打击 GEMM2 58% 瓶颈，单 kernel 提速 ~3% |
+| `1010fb4` | **小中T GEMM1 Autotune** | ✅✅ | 增补 13 个 candidates 覆盖深流水线，T=32~80 GEMM1 时长稳定减少 1.6%~6.6% |
 
 **结论：当前主线中所有生效改动都是 ✅ 或 ✅✅ 确定真实的。**
 
