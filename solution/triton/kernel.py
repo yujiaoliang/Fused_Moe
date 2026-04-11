@@ -55,7 +55,27 @@ T1_GENERIC_MAX_PADDED = TOP_K * T1_GENERIC_BLOCK_M
 TOKEN_SCATTER_BLOCK_TOKENS = 8
 
 GEMM2_T901_CONFIGS = [
+    # Original config
     triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=2),
+    # Low warp / low latency for short K=2048 (16 iters)
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=2, num_stages=2),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=4, num_stages=2),
+    # Deeper pipeline to hide fp32 A-side load latency
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=6),
+    # Higher GROUP_M for L2 weight reuse (T=901 has ~36 blocks)
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=8, num_stages=3),
+    # Low GROUP_M for few-block scenarios
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=2),
+    # BLOCK_N=256 variants
+    triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+    # BLOCK_N=64 for narrower tile
+    triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=2),
 ]
 
 
@@ -1235,6 +1255,13 @@ def _fused_moe_gemm2_t901_kernel(
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=2, num_stages=2),
+        # NEW: Fill gaps in GROUP_M=8/16, deeper pipeline, and warps sweep
+        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=2, num_stages=4),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=2, num_stages=4),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
     restore_value=['C_ptr'],
@@ -1427,6 +1454,14 @@ def _small_medium_fused_moe_gemm2_kernel(
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=2),
+        # NEW: Column-major + deeper pipeline + GROUP_M sweep for T=65-128
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=2, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=2, num_stages=4),
+        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=2, num_stages=2),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
     restore_value=['C_ptr'],

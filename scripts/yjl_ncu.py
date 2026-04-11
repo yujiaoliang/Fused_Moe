@@ -542,8 +542,7 @@ def run_profile(solution_json: str) -> str:
         log("=" * 96)
         log(f"T = {t}")
         log("=" * 96)
-        if t>=901:
-            continue
+        # Previously: if t>=901: continue  — removed to enable T=901+ profiling
         if t in trace_inputs_by_t:
             args = trace_inputs_by_t[t]
             log(f"Input source: trace set (T={t})")
