@@ -49,8 +49,9 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
    - Epilogue 融合 SwiGLU → 输出 fp32 `Intermediate [num_padded, 2048]`
 
 4. **GEMM2 (Non-Atomic Triton)**  
-   按 batch 大小 dispatch 到 `_small_medium_*` / `_medium_*` / `_fused_moe_gemm2_*` kernel  
+   按 batch 大小 dispatch 到 `_small_medium_*` / `_medium_*` / `_fused_moe_gemm2_*` / `_fused_moe_gemm2_t901_*` kernel  
    - Post-dot B-scale：`tl.dot(a, b.to(f32))` + `acc += partial * b_scale`  
+   - T=901 专用 kernel：独立 autotune config (`BLOCK_N=128, BLOCK_K=128, GROUP_M=8`)，针对 GEMM2 瓶颈场景优化  
    - 非原子写入 `expert_out [num_padded, 7168]`
 
 5. **Token-Centric Reduce** — `_token_reduce_kernel`  
@@ -68,6 +69,7 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 | 32 ≤ T ≤ 64 | 32 | `_small_medium_*` |
 | 65 ≤ T ≤ 128 | 32/64 | `_medium_*` |
 | T > 128 | 64 | `_fused_moe_*` (generic) |
+| **T = 901** | 64 | `_fused_moe_gemm2_t901_kernel` (GEMM2 专用) |
 | T > 2048 | 128 | `_fused_moe_*` (generic) |
 | T ≥ 4096 | dynamic | Exact dispatch (`total_blocks.item()`) |
 
@@ -173,6 +175,7 @@ mlsys_note/
 │   ├── run_modal.py             # Modal 完整 benchmark
 │   ├── profile_modal.py         # Modal NCU profiling
 │   ├── debug_modal.py           # 逐步对比 kernel vs reference
+│   ├── yjl_ncu.py               # NCU profiling + autotune 日志（支持 T901 kernel 分类）
 │   ├── pack_solution_simple.py  # 打包 solution.json
 │   └── ncu_profile_modal.py     # per-kernel 时间分解
 ├── config.toml                  # 配置（队名、赛道）
@@ -250,6 +253,7 @@ mlsys_note/
 | 2D Tiled Token Reduce (BLOCK_T=16/32) | ✅ Large-T +2.9% | 削减 10x Grid Launch 开销，靠 ILP 打通 HBM Reduce 延迟墙 |
 | Column-Major 调度与并行 Dispatch | ✅ Medium-T 最高 +8.9% | 消除 GEMM1 计算依赖并提高权重 Cache 命中，精准打击中等 T 的延迟瓶颈 |
 | **GEMM2 Autotune 扩展** | ✅ AB-test Mean +2.1%，8/19 improved | 低 warp / GROUP_M=4/64 等新 configs 覆盖 GEMM2 短 K-loop (K=2048) |
+| **T=901 GEMM2 专用 Kernel** | ✅ T=901 GEMM2 瓶颈特化 | 独立 autotune 配置 (BN=128, BK=128, GROUP_M=8)，精准优化 GEMM2 占比 58% 的中大 T 瓶颈点 |
 
 ---
 
@@ -288,6 +292,7 @@ mlsys_note/
 | `9d5a2f8` | Medium-T Column-Major | ✅ | `GROUP_M=32/64` 列排布与并行扫描，Medium-T 最高提速 +8.9% |
 | `c19336d` | Fused Routing+Histogram | ✅ | Token-major sort/layout/scatter，large-T routing/sort 开销 -1.5% |
 | (pending) | **GEMM2 autotune 扩展** | ✅ | AB-test mean +2.1%，8/19 improved，0 regressed |
+| `67ef373` | **T=901 GEMM2 专用 Kernel** | ✅ | 独立 `_fused_moe_gemm2_t901_kernel` + 专属 autotune，打击 GEMM2 58% 瓶颈 |
 
 **结论：当前主线中所有生效改动都是 ✅ 或 ✅✅ 确定真实的。**
 
