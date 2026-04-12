@@ -255,6 +255,7 @@ mlsys_note/
 | **GEMM2 Autotune 扩展** | ✅ AB-test Mean +2.1%，8/19 improved | 低 warp / GROUP_M=4/64 等新 configs 覆盖 GEMM2 短 K-loop (K=2048) |
 | **T=901 GEMM2 专用 Kernel** | ✅ T=901 GEMM2 瓶颈特化 | 独立 autotune 配置，精准打击 GEMM2 58% 的中大 T 瓶颈点。Kernel级时长 -2.9% |
 | **小中T GEMM1 Autotune 扩展** | ✅ Kernel级延迟 -1.6%~6.6% | 补充深流水线 (stages=3/4) 及各种 GROUP_M 覆盖，全面降低 T=32~80 的 GEMM1 时长 |
+| **T=1 Autotune 扩展** | ✅ T=1 Kernel -3% | 补充针对极小维度的低纬度分块与浅流水线 (warps=2, stages=2) 特化 |
 
 ---
 
@@ -295,6 +296,7 @@ mlsys_note/
 | (pending) | **GEMM2 autotune 扩展** | ✅ | AB-test mean +2.1%，8/19 improved，0 regressed |
 | `67ef373` | **T=901 GEMM2 专用 Kernel** | ✅ | 独立 `_fused_moe_gemm2_t901_kernel` + 专属 autotune，打击 GEMM2 58% 瓶颈，单 kernel 提速 ~3% |
 | `1010fb4` | **小中T GEMM1 Autotune** | ✅✅ | 增补 13 个 candidates 覆盖深流水线，T=32~80 GEMM1 时长稳定减少 1.6%~6.6% |
+| `c35907d` | **T=1 GEMM1/2 Autotune** | ✅✅ | 补充微型 kernel 设置 (warps=2)，单 token 指令开销降低，latency -3% |
 
 **结论：当前主线中所有生效改动都是 ✅ 或 ✅✅ 确定真实的。**
 
