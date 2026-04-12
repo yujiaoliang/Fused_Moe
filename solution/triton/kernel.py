@@ -1656,6 +1656,13 @@ def _medium_fused_moe_gemm2_kernel(
         triton.Config({'BLOCK_N': 128}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 256}, num_warps=8, num_stages=4),
+        # NEW low-latency / low-overhead configs
+        triton.Config({'BLOCK_N': 64}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 128}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 256}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 256}, num_warps=2, num_stages=2),
     ],
     key=['N', 'K'],
 )
@@ -1805,6 +1812,14 @@ def _token_reduce_kernel(
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=3),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=3),
+        # NEW low-latency configs
+        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=2, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=4, num_stages=3),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
     restore_value=['C_ptr'],

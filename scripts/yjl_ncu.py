@@ -173,6 +173,11 @@ def _log_t901_gemm2_autotune(module, log) -> None:
     _log_named_triton_autotune(module, "_fused_moe_gemm2_kernel", "Base GEMM2 autotune", log)
 
 
+def _log_t1_autotune(module, log) -> None:
+    _log_named_triton_autotune(module, "_t1_fused_gemm1_swiglu_kernel", "T=1 GEMM1 autotune", log)
+    _log_named_triton_autotune(module, "_t1_fused_gemm2_reduce_kernel", "T=1 GEMM2 autotune", log)
+
+
 def _log_small_t_gemm1_autotune(module, t: int, log) -> None:
     if t <= 64:
         _log_named_triton_autotune(
@@ -583,6 +588,8 @@ def run_profile(solution_json: str) -> str:
             output.zero_()
             kernel_fn(*args)
         torch.cuda.synchronize()
+        if t == 1:
+            _log_t1_autotune(module, log)
         if t in (32, 52, 80):
             _log_small_t_gemm1_autotune(module, t, log)
         if t == 901:
