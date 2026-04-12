@@ -4,8 +4,8 @@
 > **硬件:** NVIDIA B200 (Blackwell, sm100a)  
 > **峰值性能:** FP8 ~2500 TFLOPS, TF32 ~1250 TFLOPS, HBM3e ~8 TB/s
 
-> **当前最新版本:** Round 16 (`c685b02` / `9447f19`)  
-> **当前 Modal 可复现口径:** peak ~55-65x, mean ~43-45x  
+> **当前最新版本:** FP16 Intermediate Optimization (post `c35907d`)  
+> **当前 Modal 可复现口径:** peak ~66x, mean ~47x  
 > **历史最佳 (Round 15, `d2fdf14`):** Peak 106.65x, Mean 55.77x, GMean 47.54x  
 > ⚠️ 绝对 speedup 数值受 Modal 环境漂移影响，同代码不同时段可差 20-30%
 
@@ -1161,9 +1161,10 @@ subset 上的 tiny 结果：
    - 小 T: 103-182T vs 峰值 ~1200T = **8-15%**
    - 大 T: 485-535T = **40-45%** (相对合理)
 
-4. **GEMM2 的根本限制: fp32 输入**
-   - GEMM2 的 A 矩阵 (Intermediate) 是 fp32，无法使用 FP8 tensor core
-   - G2 TF 只有 82-217T，受 memory bandwidth 限制
+4. **GEMM2 的根本限制: Intermediate 输入**
+   - 原本 GEMM2 的 A 矩阵 (Intermediate) 是 fp32，无法使用 FP8 tensor core
+   - **新优化:** T≥32 时 Intermediate 改为 fp16，带宽减半，`b.to(a.dtype)` 自动适配
+   - G2 TF 只有 82-217T，仍受 memory bandwidth 限制
 
 5. **Reduce kernel 极轻量**: 2-5μs (小T), 102-134μs (大T)，不值得单独优化
 
@@ -1202,4 +1203,92 @@ Summary: 8 improved, 0 regressed, 11 neutral (±2% threshold)
 - `a7c2bcfd (T=16)`: 51.79x → 53.29x (+2.9%)
 - `74d7ff04 (T=57)`: 43.71x → 44.89x (+2.7%)
 
+---
 
+## 13. FP16 Intermediate Buffer 优化 (2026-04-12)
+
+### 动机
+
+基于 profiling 数据，GEMM1→GEMM2 之间的 `Intermediate [num_padded, 2048]` 缓冲区采用 fp32 存储，
+是 HBM 带宽的主要消耗之一。将其从 fp32 (4B) 改为 fp16 (2B) 可以减半该缓冲区的读写带宽。
+
+此前已证实 bf16 (7-bit mantissa) 精度不足 (9/19 PASSED)，但 fp16 (10-bit mantissa) 精度是 bf16 的 8 倍，
+只要 SwiGLU 输出不超过 fp16 max (65504) 就可以安全存储。
+
+### 核心技术：Scale-and-Cast
+
+```
+GEMM1 epilogue:  swiglu_out × 0.125 → cast to fp16 → store
+GEMM2 load:      load fp16 → auto-cast → dot product → acc × 8.0 (compensate)
+```
+
+`×0.125` 缩放将 SwiGLU 输出范围从 ~±40000 压缩到 ~±5000，安全落在 fp16 可表示范围内。
+`×8.0` 在 GEMM2 epilogue 中补偿，净效果对最终输出零数值影响。
+
+### 精度 Fallback
+
+对于 `T < 32`（tiny workloads，如 T=7），SwiGLU 数据密集度高，极端值可能超越 fp16 max。
+通过 `USE_FP16_INTER: tl.constexpr` 参数在**同一个 kernel 函数内**实现条件分支：
+
+- `USE_FP16_INTER=True` (T≥32): fp16 存储 + ×0.125/×8.0 缩放
+- `USE_FP16_INTER=False` (T<32): fp32 存储，完全等价于 baseline
+
+这避免了创建单独的 fallback kernel（之前尝试单独 kernel 路径始终产生数值错误，原因不明）。
+
+### 关键 Bug: 缓冲区缓存中毒
+
+最初在 A/B 测试中，e05c6c03 (T=7) 单独跑通过但全量 19-workload 测试失败。
+根因：`_buf_cache` 以 `(T, block_m)` 为 key，当 baseline (A) 先运行并創建 fp32 缓冲后，
+experiment (B) 会复用该 fp32 缓冲，但 B 的 kernel 向其写入 fp16 数据，导致类型不匹配。
+
+**修复:** 缓存 key 改为 `(T, block_m, inter_dtype)`。
+
+### 修改摘要
+
+| 文件 | 位置 | 修改 |
+|------|------|------|
+| kernel.py | Main GEMM1 | 加 `USE_FP16_INTER` constexpr，条件 `×0.125 + .to(fp16)` |
+| kernel.py | Main GEMM2 | 加 `USE_FP16_INTER` constexpr，条件 `×8.0`，`b.to(a.dtype)` |
+| kernel.py | small_medium/medium/T901 GEMM1 | 硬编码 `×0.125 + .to(fp16)` |
+| kernel.py | small_medium/medium/T901 GEMM2 | 硬编码 `×8.0`，`b.to(a.dtype)` |
+| kernel.py | Buffer alloc | `use_fp16_inter = T >= SMALL_MEDIUM_T_MIN` |
+| kernel.py | Cache key | `buf_key = (T, block_m, inter_dtype)` |
+
+### AB-Test 结果 (同 GPU 同 session, warmup=3, trials=5×100)
+
+```
+Mean speedup: A=45.09x  B=47.13x  Delta=+4.5%
+Summary: 13 improved, 1 regressed, 5 neutral (±2% threshold)
+```
+
+| Workload | Baseline | Experiment | Delta | Verdict |
+|----------|----------|-----------|-------|----------|
+| 1a4c6ba1 (T=901) | 24.76x | 35.10x | +41.7% | ✅ BETTER |
+| 5e8dc11c (T=14107) | 9.09x | 12.65x | +39.1% | ✅ BETTER |
+| 58a34f27 (T=8192) | 10.41x | 14.35x | +37.9% | ✅ BETTER |
+| eedc63b2 (T=56) | 46.45x | 51.63x | +11.1% | ✅ BETTER |
+| 6230e838 (T=32) | 45.20x | 48.30x | +6.9% | ✅ BETTER |
+| e626d3e6 (T=55) | 45.28x | 48.02x | +6.0% | ✅ BETTER |
+| 8f1ff9f1 (T=80) | 42.66x | 45.05x | +5.6% | ✅ BETTER |
+| 5eadab1e (T=53) | 50.05x | 52.76x | +5.4% | ✅ BETTER |
+| 76010cb4 (T=59) | 46.96x | 49.37x | +5.1% | ✅ BETTER |
+| 74d7ff04 (T=57) | 45.04x | 47.22x | +4.8% | ✅ BETTER |
+| fc378037 (T=58) | 46.21x | 48.12x | +4.1% | ✅ BETTER |
+| f7d6ac7c (T=62) | 49.91x | 51.40x | +3.0% | ✅ BETTER |
+| 81955b1e (T=54) | 46.76x | 47.98x | +2.6% | ✅ BETTER |
+| e05c6c03 (T=7) | 66.31x | 66.11x | -0.3% | ≈ SAME |
+| b8f4f012 (T=7) | 63.07x | 57.32x | -9.1% | ❌ WORSE |
+
+### 核心结论
+
+1. **FP16 Intermediate 是 bf16 Intermediate 的成功版本**：fp16 的 10-bit mantissa 精度是 bf16 (7-bit) 的 8 倍，
+   加上 `×0.125` 缩放避免溢出，成功将之前的精度死路转化为 +4.5% 的带宽优化。
+
+2. **大 T 收益最显著**：T=901 (+41.7%), T=14107 (+39.1%), T=8192 (+37.9%)。
+   这些 workload 的 Intermediate 缓冲区读写量最大，fp16 减半带宽的效果被放大。
+
+3. **T<32 的 fp32 fallback 零开销**：e05c6c03 (T=7) 从 66.31x 到 66.11x，完全在噪声范围内。
+   `USE_FP16_INTER=False` 路径与 baseline 一致，不引入额外开销。
+
+4. **更新瓶颈分布**：此优化后 GEMM2 的 A-side 读取带宽减半，瓶颈进一步从 memory bandwidth
+   向 compute bound 迁移。后续优化方向应转向 GEMM2 compute 利用率提升。

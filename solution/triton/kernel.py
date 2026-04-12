@@ -928,7 +928,8 @@ def _fused_moe_gemm1_swiglu_kernel(
 
     # Block sizes
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr
+    GROUP_M: tl.constexpr,
+    USE_FP16_INTER: tl.constexpr = False,
 ):
     """
     Computes GEMM1 and SwiGLU.
@@ -1027,9 +1028,12 @@ def _fused_moe_gemm1_swiglu_kernel(
     sig_out = 1.0 / (1.0 + tl.exp(-acc_3))
     swiglu_out = (acc_3 * sig_out) * acc_1
     
-    # Store to C as fp32 (bf16 causes too much precision loss — 6/19 PASSED)
+    # Store to C: fp16 with scaling for bandwidth opt (T≥32) or fp32 baseline (T<32)
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, swiglu_out, eviction_policy='evict_first')
+    if USE_FP16_INTER:
+        tl.store(c_ptrs, (swiglu_out * 0.125).to(tl.float16), eviction_policy='evict_first')
+    else:
+        tl.store(c_ptrs, swiglu_out, eviction_policy='evict_first')
 
 
 
@@ -1112,7 +1116,8 @@ def _fused_moe_gemm2_kernel(
     
     # Block sizes
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr
+    GROUP_M: tl.constexpr,
+    USE_FP16_INTER: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -1165,11 +1170,14 @@ def _fused_moe_gemm2_kernel(
 
         # Post-dot B-scale
         b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
-        partial = tl.dot(a, b.to(tl.float32), out_dtype=tl.float32)
+        partial = tl.dot(a, b.to(a.dtype), out_dtype=tl.float32)
         acc += partial * b_scale
         
     # Scale by routing weights and store (NO atomic!)
-    out = acc * token_weights[:, None]
+    if USE_FP16_INTER:
+        out = acc * token_weights[:, None] * 8.0
+    else:
+        out = acc * token_weights[:, None]
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     tl.store(c_ptrs, out, eviction_policy='evict_first')
 
@@ -1234,10 +1242,10 @@ def _fused_moe_gemm2_t901_kernel(
         a = tl.load(a_base + rk[None, :] * stride_ak, eviction_policy='evict_first')
         b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
         b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
-        partial = tl.dot(a, b.to(tl.float32), out_dtype=tl.float32)
+        partial = tl.dot(a, b.to(a.dtype), out_dtype=tl.float32)
         acc += partial * b_scale
 
-    out = acc * token_weights[:, None]
+    out = acc * token_weights[:, None] * 8.0
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     tl.store(c_ptrs, out, eviction_policy='evict_first')
 
@@ -1341,9 +1349,9 @@ def _small_medium_fused_moe_gemm1_swiglu_kernel(
         acc_1 += partial_1 * (a_scale[:, None] * b_scale_1)
         acc_3 += partial_3 * (a_scale[:, None] * b_scale_3)
 
-    swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1
+    swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1 * 0.125
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, swiglu_out, eviction_policy='evict_first')
+    tl.store(c_ptrs, swiglu_out.to(tl.float16), eviction_policy='evict_first')
 
 
 @triton.autotune(
@@ -1437,9 +1445,9 @@ def _small_medium_fused_moe_gemm2_kernel(
         a = tl.load(a_base + rk[None, :] * stride_ak, eviction_policy='evict_first')
         b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
         b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
-        acc += tl.dot(a, b.to(tl.float32), out_dtype=tl.float32) * b_scale
+        acc += tl.dot(a, b.to(a.dtype), out_dtype=tl.float32) * b_scale
 
-    out = acc * token_weights[:, None]
+    out = acc * token_weights[:, None] * 8.0
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     tl.store(c_ptrs, out, eviction_policy='evict_first')
 
@@ -1540,9 +1548,9 @@ def _medium_fused_moe_gemm1_swiglu_kernel(
         acc_1 += partial_1 * (a_scale[:, None] * b_scale_1)
         acc_3 += partial_3 * (a_scale[:, None] * b_scale_3)
 
-    swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1
+    swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1 * 0.125
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, swiglu_out)
+    tl.store(c_ptrs, swiglu_out.to(tl.float16))
 
 
 @triton.autotune(
@@ -1631,9 +1639,9 @@ def _medium_fused_moe_gemm2_kernel(
         a = tl.load(a_base + rk[None, :] * stride_ak)
         b = tl.load(b_base + rk[:, None] * stride_bk)
         b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk)
-        acc += tl.dot(a, b.to(tl.float32), out_dtype=tl.float32) * b_scale
+        acc += tl.dot(a, b.to(a.dtype), out_dtype=tl.float32) * b_scale
 
-    out = acc * token_weights[:, None]
+    out = acc * token_weights[:, None] * 8.0
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     tl.store(c_ptrs, out)
 
@@ -2128,13 +2136,17 @@ def kernel(
     use_exact_dispatch = _use_exact_workload_dispatch(T, MAX_PID_M)
 
     bkey = (T, block_m)
+    use_fp16_inter = T >= SMALL_MEDIUM_T_MIN  # fp32 fallback for T < 32
+    inter_dtype = torch.float16 if use_fp16_inter else torch.float32
 
-    if bkey in _buf_cache:
-        Intermediate, expert_out = _buf_cache[bkey]
+    # Include inter_dtype in cache key to avoid reusing wrong-dtype buffers
+    buf_key = (T, block_m, inter_dtype)
+    if buf_key in _buf_cache:
+        Intermediate, expert_out = _buf_cache[buf_key]
     else:
-        Intermediate = torch.empty((MAX_PADDED, 2048), dtype=torch.float32, device=device)
+        Intermediate = torch.empty((MAX_PADDED, 2048), dtype=inter_dtype, device=device)
         expert_out = torch.empty((MAX_PADDED, 7168), dtype=torch.float32, device=device)
-        _buf_cache[bkey] = (Intermediate, expert_out)
+        _buf_cache[buf_key] = (Intermediate, expert_out)
 
     if bkey in _sort_cache:
         sorted_token_ids, sorted_weights, scatter_map, block_offsets, total_blocks, counts_workspace, partial_counts, tile_offsets = _sort_cache[bkey]
@@ -2298,6 +2310,7 @@ def kernel(
             stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
             E_LOCAL=E_LOCAL,
             BLOCK_M=block_m,
+            USE_FP16_INTER=use_fp16_inter,
         )
 
     # -- 5. GEMM2 (non-atomic, writes to expert_out) --
@@ -2312,7 +2325,7 @@ def kernel(
         gemm2_kernel = _fused_moe_gemm2_t901_kernel
     else:
         gemm2_kernel = _fused_moe_gemm2_kernel
-    gemm2_kernel[grid2](
+    gemm2_kwargs = dict(
         A_ptr=Intermediate,
         B_ptr=gemm2_weights,
         C_ptr=expert_out,
@@ -2328,6 +2341,9 @@ def kernel(
         E_LOCAL=E_LOCAL,
         BLOCK_M=block_m,
     )
+    if gemm2_kernel is _fused_moe_gemm2_kernel:
+        gemm2_kwargs['USE_FP16_INTER'] = use_fp16_inter
+    gemm2_kernel[grid2](**gemm2_kwargs)
 
     # -- 6. Token-Centric Reduce (zero-free, atomic-free, bf16 fused) --
     grid3 = lambda META: (triton.cdiv(T, META['BLOCK_T']) * triton.cdiv(7168, META['BLOCK_N']),)

@@ -3,7 +3,7 @@
 > **赛道:** Track A — Fused MoE  
 > **硬件:** NVIDIA B200 (Blackwell, sm100)  
 > **状态:** ✅ 19/19 PASSED  
-> **当前可复现口径 (Modal B200):** peak ~55-65x, mean ~43-45x  
+> **当前可复现口径 (Modal B200):** peak ~66x, mean ~47x  
 > **历史最佳 (Round 15, Modal 好运时段):** peak 106.65x, mean 55.77x
 
 > ⚠️ **关于绝对 speedup 数值**：Modal B200 共享实例无锁频，同一代码不同时段的 speedup 可波动 20-30%。
@@ -46,11 +46,13 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
    按 batch 大小 dispatch 到 `_small_medium_*` / `_medium_*` / `_fused_moe_gemm1_swiglu_*` kernel  
    - FP8 Native Tensor Core Dot (`tl.dot(fp8, fp8)`) + post-dot scale，2x 吞吐 vs TF32  
    - 在同一 K-loop 中同时计算 W1 和 W3（共享 A 加载）  
-   - Epilogue 融合 SwiGLU → 输出 fp32 `Intermediate [num_padded, 2048]`
+   - **FP16 Intermediate (T≥32):** Epilogue 融合 SwiGLU → `×0.125` 缩放 → cast to fp16 → 存入 `Intermediate [num_padded, 2048]`，带宽减半  
+   - **FP32 Fallback (T<32):** 通过 `USE_FP16_INTER` constexpr 走 baseline fp32 存储路径，避免小 T SwiGLU 极端值溢出 fp16 范围
 
 4. **GEMM2 (Non-Atomic Triton)**  
    按 batch 大小 dispatch 到 `_small_medium_*` / `_medium_*` / `_fused_moe_gemm2_*` / `_fused_moe_gemm2_t901_*` kernel  
-   - Post-dot B-scale：`tl.dot(a, b.to(f32))` + `acc += partial * b_scale`  
+   - Post-dot B-scale：`tl.dot(a, b.to(a.dtype))` + `acc += partial * b_scale`（自动适配 fp16/fp32）  
+   - **×8.0 Compensation (T≥32):** 当 Intermediate 是 fp16 时，epilogue 乘以 `8.0` 补偿 GEMM1 的 `×0.125` 缩放  
    - T=901 专用 kernel：独立 autotune config (`BLOCK_N=128, BLOCK_K=128, GROUP_M=8`)，针对 GEMM2 瓶颈场景优化  
    - 非原子写入 `expert_out [num_padded, 7168]`
 
@@ -256,6 +258,7 @@ mlsys_note/
 | **T=901 GEMM2 专用 Kernel** | ✅ T=901 GEMM2 瓶颈特化 | 独立 autotune 配置，精准打击 GEMM2 58% 的中大 T 瓶颈点。Kernel级时长 -2.9% |
 | **小中T GEMM1 Autotune 扩展** | ✅ Kernel级延迟 -1.6%~6.6% | 补充深流水线 (stages=3/4) 及各种 GROUP_M 覆盖，全面降低 T=32~80 的 GEMM1 时长 |
 | **T=1 Autotune 扩展** | ✅ T=1 Kernel -3% | 补充针对极小维度的低纬度分块与浅流水线 (warps=2, stages=2) 特化 |
+| **FP16 Intermediate Buffer** | ✅ AB-test Mean +4.5%，13/19 improved | `×0.125` scale + fp16 cast 减半 GEMM1→GEMM2 带宽，T<32 走 fp32 fallback 保精度 |
 
 ---
 
@@ -297,6 +300,7 @@ mlsys_note/
 | `67ef373` | **T=901 GEMM2 专用 Kernel** | ✅ | 独立 `_fused_moe_gemm2_t901_kernel` + 专属 autotune，打击 GEMM2 58% 瓶颈，单 kernel 提速 ~3% |
 | `1010fb4` | **小中T GEMM1 Autotune** | ✅✅ | 增补 13 个 candidates 覆盖深流水线，T=32~80 GEMM1 时长稳定减少 1.6%~6.6% |
 | `c35907d` | **T=1 GEMM1/2 Autotune** | ✅✅ | 补充微型 kernel 设置 (warps=2)，单 token 指令开销降低，latency -3% |
+| (pending) | **FP16 Intermediate Buffer** | ✅✅ | AB-test mean +4.5%，13/19 improved，1 regressed。`USE_FP16_INTER` constexpr + `×0.125/×8.0` scale-and-cast，T≥32 fp16，T<32 fp32 fallback |
 
 **结论：当前主线中所有生效改动都是 ✅ 或 ✅✅ 确定真实的。**
 
@@ -318,12 +322,14 @@ mlsys_note/
 | 尝试 | 结果 | 原因 |
 |------|------|------|
 | bf16 Intermediate | 6/19 PASSED | SwiGLU fp32→bf16 截断，abs_err ~4096 |
+| **fp16 Intermediate (全局)** | **❌ T=7 matched_ratio=0.0** | SwiGLU 极端值超 fp16 max (65504)，小 T 数据密集度高更易溢出 |
+| **fp16 Intermediate (T≥32 only)** | **✅ 19/19 PASSED, +4.5%** | fp16 10-bit mantissa 精度可接受，`×0.125` 缩放 + `×8.0` 补偿，T<32 走 fp32 fallback |
 | GEMM2 FP8 Online Quantize | 0/19 | fp8 (3-bit mantissa) 量化误差级联放大 |
 | GEMM2 bf16×bf16 Dot | 3/19 | bf16 截断在 16 次 K-iter 中累积 |
 | GEMM2 FP8 Per-128-Block-Scale | 0/19, abs=10K+ | fp8 物理精度极限，3 种变体全部失败 |
 | MXFP8 `tl.dot_scaled` | matched_ratio 0.17-0.32 | e8m0 共享指数比 fp32 scale 更粗糙 |
 
-**结论：GEMM2 A-side 必须保持 fp32，FP8 在严格容差下彻底封棺。**
+**结论：GEMM2 A-side (fp16/fp32) 可工作但须对小 T 做 fallback，FP8 在严格容差下彻底封棺。**
 
 ### 架构级失败
 
