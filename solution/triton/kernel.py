@@ -64,6 +64,11 @@ TOKEN_SCATTER_BLOCK_TOKENS = 8
 
 # cuBLAS GEMM2 dispatch threshold (only for large-T where GEMM compute dominates)
 CUBLAS_GEMM2_T_MIN = 2048
+CUBLAS_ENABLED = False  # Disable cuBLAS in final submission (organizers value own implementation)
+
+# bf16 expert_out: saves 50% bandwidth on largest buffer [MAX_PADDED, 7168]
+# bf16 range = 3.4e38 (same as fp32) — no overflow risk unlike fp16
+BF16_EXPERT_OUT_T_MIN = 128  # bf16 expert_out for medium/large-T workloads
 
 GEMM2_T901_CONFIGS = [
     # Original config
@@ -1129,6 +1134,7 @@ def _fused_moe_gemm2_kernel(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
     USE_FP16_INTER: tl.constexpr = False,
+    USE_BF16_EXPERT_OUT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -1190,7 +1196,10 @@ def _fused_moe_gemm2_kernel(
     else:
         out = acc * token_weights[:, None]
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, out, eviction_policy='evict_first')
+    if USE_BF16_EXPERT_OUT:
+        tl.store(c_ptrs, out.to(tl.bfloat16), eviction_policy='evict_first')
+    else:
+        tl.store(c_ptrs, out, eviction_policy='evict_first')
 
 
 @triton.autotune(
@@ -1216,6 +1225,7 @@ def _fused_moe_gemm2_t901_kernel(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
     USE_FP16_INTER: tl.constexpr = False,
+    USE_BF16_EXPERT_OUT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -1265,7 +1275,10 @@ def _fused_moe_gemm2_t901_kernel(
     else:
         out = acc * token_weights[:, None]
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, out, eviction_policy='evict_first')
+    if USE_BF16_EXPERT_OUT:
+        tl.store(c_ptrs, out.to(tl.bfloat16), eviction_policy='evict_first')
+    else:
+        tl.store(c_ptrs, out, eviction_policy='evict_first')
 
 
 @triton.autotune(
@@ -1403,6 +1416,7 @@ def _small_medium_fused_moe_gemm2_kernel(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
     USE_FP16_INTER: tl.constexpr = False,
+    USE_BF16_EXPERT_OUT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -1450,7 +1464,10 @@ def _small_medium_fused_moe_gemm2_kernel(
     else:
         out = acc * token_weights[:, None]
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, out, eviction_policy='evict_first')
+    if USE_BF16_EXPERT_OUT:
+        tl.store(c_ptrs, out.to(tl.bfloat16), eviction_policy='evict_first')
+    else:
+        tl.store(c_ptrs, out, eviction_policy='evict_first')
 
 
 @triton.autotune(
@@ -1608,6 +1625,7 @@ def _medium_fused_moe_gemm2_kernel(
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
     USE_FP16_INTER: tl.constexpr = False,
+    USE_BF16_EXPERT_OUT: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -1655,7 +1673,10 @@ def _medium_fused_moe_gemm2_kernel(
     else:
         out = acc * token_weights[:, None]
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, out)
+    if USE_BF16_EXPERT_OUT:
+        tl.store(c_ptrs, out.to(tl.bfloat16))
+    else:
+        tl.store(c_ptrs, out)
 
 
 @triton.autotune(
@@ -1752,7 +1773,7 @@ def _t1_fused_gemm2_reduce_kernel(
 )
 @triton.jit
 def _token_reduce_kernel(
-    expert_out_ptr,   # [num_padded, N] fp32
+    expert_out_ptr,   # [num_padded, N] fp32 or bf16
     output_ptr,       # [T, N] bf16 (final output)
     scatter_map_ptr,  # [T * TOP_K] int32
     T_val: tl.constexpr,
@@ -2150,14 +2171,16 @@ def kernel(
     bkey = (T, block_m)
     use_fp16_inter = T >= SMALL_MEDIUM_T_MIN
     inter_dtype = torch.float16 if use_fp16_inter else torch.float32
+    use_bf16_expert_out = T >= BF16_EXPERT_OUT_T_MIN
+    eo_dtype = torch.bfloat16 if use_bf16_expert_out else torch.float32
 
-    # Include inter_dtype in cache key to avoid reusing wrong-dtype buffers
-    buf_key = (T, block_m, inter_dtype)
+    # Include inter_dtype and eo_dtype in cache key to avoid reusing wrong-dtype buffers
+    buf_key = (T, block_m, inter_dtype, eo_dtype)
     if buf_key in _buf_cache:
         Intermediate, expert_out = _buf_cache[buf_key]
     else:
         Intermediate = torch.empty((MAX_PADDED, 2048), dtype=inter_dtype, device=device)
-        expert_out = torch.empty((MAX_PADDED, 7168), dtype=torch.float32, device=device)
+        expert_out = torch.empty((MAX_PADDED, 7168), dtype=eo_dtype, device=device)
         _buf_cache[buf_key] = (Intermediate, expert_out)
 
     if bkey in _sort_cache:
@@ -2328,9 +2351,10 @@ def kernel(
         )
 
     # -- 5. GEMM2 (non-atomic, writes to expert_out) --
-    # Try cuBLAS path for large-T workloads where GEMM compute dominates
+    # cuBLAS path disabled for final submission (organizers value own implementation)
     _use_cublas_gemm2 = (
-        _HAS_CUBLAS_MODULE
+        CUBLAS_ENABLED
+        and _HAS_CUBLAS_MODULE
         and T >= CUBLAS_GEMM2_T_MIN
         and use_exact_dispatch
         and _ck_mod.ensure_compiled()
@@ -2391,6 +2415,7 @@ def kernel(
             BLOCK_M=block_m,
         )
         gemm2_kwargs['USE_FP16_INTER'] = use_fp16_inter
+        gemm2_kwargs['USE_BF16_EXPERT_OUT'] = use_bf16_expert_out
         gemm2_kernel[grid2](**gemm2_kwargs)
 
     # -- 6. Token-Centric Reduce (zero-free, atomic-free, bf16 fused) --
