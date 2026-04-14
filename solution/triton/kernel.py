@@ -19,6 +19,14 @@ import torch
 import triton
 import triton.language as tl
 
+# Lazy-import cuBLAS GEMM2 module (compiled on first use)
+try:
+    import cutlass_kernels as _ck_mod
+    _HAS_CUBLAS_MODULE = True
+except ImportError:
+    _ck_mod = None
+    _HAS_CUBLAS_MODULE = False
+
 # ── Constants (DeepSeek-V3 / R1) ──
 H = 7168
 I_SIZE = 2048
@@ -41,6 +49,7 @@ SMALL_MEDIUM_T_MIN = 32
 SMALL_MEDIUM_T_MAX = 64
 UPPER_MEDIUM_T_MIN = 65
 UPPER_MEDIUM_T_MAX = 128
+FP16_INTER_T_MIN = 512  # Only use fp16 intermediate for T >= this (bandwidth-sensitive)
 # Large traces benefit from exact pid_m dispatch; smaller traces lose to the extra host sync.
 EXACT_WORKLOAD_DISPATCH_T_MIN = 4096
 # A second guard keeps boundary workloads on the base path unless the overlaunch upper bound is large enough.
@@ -53,6 +62,9 @@ T1_GENERIC_BLOCK_M = 16
 T1_GENERIC_MAX_PADDED = TOP_K * T1_GENERIC_BLOCK_M
 
 TOKEN_SCATTER_BLOCK_TOKENS = 8
+
+# cuBLAS GEMM2 dispatch threshold (only for large-T where GEMM compute dominates)
+CUBLAS_GEMM2_T_MIN = 2048
 
 GEMM2_T901_CONFIGS = [
     # Original config
@@ -1203,7 +1215,8 @@ def _fused_moe_gemm2_t901_kernel(
     stride_bse, stride_bsn, stride_bsk,
     E_LOCAL: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr
+    GROUP_M: tl.constexpr,
+    USE_FP16_INTER: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -1242,10 +1255,16 @@ def _fused_moe_gemm2_t901_kernel(
         a = tl.load(a_base + rk[None, :] * stride_ak, eviction_policy='evict_first')
         b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
         b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
-        partial = tl.dot(a, b.to(a.dtype), out_dtype=tl.float32)
+        if USE_FP16_INTER:
+            partial = tl.dot(a, b.to(a.dtype), out_dtype=tl.float32)
+        else:
+            partial = tl.dot(a, b.to(tl.float32), out_dtype=tl.float32)
         acc += partial * b_scale
 
-    out = acc * token_weights[:, None] * 8.0
+    if USE_FP16_INTER:
+        out = acc * token_weights[:, None] * 8.0
+    else:
+        out = acc * token_weights[:, None]
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     tl.store(c_ptrs, out, eviction_policy='evict_first')
 
@@ -1259,17 +1278,9 @@ def _fused_moe_gemm2_t901_kernel(
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=2, num_stages=3),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=4, num_stages=2),
-        # Exp-B2: Column-Major scheduling for small/medium batches (mimicking PyTorch Labs)
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=2, num_stages=2),
-        # NEW: Fill gaps in GROUP_M=8/16, deeper pipeline, and warps sweep
-        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=2, num_stages=4),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=2, num_stages=4),
     ],
     key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
     restore_value=['C_ptr'],
@@ -1292,7 +1303,8 @@ def _small_medium_fused_moe_gemm1_swiglu_kernel(
     stride_bse, stride_bsn, stride_bsh,
     E_LOCAL: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr
+    GROUP_M: tl.constexpr,
+    USE_FP16_INTER: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     N_OUT = N // 2
@@ -1349,42 +1361,25 @@ def _small_medium_fused_moe_gemm1_swiglu_kernel(
         acc_1 += partial_1 * (a_scale[:, None] * b_scale_1)
         acc_3 += partial_3 * (a_scale[:, None] * b_scale_3)
 
-    swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1 * 0.125
+    swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, swiglu_out.to(tl.float16), eviction_policy='evict_first')
+    if USE_FP16_INTER:
+        tl.store(c_ptrs, (swiglu_out * 0.125).to(tl.float16), eviction_policy='evict_first')
+    else:
+        tl.store(c_ptrs, swiglu_out, eviction_policy='evict_first')
 
 
 @triton.autotune(
     configs=[
-        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=2, num_stages=3),
+        # v9 core configs
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=2, num_stages=2),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=2, num_stages=3),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=2),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=3),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=4),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=5),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=6),
-        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=4),
-        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=5),
-        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=6),
-        # Exp-B2: Column-Major scheduling
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=4, num_stages=4),
-        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=4, num_stages=4),
-        triton.Config({'BLOCK_N': 64,  'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=2, num_stages=3),
-        # --- NEW: Low-warp / low-latency for short K=2048 loop ---
-        triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=2, num_stages=2),
-        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 1}, num_warps=8, num_stages=2),
-        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=4, num_stages=2),
-        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=3),
-        # Higher warp counts for medium blocks
+        # Higher GROUP_M for L2 weight reuse
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
-        # Large GROUP_M for weight L2 reuse
         triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=4, num_stages=3),
         triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=8, num_stages=3),
     ],
@@ -1407,7 +1402,8 @@ def _small_medium_fused_moe_gemm2_kernel(
     stride_bse, stride_bsn, stride_bsk,
     E_LOCAL: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr
+    GROUP_M: tl.constexpr,
+    USE_FP16_INTER: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -1445,9 +1441,15 @@ def _small_medium_fused_moe_gemm2_kernel(
         a = tl.load(a_base + rk[None, :] * stride_ak, eviction_policy='evict_first')
         b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
         b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
-        acc += tl.dot(a, b.to(a.dtype), out_dtype=tl.float32) * b_scale
+        if USE_FP16_INTER:
+            acc += tl.dot(a, b.to(a.dtype), out_dtype=tl.float32) * b_scale
+        else:
+            acc += tl.dot(a, b.to(tl.float32), out_dtype=tl.float32) * b_scale
 
-    out = acc * token_weights[:, None] * 8.0
+    if USE_FP16_INTER:
+        out = acc * token_weights[:, None] * 8.0
+    else:
+        out = acc * token_weights[:, None]
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     tl.store(c_ptrs, out, eviction_policy='evict_first')
 
@@ -1492,7 +1494,8 @@ def _medium_fused_moe_gemm1_swiglu_kernel(
     stride_bse, stride_bsn, stride_bsh,
     E_LOCAL: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr
+    GROUP_M: tl.constexpr,
+    USE_FP16_INTER: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     N_OUT = N // 2
@@ -1548,9 +1551,12 @@ def _medium_fused_moe_gemm1_swiglu_kernel(
         acc_1 += partial_1 * (a_scale[:, None] * b_scale_1)
         acc_3 += partial_3 * (a_scale[:, None] * b_scale_3)
 
-    swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1 * 0.125
+    swiglu_out = (acc_3 * (1.0 / (1.0 + tl.exp(-acc_3)))) * acc_1
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
-    tl.store(c_ptrs, swiglu_out.to(tl.float16))
+    if USE_FP16_INTER:
+        tl.store(c_ptrs, (swiglu_out * 0.125).to(tl.float16))
+    else:
+        tl.store(c_ptrs, swiglu_out)
 
 
 @triton.autotune(
@@ -1601,7 +1607,8 @@ def _medium_fused_moe_gemm2_kernel(
     stride_bse, stride_bsn, stride_bsk,
     E_LOCAL: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr
+    GROUP_M: tl.constexpr,
+    USE_FP16_INTER: tl.constexpr = False,
 ):
     pid = tl.program_id(0)
     num_pid_n = tl.cdiv(N, BLOCK_N)
@@ -1639,9 +1646,15 @@ def _medium_fused_moe_gemm2_kernel(
         a = tl.load(a_base + rk[None, :] * stride_ak)
         b = tl.load(b_base + rk[:, None] * stride_bk)
         b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk)
-        acc += tl.dot(a, b.to(a.dtype), out_dtype=tl.float32) * b_scale
+        if USE_FP16_INTER:
+            acc += tl.dot(a, b.to(a.dtype), out_dtype=tl.float32) * b_scale
+        else:
+            acc += tl.dot(a, b.to(tl.float32), out_dtype=tl.float32) * b_scale
 
-    out = acc * token_weights[:, None] * 8.0
+    if USE_FP16_INTER:
+        out = acc * token_weights[:, None] * 8.0
+    else:
+        out = acc * token_weights[:, None]
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     tl.store(c_ptrs, out)
 
@@ -2136,7 +2149,7 @@ def kernel(
     use_exact_dispatch = _use_exact_workload_dispatch(T, MAX_PID_M)
 
     bkey = (T, block_m)
-    use_fp16_inter = T >= SMALL_MEDIUM_T_MIN  # fp32 fallback for T < 32
+    use_fp16_inter = T >= FP16_INTER_T_MIN  # fp16 only for large T where bandwidth savings dominate
     inter_dtype = torch.float16 if use_fp16_inter else torch.float32
 
     # Include inter_dtype in cache key to avoid reusing wrong-dtype buffers
@@ -2272,6 +2285,7 @@ def kernel(
             stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
             E_LOCAL=E_LOCAL,
             BLOCK_M=block_m,
+            USE_FP16_INTER=use_fp16_inter,
         )
     elif use_upper_medium_gemm:
         _medium_fused_moe_gemm1_swiglu_kernel[grid1](
@@ -2291,6 +2305,7 @@ def kernel(
             stride_bse=gemm1_weights_scale.stride(0), stride_bsn=gemm1_weights_scale.stride(1), stride_bsh=gemm1_weights_scale.stride(2),
             E_LOCAL=E_LOCAL,
             BLOCK_M=block_m,
+            USE_FP16_INTER=use_fp16_inter,
         )
     else:
         _fused_moe_gemm1_swiglu_kernel[grid1](
@@ -2314,36 +2329,70 @@ def kernel(
         )
 
     # -- 5. GEMM2 (non-atomic, writes to expert_out) --
-    grid2 = lambda META: (exact_pid_m * triton.cdiv(7168, META['BLOCK_N']),)
-    use_gemm2_t901 = _use_gemm2_t901_override(T, block_m, use_exact_dispatch)
-
-    if use_small_medium_gemm:
-        gemm2_kernel = _small_medium_fused_moe_gemm2_kernel
-    elif use_upper_medium_gemm:
-        gemm2_kernel = _medium_fused_moe_gemm2_kernel
-    elif use_gemm2_t901:
-        gemm2_kernel = _fused_moe_gemm2_t901_kernel
-    else:
-        gemm2_kernel = _fused_moe_gemm2_kernel
-    gemm2_kwargs = dict(
-        A_ptr=Intermediate,
-        B_ptr=gemm2_weights,
-        C_ptr=expert_out,
-        B_scale_ptr=gemm2_weights_scale,
-        token_weights_ptr=sorted_weights,
-        block_offsets_ptr=block_offsets,
-        total_blocks_ptr=total_blocks,
-        MAX_PID_M=exact_pid_m, N=7168, K=2048,
-        stride_am=Intermediate.stride(0), stride_ak=Intermediate.stride(1),
-        stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1), stride_bk=gemm2_weights.stride(2),
-        stride_cm=expert_out.stride(0), stride_cn=expert_out.stride(1),
-        stride_bse=gemm2_weights_scale.stride(0), stride_bsn=gemm2_weights_scale.stride(1), stride_bsk=gemm2_weights_scale.stride(2),
-        E_LOCAL=E_LOCAL,
-        BLOCK_M=block_m,
+    # Try cuBLAS path for large-T workloads where GEMM compute dominates
+    _use_cublas_gemm2 = (
+        _HAS_CUBLAS_MODULE
+        and T >= CUBLAS_GEMM2_T_MIN
+        and use_exact_dispatch
+        and _ck_mod.ensure_compiled()
     )
-    if gemm2_kernel is _fused_moe_gemm2_kernel:
+
+    if _use_cublas_gemm2:
+        # Per-expert cuBLAS GEMM2: read block_offsets (already synced via exact_pid_m)
+        offsets = block_offsets.cpu().tolist()
+        for e in range(E_LOCAL):
+            start_blk = offsets[e]
+            end_blk = offsets[e + 1]
+            if end_blk <= start_blk:
+                continue
+            start_row = start_blk * block_m
+            end_row = end_blk * block_m
+            # A slice: [num_rows, 2048] from Intermediate
+            A_slice = Intermediate[start_row:end_row]
+            # token_weights slice
+            tw_slice = sorted_weights[start_row:end_row]
+            # Output slice
+            C_slice = expert_out[start_row:end_row]
+            # B: gemm2_weights[e] is [N=7168, K=2048] — native layout, no transpose
+            # B_scale: gemm2_weights_scale[e] is [N//128, K//128] = [56, 16]
+            _ck_mod.cublas_gemm2_expert(
+                A_slice,
+                gemm2_weights[e],
+                gemm2_weights_scale[e],
+                tw_slice,
+                C_slice,
+                use_fp16_inter,
+            )
+    else:
+        grid2 = lambda META: (exact_pid_m * triton.cdiv(7168, META['BLOCK_N']),)
+        use_gemm2_t901 = _use_gemm2_t901_override(T, block_m, use_exact_dispatch)
+
+        if use_small_medium_gemm:
+            gemm2_kernel = _small_medium_fused_moe_gemm2_kernel
+        elif use_upper_medium_gemm:
+            gemm2_kernel = _medium_fused_moe_gemm2_kernel
+        elif use_gemm2_t901:
+            gemm2_kernel = _fused_moe_gemm2_t901_kernel
+        else:
+            gemm2_kernel = _fused_moe_gemm2_kernel
+        gemm2_kwargs = dict(
+            A_ptr=Intermediate,
+            B_ptr=gemm2_weights,
+            C_ptr=expert_out,
+            B_scale_ptr=gemm2_weights_scale,
+            token_weights_ptr=sorted_weights,
+            block_offsets_ptr=block_offsets,
+            total_blocks_ptr=total_blocks,
+            MAX_PID_M=exact_pid_m, N=7168, K=2048,
+            stride_am=Intermediate.stride(0), stride_ak=Intermediate.stride(1),
+            stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1), stride_bk=gemm2_weights.stride(2),
+            stride_cm=expert_out.stride(0), stride_cn=expert_out.stride(1),
+            stride_bse=gemm2_weights_scale.stride(0), stride_bsn=gemm2_weights_scale.stride(1), stride_bsk=gemm2_weights_scale.stride(2),
+            E_LOCAL=E_LOCAL,
+            BLOCK_M=block_m,
+        )
         gemm2_kwargs['USE_FP16_INTER'] = use_fp16_inter
-    gemm2_kernel[grid2](**gemm2_kwargs)
+        gemm2_kernel[grid2](**gemm2_kwargs)
 
     # -- 6. Token-Centric Reduce (zero-free, atomic-free, bf16 fused) --
     grid3 = lambda META: (triton.cdiv(T, META['BLOCK_T']) * triton.cdiv(7168, META['BLOCK_N']),)
