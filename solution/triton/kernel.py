@@ -49,7 +49,6 @@ SMALL_MEDIUM_T_MIN = 32
 SMALL_MEDIUM_T_MAX = 64
 UPPER_MEDIUM_T_MIN = 65
 UPPER_MEDIUM_T_MAX = 128
-FP16_INTER_T_MIN = 512  # Only use fp16 intermediate for T >= this (bandwidth-sensitive)
 # Large traces benefit from exact pid_m dispatch; smaller traces lose to the extra host sync.
 EXACT_WORKLOAD_DISPATCH_T_MIN = 4096
 # A second guard keeps boundary workloads on the base path unless the overlaunch upper bound is large enough.
@@ -1140,14 +1139,14 @@ def _fused_moe_gemm2_kernel(
     if pid >= total_blocks * num_pid_n:
         return
     num_pid_m = total_blocks
-    
+
     # Grouped Swizzle
     num_pid_in_group = GROUP_M * num_pid_n
     group_id = pid // num_pid_in_group
     first_pid_m = group_id * GROUP_M
     group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
     pid_m = first_pid_m + (pid % group_size_m)
-        
+
     pid_n = (pid % num_pid_in_group) // group_size_m
 
     e_idx = tl.arange(0, E_LOCAL)
@@ -1155,11 +1154,11 @@ def _fused_moe_gemm2_kernel(
     b_end = tl.load(block_offsets_ptr + e_idx + 1)
     valid = (b_start <= pid_m) & (pid_m < b_end)
     expert_id = tl.argmax(valid.to(tl.int32), axis=0)
-    
+
     # Offsets
     rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    
+
     # Load routing weights
     token_weights = tl.load(token_weights_ptr + rm)
 
@@ -1184,7 +1183,7 @@ def _fused_moe_gemm2_kernel(
         b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
         partial = tl.dot(a, b.to(a.dtype), out_dtype=tl.float32)
         acc += partial * b_scale
-        
+
     # Scale by routing weights and store (NO atomic!)
     if USE_FP16_INTER:
         out = acc * token_weights[:, None] * 8.0
@@ -2149,7 +2148,7 @@ def kernel(
     use_exact_dispatch = _use_exact_workload_dispatch(T, MAX_PID_M)
 
     bkey = (T, block_m)
-    use_fp16_inter = T >= FP16_INTER_T_MIN  # fp16 only for large T where bandwidth savings dominate
+    use_fp16_inter = T >= SMALL_MEDIUM_T_MIN
     inter_dtype = torch.float16 if use_fp16_inter else torch.float32
 
     # Include inter_dtype in cache key to avoid reusing wrong-dtype buffers
