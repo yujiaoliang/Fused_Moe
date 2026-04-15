@@ -556,6 +556,9 @@ def run_profile(solution_json: str) -> str:
             log(f"Input source: synthetic fallback (T={t})")
         output = args[-1]
 
+        # if t!=1:
+        #     continue
+
         padding_stats = infer_padding_stats(args)
         total_blocks = padding_stats["total_blocks"]
         num_padded = padding_stats["num_padded"]
