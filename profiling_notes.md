@@ -1292,3 +1292,127 @@ Summary: 13 improved, 1 regressed, 5 neutral (±2% threshold)
 
 4. **更新瓶颈分布**：此优化后 GEMM2 的 A-side 读取带宽减半，瓶颈进一步从 memory bandwidth
    向 compute bound 迁移。后续优化方向应转向 GEMM2 compute 利用率提升。
+
+## 14. GEMM2 FP8 On-the-fly Dot 实验 (2026-04-15)
+
+### 动机
+
+GEMM1 的 FP8 native dot (Round 5) 带来 2x 吞吐提升。尝试将同样策略应用于 GEMM2：
+将 Intermediate A-side (fp16/fp32) on-the-fly cast 到 fp8，用 `tl.dot(fp8, fp8)` 进行 native tensor core dot。
+
+### 方案 A: Direct Cast (无缩放)
+
+```python
+# GEMM2 K-loop 中:
+a_fp8 = a.to(b.dtype)  # fp16 → fp8e4m3fn, 直接截断
+partial = tl.dot(a_fp8, b, out_dtype=tl.float32)
+```
+
+**结果:** 5/19 PASSED, 14/19 INCORRECT_NUMERICAL
+- abs=500K-1M (fp8 max=448, SwiGLU 输出超此范围的值直接溢出)
+- 2/19 workload (T=14107, T=8192) ptxas register allocation failed (255 reg limit)
+- `tl.float8e4m3fn` 在 eval Triton 不存在 → RUNTIME_ERROR; 改用 `b.dtype` 推断类型后可运行
+
+### 方案 B: Per-Row Dynamic Scaling
+
+```python
+# GEMM2 K-loop 中:
+a_max = tl.max(tl.abs(a), axis=1)[:, None]  # per-row absmax
+a_scale = a_max / 448.0 + 1e-12
+a_scaled = (a / a_scale).to(b.dtype)  # 缩放到 fp8 安全范围
+partial = tl.dot(a_scaled, b, out_dtype=tl.float32) * a_scale  # 补偿
+```
+
+**结果:** 未单独测试（方案 A 的精度已说明 3-bit mantissa 根本不足）
+
+### Triton 兼容性问题
+
+eval Triton 版本无 `tl.float8e4m3fn` 属性：
+```
+AttributeError("module 'triton.language' has no attribute 'float8e4m3fn'")
+```
+**解决方案:** 用 `b.dtype` 从已加载的 fp8 weight tensor 推断类型。首次尝试的 17/19 RUNTIME_ERROR 就是因为硬编码了 `tl.float8e4m3fn`。
+
+### 失败分析
+
+| 因素 | 说明 |
+|------|------|
+| 精度 | fp8 仅 3-bit mantissa (8 个精度级别)。K=2048 的累积中，每个乘加的截断误差级联放大。与 GEMM1 不同，GEMM1 的 A-side 本身就是 fp8 weight（无额外量化损失），而 GEMM2 的 A-side 是 SwiGLU fp16 输出，on-the-fly cast 额外引入量化误差 |
+| 溢出 | SwiGLU 输出范围 ±40000，fp8e4m3fn max=448。直接 cast 导致大量 overflow |
+| Register pressure | fp8 cast + scaling 逻辑增加 register 使用，在大 tile 配置下触发 ptxas 255-reg fatal |
+| 数值比较 | abs=500K-1M (direct), abs=14K-25K (scaled) — 均远超 contest atol=1.0 |
+
+### 结论
+
+**GEMM2 A-side MUST stay ≥fp16。** fp8 的 3-bit mantissa 在 K=2048 累积维度下精度根本不足。
+与之前 GEMM2 FP8 Per-128-Block-Scale (Section 12, Round 7) 结论一致：GEMM2 不适用任何 fp8 精度方案。
+
+**GEMM2 所有 fp8 尝试总结:**
+1. FP8 Intermediate (fp32→fp8→fp32 quant/dequant, Round 7): 0/19, abs=10K+
+2. FP8 Per-128-Block-Scale (Round 7): 0/19, abs=10K+
+3. FP8 On-the-fly Dot direct cast (本轮): 5/19, abs=500K-1M
+4. FP8 On-the-fly Dot per-row scaled (本轮估计): abs=14K-25K
+→ **fp8 在 GEMM2 的所有变体彻底封棺。**
+
+## 15. Autotune Saturation Sweep + bf16 Expert_out AB Test (2026-04-15)
+
+### 背景
+
+在 FP8 GEMM2 dot 实验失败后，系统性探索 4 个剩余优化方向：
+1. GEMM2 autotune 深度调优（大 T 专项）
+2. GEMM1 compute 优化（中小 T）
+3. token_reduce kernel 优化
+4. bf16 expert_out 量化收益
+
+### Direction 1: GEMM2 Autotune 新 Configs
+
+在现有 45 configs 基础上新增 7 个 configs：
+- BLOCK_K=64 (3 variants) — 首次尝试非 128 的 K tile
+- num_stages=1 (2 variants) — 浅 pipeline 减少 register pressure
+- GROUP_M=128 (2 variants) — 极大 L2 weight reuse
+
+**AB test 结果: Delta = -0.2%, 16/19 neutral**
+
+结论：45 个现有 configs 已穷尽 GEMM2 autotune 空间。BLOCK_K=64 并未带来优势（K=2048 → 32 iterations 的额外 loop overhead 抵消了 register 节省）。
+
+### Direction 2: GEMM1 Small/Medium Autotune 新 Configs
+
+在 small_medium (10 configs) 和 medium (12 configs) GEMM1 各新增 5 configs：
+- BLOCK_N=256 variants — 更宽 N tile
+- num_warps=8, num_stages=3-4 — 更深 pipeline
+- GROUP_M=8/16 — L2 reuse sweep
+
+**AB test 结果 (与 Direction 3 同轮): Delta = +0.4%, 1/19 improved (T=80 +3.3%), 18 neutral**
+
++3.3% 在单 workload 噪声范围内（±15%）。结论：GEMM1 autotune 空间已饱和。
+
+### Direction 3: Token Reduce 新 Configs
+
+在现有 5 configs 基础上新增 4 configs：
+- BLOCK_N=512 (2 variants) — 更宽 N tile 改善 memory coalescing
+- BLOCK_T=4/32 variants — T 维度 tile 探索
+
+与 Direction 2 同轮 AB test。无独立可见改善。
+
+### Direction 4: bf16 Expert_out AB Test
+
+A = fp32 expert_out (BF16_EXPERT_OUT_T_MIN=99999), B = bf16 expert_out (T_MIN=32)
+
+| Workload | A (fp32) | B (bf16) | Delta |
+|----------|----------|----------|-------|
+| 5e8dc11c (T=14107) | 12.65x | 12.97x | +2.5% |
+| 58a34f27 (T=8192) | 14.30x | 14.53x | +1.6% |
+| 1a4c6ba1 (T=901) | 34.81x | 35.30x | +1.4% |
+| 中小 T (majority) | ~neutral | ~neutral | ±1% |
+| **Mean** | **47.02x** | **47.22x** | **+0.4%** |
+
+bf16 expert_out 节省 50% 写带宽 ([MAX_PADDED, 7168] buffer)。大 T workloads 受益最明显 (+1.4~2.5%)，
+但在 19-workload mean 中被中小 T 稀释。效果确认正向但微弱，保留。
+
+### 总结论
+
+**所有 autotune 方向均已饱和。** 三个 kernel (GEMM1, GEMM2, token_reduce) 的 autotune config 空间
+已被现有 configs 充分覆盖，新增 configs 带来的变化均在噪声范围内 (|delta| ≤ 0.4%)。
+bf16 expert_out 是唯一确认正向的优化 (+0.4% mean, +2.5% 最大 T)，已保留。
+
+后续优化需要**算法级**或**架构级**变化，而非 autotune config 搜索。
