@@ -75,6 +75,10 @@ NUM_SMS = 148  # B200 SM count
 USE_PERSISTENT_GEMM2 = False  # AB test: -1.0% mean, 7 regressions. Disabled.
 PERSISTENT_GEMM2_T_MIN = 256  # Only use persistent for T>=256 (enough tiles to fill 148 SMs)
 
+# Fused GEMM2+Reduce: atomic_add directly to output, eliminating expert_out buffer
+USE_FUSED_GEMM2_REDUCE = False  # AB test: -4.5~4.8% on large-T. atomic_add 6x bandwidth vs bf16 store.
+FUSED_GEMM2_REDUCE_T_MIN = 129  # Only for generic GEMM2 path (T > 128)
+
 GEMM2_T901_CONFIGS = [
     # Original config
     triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=2),
@@ -1968,6 +1972,131 @@ def _token_reduce_kernel(
     tl.store(o_ptrs, acc.to(tl.bfloat16), mask=(t_mask[:, None] & n_mask[None, :]), eviction_policy='evict_first')
 
 
+# ═══════════════════════════════════════════════════════════════
+# Fused GEMM2 + Reduce: atomic_add directly to output buffer
+# Eliminates expert_out read/write by scattering GEMM2 results
+# directly to the final output using sorted_token_ids mapping.
+# ═══════════════════════════════════════════════════════════════
+
+FUSED_GEMM2_REDUCE_CONFIGS = [
+    triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=3),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+    triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=4),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=4),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=4, num_stages=2),
+    triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=8, num_stages=3),
+    triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 32}, num_warps=8, num_stages=4),
+    triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=2, num_stages=2),
+]
+
+@triton.autotune(
+    configs=FUSED_GEMM2_REDUCE_CONFIGS,
+    key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
+    restore_value=['output_ptr'],
+)
+@triton.jit
+def _fused_moe_gemm2_reduce_kernel(
+    # Data pointers
+    A_ptr,                # [num_padded, K] fp32/fp16 (intermediate SwiGLU output)
+    B_ptr,                # [E, N, K] fp8 (W2 weights trans)
+    B_scale_ptr,          # [E, N//128, K//128] fp32 (W2 block scales)
+    output_ptr,           # [T, N] fp32 (accumulation buffer, zeroed before call)
+    token_weights_ptr,    # [num_padded] fp32 (routing weights for each slot)
+    sorted_token_ids_ptr, # [num_padded] int64 (original token indices; padding = T)
+    block_offsets_ptr,    # [E_LOCAL + 1] int32
+    total_blocks_ptr,     # [1] int32
+
+    # Dimensions
+    MAX_PID_M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    T_val,                # scalar: number of real tokens (padding has id >= T_val)
+
+    # Strides
+    stride_am, stride_ak,
+    stride_be, stride_bn, stride_bk,
+    stride_ot, stride_on,
+    stride_bse, stride_bsn, stride_bsk,
+    E_LOCAL: tl.constexpr,
+
+    # Block sizes
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+    USE_FP16_INTER: tl.constexpr = False,
+):
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+
+    total_blocks = tl.load(total_blocks_ptr)
+    if total_blocks <= 0:
+        return
+    if pid >= total_blocks * num_pid_n:
+        return
+    num_pid_m = total_blocks
+
+    # Grouped Swizzle
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    e_idx = tl.arange(0, E_LOCAL)
+    b_start = tl.load(block_offsets_ptr + e_idx)
+    b_end = tl.load(block_offsets_ptr + e_idx + 1)
+    valid = (b_start <= pid_m) & (pid_m < b_end)
+    expert_id = tl.argmax(valid.to(tl.int32), axis=0)
+
+    # Offsets
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    # Load routing weights
+    token_weights = tl.load(token_weights_ptr + rm)
+
+    # Accumulator
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Loop invariant bases
+    a_base = A_ptr + rm[:, None] * stride_am
+    b_base = B_ptr + expert_id * stride_be + rn[None, :] * stride_bn
+    b_scale_base = B_scale_ptr + expert_id * stride_bse + (rn[None, :] // 128) * stride_bsn
+
+    for k in range(0, K, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+
+        # Load A: fp32/fp16 from Intermediate buffer
+        a = tl.load(a_base + rk[None, :] * stride_ak, eviction_policy='evict_first')
+
+        # Load B: fp8
+        b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
+
+        # Post-dot B-scale
+        b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
+        partial = tl.dot(a, b.to(a.dtype), out_dtype=tl.float32)
+        acc += partial * b_scale
+
+    # ── Fused epilogue: atomic_add directly to output ──
+    if USE_FP16_INTER:
+        out = acc * token_weights[:, None] * 8.0
+    else:
+        out = acc * token_weights[:, None]
+
+    # Look up original token IDs
+    original_ids = tl.load(sorted_token_ids_ptr + rm)
+    valid_mask = original_ids < T_val
+    safe_ids = tl.where(valid_mask, original_ids, 0)
+
+    # Scatter-add to output[original_token_id, :]
+    o_ptrs = output_ptr + safe_ids[:, None] * stride_ot + rn[None, :] * stride_on
+    tl.atomic_add(o_ptrs, out, mask=valid_mask[:, None], sem='relaxed')
+
+
 @triton.autotune(
     configs=[
         triton.Config({'BLOCK_N': 64, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=3),
@@ -2090,6 +2219,7 @@ def _t1_fused_gemm1_swiglu_kernel(
 # ═══════════════════════════════════════════════════════════════
 
 _buf_cache = {}
+_output_accum_cache = {}
 _routing_cache = {}
 _routing_hist_cache = {}
 _sort_cache = {}
@@ -2491,8 +2621,8 @@ def kernel(
             USE_FP16_INTER=use_fp16_inter,
         )
 
-    # -- 5. GEMM2 (non-atomic, writes to expert_out) --
-    # cuBLAS path disabled for final submission (organizers value own implementation)
+    # -- 5. GEMM2 + Reduce --
+    # Determine if we can use fused GEMM2+Reduce (atomic_add, eliminates expert_out)
     _use_cublas_gemm2 = (
         CUBLAS_ENABLED
         and _HAS_CUBLAS_MODULE
@@ -2501,6 +2631,51 @@ def kernel(
         and _ck_mod.ensure_compiled()
     )
 
+    use_fused_reduce = (
+        USE_FUSED_GEMM2_REDUCE
+        and T >= FUSED_GEMM2_REDUCE_T_MIN
+        and not _use_cublas_gemm2
+        and not use_small_medium_gemm
+        and not use_upper_medium_gemm
+    )
+
+    if use_fused_reduce:
+        use_gemm2_t901 = _use_gemm2_t901_override(T, block_m, use_exact_dispatch)
+        if use_gemm2_t901:
+            use_fused_reduce = False
+
+    if use_fused_reduce:
+        # Fused GEMM2+Reduce: atomic_add directly to fp32 accumulation buffer
+        if T not in _output_accum_cache:
+            _output_accum_cache[T] = torch.empty((T, 7168), dtype=torch.float32, device=device)
+        output_accum = _output_accum_cache[T]
+        output_accum.zero_()
+
+        grid2 = lambda META: (exact_pid_m * triton.cdiv(7168, META['BLOCK_N']),)
+        _fused_moe_gemm2_reduce_kernel[grid2](
+            A_ptr=Intermediate,
+            B_ptr=gemm2_weights,
+            B_scale_ptr=gemm2_weights_scale,
+            output_ptr=output_accum,
+            token_weights_ptr=sorted_weights,
+            sorted_token_ids_ptr=sorted_token_ids,
+            block_offsets_ptr=block_offsets,
+            total_blocks_ptr=total_blocks,
+            MAX_PID_M=exact_pid_m, N=7168, K=2048,
+            T_val=T,
+            stride_am=Intermediate.stride(0), stride_ak=Intermediate.stride(1),
+            stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1), stride_bk=gemm2_weights.stride(2),
+            stride_ot=output_accum.stride(0), stride_on=output_accum.stride(1),
+            stride_bse=gemm2_weights_scale.stride(0), stride_bsn=gemm2_weights_scale.stride(1), stride_bsk=gemm2_weights_scale.stride(2),
+            E_LOCAL=E_LOCAL,
+            BLOCK_M=block_m,
+            USE_FP16_INTER=use_fp16_inter,
+        )
+        # Convert fp32 accumulation → bf16 output
+        output.copy_(output_accum.to(torch.bfloat16))
+        return output
+
+    # -- 5b. Non-fused GEMM2 path (writes to expert_out) --
     if _use_cublas_gemm2:
         # Per-expert cuBLAS GEMM2: read block_offsets (already synced via exact_pid_m)
         offsets = block_offsets.cpu().tolist()
@@ -2511,14 +2686,9 @@ def kernel(
                 continue
             start_row = start_blk * block_m
             end_row = end_blk * block_m
-            # A slice: [num_rows, 2048] from Intermediate
             A_slice = Intermediate[start_row:end_row]
-            # token_weights slice
             tw_slice = sorted_weights[start_row:end_row]
-            # Output slice
             C_slice = expert_out[start_row:end_row]
-            # B: gemm2_weights[e] is [N=7168, K=2048] — native layout, no transpose
-            # B_scale: gemm2_weights_scale[e] is [N//128, K//128] = [56, 16]
             _ck_mod.cublas_gemm2_expert(
                 A_slice,
                 gemm2_weights[e],
@@ -2529,7 +2699,6 @@ def kernel(
             )
     else:
         use_gemm2_t901 = _use_gemm2_t901_override(T, block_m, use_exact_dispatch)
-        # Persistent GEMM2: use for generic (large-T) path where enough tiles exist
         use_persistent = (
             USE_PERSISTENT_GEMM2
             and T >= PERSISTENT_GEMM2_T_MIN
@@ -2573,7 +2742,7 @@ def kernel(
             gemm2_kwargs['NUM_SMS'] = NUM_SMS
         gemm2_kernel[grid2](**gemm2_kwargs)
 
-    # -- 6. Token-Centric Reduce (zero-free, atomic-free, bf16 fused) --
+    # -- 6. Token-Centric Reduce (only for non-fused path) --
     grid3 = lambda META: (triton.cdiv(T, META['BLOCK_T']) * triton.cdiv(7168, META['BLOCK_N']),)
 
     _token_reduce_kernel[grid3](

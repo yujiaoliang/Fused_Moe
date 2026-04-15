@@ -399,8 +399,9 @@ mlsys_note/
 
 | **`tl.make_tensor_descriptor` (R13)** | **-4%** | TMA descriptor setup cost 无法在 16 次 K-loop (K=2048) 中摊销。需 `triton.set_allocator()`。Runtime base+strides 可编译运行 |
 | **`tl.make_block_ptr` (R13)** | **0.998x (中性)** | 和 ptr_arith 生成相同 load 指令。deprecated API |
+| **Fused GEMM2+Reduce `tl.atomic_add` (R14)** | **❌ -4.5~4.8% large-T** | GEMM2 epilogue 直接 `tl.atomic_add` fp32 到 output 消除 expert_out buffer。AB test: T=8192 -4.8%, T=14107 -4.5%, 其他 17/19 不受影响 (T≤128 走旧路径)。**根因：fp32 atomic_add RMW 12 bytes/elem vs bf16 store 2 bytes/elem = 6× bandwidth**。MAX_PADDED=114K 行 × 7168 cols → atomic 带宽 ~9.6GB vs 原 GEMM2 store + token_reduce read = ~3.2GB。还需 `output_accum.zero_()` + fp32→bf16 conversion。仅当 output ≤ L2 (T≤~2000) 时可能有效，但无该范围测试工况 |
 
-**结论：所有 autotune/架构/load 策略方向已饱和。Pointer arithmetic 是最优 load 策略。后续提升需要算法级变化。**
+**结论：所有 autotune/架构/load 策略/GEMM2-reduce 融合方向已饱和。Pointer arithmetic 是最优 load 策略。两步 GEMM2→expert_out→token_reduce 是最优数据流。后续提升需要算法级变化。**
 
 ---
 
