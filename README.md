@@ -349,8 +349,12 @@ mlsys_note/
 | GEMM2 bf16×bf16 Dot | 3/19 | bf16 截断在 16 次 K-iter 中累积 |
 | GEMM2 FP8 Per-128-Block-Scale | 0/19, abs=10K+ | fp8 物理精度极限，3 种变体全部失败 |
 | MXFP8 `tl.dot_scaled` | matched_ratio 0.17-0.32 | e8m0 共享指数比 fp32 scale 更粗糙 |
+| GEMM2 FP8 On-the-fly Dot (direct cast) | 5/19, abs=500K-1M | fp16→fp8 直接截断，>448 值溢出 + register pressure (ptxas 255-reg failure on 2 WL) |
+| GEMM2 FP8 On-the-fly Dot (per-row scaled) | 5/19, abs=14K-25K | absmax/448 动态缩放避免溢出，但 fp8 3-mantissa-bit + K=2048 累积 → 误差级联放大。远超 contest atol=1.0 |
 
-**结论：Intermediate 精度阶梯 fp16 > bf16 > fp8，仅 fp16+scaling 可行。expert_out 精度阶梯 bf16 > fp16 > fp8，仅 bf16 可行（contest tol 内）。**
+**注意：** eval Triton 无 `tl.float8e4m3fn`，须用 `b.dtype`（从 fp8 weight 推断类型）进行 cast。
+
+**结论：Intermediate 精度阶梯 fp16 > bf16 > fp8，仅 fp16+scaling 可行。expert_out 精度阶梯 bf16 > fp16 > fp8，仅 bf16 可行（contest tol 内）。GEMM2 A-side MUST stay ≥fp16。**
 
 ### 架构级失败
 
@@ -373,6 +377,17 @@ mlsys_note/
 | Tiny GEMM1-only Dispatch | 42.55x mean | 算力利用率下降 |
 | Direct GEMM2+Reduce | 46-51x | 破坏 GEMM2 tile reuse |
 | Bucket/Autotune Follow-up Sweeps | 全回退 | 边际极限 |
+
+### Autotune 饱和测试 (2026-04-15)
+
+| 尝试 | 结果 | 原因 |
+|------|------|------|
+| GEMM2 +7 configs (BLOCK_K=64, stages=1, GROUP_M=128) | -0.2% mean | 45 个现有 configs 已穷尽空间 |
+| GEMM1 small/medium +10 configs (BLOCK_N=256, deeper pipeline) | +0.4% mean | 噪声范围，GEMM1 小 T 本身 memory-bound |
+| token_reduce +4 configs (BLOCK_N=512) | neutral | 5 个现有 configs 已覆盖 |
+| **bf16 expert_out AB test** (fp32 vs bf16) | **+0.4% mean, +2.5% T=14107** | **正向确认，保留** |
+
+**结论：所有 autotune 方向已饱和。后续提升需要算法级/架构级变化。**
 
 ---
 

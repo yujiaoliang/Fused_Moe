@@ -68,7 +68,7 @@ CUBLAS_ENABLED = False  # Disable cuBLAS in final submission (organizers value o
 
 # bf16 expert_out: saves 50% bandwidth on largest buffer [MAX_PADDED, 7168]
 # bf16 range = 3.4e38 (same as fp32) — no overflow risk unlike fp16
-BF16_EXPERT_OUT_T_MIN = 128  # bf16 expert_out for medium/large-T workloads
+BF16_EXPERT_OUT_T_MIN = 32  # bf16 expert_out for all T>=32 workloads
 
 GEMM2_T901_CONFIGS = [
     # Original config
