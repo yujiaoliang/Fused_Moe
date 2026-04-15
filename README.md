@@ -1,9 +1,9 @@
 # Fused MoE Kernel — Track A (MLSys 2026 FlashInfer Contest)
 
-> **赛道:** Track A — Fused MoE  
-> **硬件:** NVIDIA B200 (Blackwell, sm100)  
-> **状态:** ✅ 19/19 PASSED  
-> **当前可复现口径 (Modal B200):** peak ~66x, mean ~47x  
+> **赛道:** Track A — Fused MoE
+> **硬件:** NVIDIA B200 (Blackwell, sm100)
+> **状态:** ✅ 19/19 PASSED
+> **当前可复现口径 (Modal B200):** peak ~56x, mean ~41x (2026-04-15 基准)
 > **历史最佳 (Round 15, Modal 好运时段):** peak 106.65x, mean 55.77x
 
 > ⚠️ **关于绝对 speedup 数值**：Modal B200 共享实例无锁频，同一代码不同时段的 speedup 可波动 20-30%。
@@ -52,9 +52,10 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 4. **GEMM2 (Non-Atomic Triton)**  
    按 batch 大小 dispatch 到 `_small_medium_*` / `_medium_*` / `_fused_moe_gemm2_*` / `_fused_moe_gemm2_t901_*` kernel  
    - Post-dot B-scale：`tl.dot(a, b.to(a.dtype))` + `acc += partial * b_scale`（自动适配 fp16/fp32）  
-   - **×8.0 Compensation (T≥32):** 当 Intermediate 是 fp16 时，epilogue 乘以 `8.0` 补偿 GEMM1 的 `×0.125` 缩放  
-   - T=901 专用 kernel：独立 autotune config (`BLOCK_N=128, BLOCK_K=128, GROUP_M=8`)，针对 GEMM2 瓶颈场景优化  
-   - 非原子写入 `expert_out [num_padded, 7168]`
+   - **×8.0 Compensation (T≥32):** 当 Intermediate 是 fp16 时，epilogue 乘以 `8.0` 补偿 GEMM1 的 `×0.125` 缩放
+   - T=901 专用 kernel：独立 autotune config (`BLOCK_N=128, BLOCK_K=128, GROUP_M=8`)，针对 GEMM2 瓶颈场景优化
+   - **bf16 expert_out (T≥128):** epilogue `out.to(tl.bfloat16)` 存入 bf16 buffer，节省 50% 写带宽
+   - 非原子写入 `expert_out [num_padded, 7168]`（bf16 for T≥128, fp32 for T<128）
 
 5. **Token-Centric Reduce** — `_token_reduce_kernel`  
    每个 output token 启动一个程序，通过 `scatter_map` 读取 TOP_K=8 个 expert 贡献  
@@ -302,6 +303,21 @@ mlsys_note/
 | `c35907d` | **T=1 GEMM1/2 Autotune** | ✅✅ | 补充微型 kernel 设置 (warps=2)，单 token 指令开销降低，latency -3% |
 | (pending) | **FP16 Intermediate Buffer** | ✅✅ | AB-test mean +4.5%，13/19 improved，1 regressed。`USE_FP16_INTER` constexpr + `×0.125/×8.0` scale-and-cast，T≥32 fp16，T<32 fp32 fallback |
 
+### Phase 5: 竞赛规则感知优化 — Round 10 (2026-04-15)
+
+**关键赛制更新（Apr 14-15 organizer 澄清）：**
+- **容差 100x 放宽**：官方 `atol=1.0, rtol=0.3, ratio=0.9`，我们之前测试用 `atol=0.01, rtol=0.01, ratio=0.95`
+- **CUPTI GPU-only 计时**：评分 = GPU kernel 执行时间之和。CPU Python 开销、kernel launch latency、`.item()` sync 全部不计入
+- **Self-contained 要求**：cuBLAS/CUTLASS/flashinfer 运行时调用不推荐。组委会 "value seeing the team's own implementation"
+- **sm_100a 已确认**：裸金属 B200 + CUDA 13.2 原生支持 sm_100a，需在 build flags 中显式指定 `-arch=sm_100a`
+- **Manual review 仅查合规**：不会有比 `atol=1.0` 更严格的数值标准
+
+| Commit | 优化内容 | 结果 | 说明 |
+|--------|---------|------|------|
+| `c1effcc` | **bf16 expert_out (T≥128)** | ✅ 19/19 PASSED | `expert_out [MAX_PADDED, 7168]` 从 fp32→bf16，节省 50% 写带宽。bf16 range=3.4e38 不溢出。AB-test mean +0.2%（噪声内），large-T 趋势 +1.4~2.0% |
+| `c1effcc` | **CUBLAS_ENABLED=False** | ✅ 策略调整 | 禁用 cuBLAS GEMM2 dispatch。组委会倾向团队自研实现，cuBLAS 仅影响 1/19 workload (T≥2048)，边际收益不值得 review 风险 |
+| (tested) | **bf16 Intermediate** | ❌ 10/19 PASSED | 即使在 contest 容差下仍 9/19 INCORRECT_NUMERICAL。bf16 7-bit mantissa 太粗糙 vs fp16 10-bit。fp16 + `×0.125/×8.0` scaling hack 是正确方案 |
+
 **结论：当前主线中所有生效改动都是 ✅ 或 ✅✅ 确定真实的。**
 
 ### 已回退实验
@@ -310,7 +326,9 @@ mlsys_note/
 |------|------|------|
 | Direction 4 微调 (T≤16→medium GEMM2 等) | ❌ | full19 mean 退化 -11% |
 | `52≤T≤62 → medium GEMM2` | ❌ | full19 退到 42.47x |
-| bf16 intermediate | ❌ | 9/19 精度失败 |
+| bf16 intermediate (strict tol) | ❌ | 6/19 精度失败 (abs_err ~4096) |
+| bf16 intermediate (contest tol, R10 复测) | ❌ | 10/19 PASSED，仍 9/19 INCORRECT_NUMERICAL。bf16 7-bit mantissa 精度不足 |
+| fp16 expert_out (R9) | ❌ | GEMM2 输出值超 fp16 max (65504) → inf，3/19 overflow + 2/19 register 溢出 |
 | Tiny GEMM1-only dispatch | ❌ | full19 退到 42.55x |
 
 ---
@@ -321,15 +339,18 @@ mlsys_note/
 
 | 尝试 | 结果 | 原因 |
 |------|------|------|
-| bf16 Intermediate | 6/19 PASSED | SwiGLU fp32→bf16 截断，abs_err ~4096 |
+| bf16 Intermediate (strict tol) | 6/19 PASSED | SwiGLU fp32→bf16 截断，abs_err ~4096 |
+| bf16 Intermediate (contest tol, R10) | 10/19 PASSED | 即使 atol=1.0，bf16 7-bit mantissa 仍太粗糙。**彻底封棺** |
 | **fp16 Intermediate (全局)** | **❌ T=7 matched_ratio=0.0** | SwiGLU 极端值超 fp16 max (65504)，小 T 数据密集度高更易溢出 |
 | **fp16 Intermediate (T≥32 only)** | **✅ 19/19 PASSED, +4.5%** | fp16 10-bit mantissa 精度可接受，`×0.125` 缩放 + `×8.0` 补偿，T<32 走 fp32 fallback |
+| **bf16 expert_out (T≥128, R10)** | **✅ 19/19 PASSED** | bf16 range=3.4e38 不溢出（fp16 失败因超 65504）。abs_err ~2K-600K 但在 contest tol 内。节省 50% expert_out 带宽 |
+| fp16 expert_out (R9) | ❌ 3/19 overflow | GEMM2 输出值超 fp16 max → inf，另 2/19 register 溢出 ptxas 255 |
 | GEMM2 FP8 Online Quantize | 0/19 | fp8 (3-bit mantissa) 量化误差级联放大 |
 | GEMM2 bf16×bf16 Dot | 3/19 | bf16 截断在 16 次 K-iter 中累积 |
 | GEMM2 FP8 Per-128-Block-Scale | 0/19, abs=10K+ | fp8 物理精度极限，3 种变体全部失败 |
 | MXFP8 `tl.dot_scaled` | matched_ratio 0.17-0.32 | e8m0 共享指数比 fp32 scale 更粗糙 |
 
-**结论：GEMM2 A-side (fp16/fp32) 可工作但须对小 T 做 fallback，FP8 在严格容差下彻底封棺。**
+**结论：Intermediate 精度阶梯 fp16 > bf16 > fp8，仅 fp16+scaling 可行。expert_out 精度阶梯 bf16 > fp16 > fp8，仅 bf16 可行（contest tol 内）。**
 
 ### 架构级失败
 
@@ -340,6 +361,9 @@ mlsys_note/
 | 1D Atomic Scatter | 8.3x→5.37x | 标量原子风暴打瘫内存控制器 |
 | Token Reduce 融合进 GEMM2 | TIMEOUT | Triton 2D tile 无法逐行 scatter |
 | CUDA 自定义 C++ 扩展 | Modal 失败 | 评测沙盒无 nvcc |
+| CUDA Graph for GEMMs | 无收益 | CUPTI 仅计 GPU kernel 时间，launch overhead 不计入评分 |
+| torch.compile on routing | 无收益 | 同上，CPU overhead 不在评分范围 |
+| cuBLAS GEMM2 dispatch (R8) | ✅ 可工作但禁用 | 组委会倾向自研实现。仅影响 1/19 (T≥2048)，边际收益不值得 review 风险 |
 
 ### Microbatch 调度失败 (Direction 4)
 
@@ -357,8 +381,10 @@ mlsys_note/
 | 约束 | 说明 |
 |------|------|
 | Destination-passing style | `kernel(*inputs, *outputs)`，output 是最后一个参数 |
-| 正确性标准 | 95% 元素满足 `abs_err ≤ 0.01` OR `rel_err ≤ 0.01` |
-| 官方评测容差 | `atol=1, rtol=0.3, matched_ratio=0.9` |
+| 正确性标准（我们的严格测试） | 95% 元素满足 `abs_err ≤ 0.01` OR `rel_err ≤ 0.01` |
+| **官方评测容差（实际评分）** | **`atol=1.0, rtol=0.3, matched_ratio=0.9`**（宽 ~100x） |
+| 评分方式 | **CUPTI GPU kernel 时间之和**，CPU 开销不计入 |
+| cuBLAS/CUTLASS 政策 | 不硬禁，但组委会倾向团队自研实现，manual review 会关注 |
 | Scalar tensor | `local_expert_offset` 和 `routed_scaling_factor` 是 tensor 非 Python scalar |
 | 显存 | 32 experts 权重 ~1.8GB FP8；B200 ~180GB 显存，不是瓶颈 |
 
@@ -367,7 +393,7 @@ mlsys_note/
 ## 注意事项
 
 1. **Modal 环境 vs 本地环境：**
-   - Modal: PyTorch 2.10.0+cu128, flashinfer-bench 0.1.2, Python 3.12
+   - Modal: PyTorch 2.11.0+cu130, flashinfer-bench, Python 3.12
    - 本地 (Windows): 无法安装 triton，仅用于打包和代码审查
    - 本地 GPU 显存 < 24GB 跑不了大 workloads（reference 也会 OOM）
 
