@@ -54,8 +54,8 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
    - Post-dot B-scale：`tl.dot(a, b.to(a.dtype))` + `acc += partial * b_scale`（自动适配 fp16/fp32）  
    - **×8.0 Compensation (T≥32):** 当 Intermediate 是 fp16 时，epilogue 乘以 `8.0` 补偿 GEMM1 的 `×0.125` 缩放
    - T=901 专用 kernel：独立 autotune config (`BLOCK_N=128, BLOCK_K=128, GROUP_M=8`)，针对 GEMM2 瓶颈场景优化
-   - **bf16 expert_out (T≥128):** epilogue `out.to(tl.bfloat16)` 存入 bf16 buffer，节省 50% 写带宽
-   - 非原子写入 `expert_out [num_padded, 7168]`（bf16 for T≥128, fp32 for T<128）
+   - **bf16 expert_out (T≥32):** epilogue `out.to(tl.bfloat16)` 存入 bf16 buffer，节省 50% 写带宽
+   - 非原子写入 `expert_out [num_padded, 7168]`（bf16 for T≥32, fp32 for T<32）
 
 5. **Token-Centric Reduce** — `_token_reduce_kernel`  
    每个 output token 启动一个程序，通过 `scatter_map` 读取 TOP_K=8 个 expert 贡献  
@@ -168,7 +168,9 @@ git push origin submission-vX
 ```
 mlsys_note/
 ├── solution/
-│   ├── triton/kernel.py         # ← 主力 Triton kernel
+│   ├── triton/
+│   │   ├── kernel.py            # ← 主力 Triton kernel
+│   │   └── cutlass_kernels.py   # cuBLAS GEMM2 JIT 扩展 (已禁用，保留备用)
 │   └── cuda/
 │       ├── binding.py           # CUDA baseline (PyTorch/cuBLAS, 19/19 PASSED)
 │       └── kernel.cu            # CUDA kernel 模板 (已废弃, Modal 无 nvcc)
@@ -180,9 +182,11 @@ mlsys_note/
 │   ├── debug_modal.py           # 逐步对比 kernel vs reference
 │   ├── yjl_ncu.py               # NCU profiling + autotune 日志（支持 T901 kernel 分类）
 │   ├── pack_solution_simple.py  # 打包 solution.json
-│   └── ncu_profile_modal.py     # per-kernel 时间分解
+│   ├── ncu_profile_modal.py     # per-kernel 时间分解
+│   └── test_cutlass_modal.py    # cuBLAS JIT 编译测试
 ├── config.toml                  # 配置（队名、赛道）
 ├── profiling_notes.md           # Profiling 分析 & 优化记录
+├── CHANGELOG-cublas-gemm2.md    # cuBLAS GEMM2 dispatch 实验日志
 ├── log.md                       # 详细实验日志
 ├── solution.json                # 打包后的提交文件
 └── mlsys26-contest/             # 比赛数据集
@@ -297,11 +301,11 @@ mlsys_note/
 | `f49c5ab` | 2D Tiled Token Reduce | ✅ | 结构性优化，大型 Workload (T>8000) 净提速 +2.5%~2.9% |
 | `9d5a2f8` | Medium-T Column-Major | ✅ | `GROUP_M=32/64` 列排布与并行扫描，Medium-T 最高提速 +8.9% |
 | `c19336d` | Fused Routing+Histogram | ✅ | Token-major sort/layout/scatter，large-T routing/sort 开销 -1.5% |
-| (pending) | **GEMM2 autotune 扩展** | ✅ | AB-test mean +2.1%，8/19 improved，0 regressed |
+| `93e3a84` | **GEMM2 autotune 扩展** | ✅ | AB-test mean +2.1%，8/19 improved，0 regressed |
 | `67ef373` | **T=901 GEMM2 专用 Kernel** | ✅ | 独立 `_fused_moe_gemm2_t901_kernel` + 专属 autotune，打击 GEMM2 58% 瓶颈，单 kernel 提速 ~3% |
 | `1010fb4` | **小中T GEMM1 Autotune** | ✅✅ | 增补 13 个 candidates 覆盖深流水线，T=32~80 GEMM1 时长稳定减少 1.6%~6.6% |
 | `c35907d` | **T=1 GEMM1/2 Autotune** | ✅✅ | 补充微型 kernel 设置 (warps=2)，单 token 指令开销降低，latency -3% |
-| (pending) | **FP16 Intermediate Buffer** | ✅✅ | AB-test mean +4.5%，13/19 improved，1 regressed。`USE_FP16_INTER` constexpr + `×0.125/×8.0` scale-and-cast，T≥32 fp16，T<32 fp32 fallback |
+| `a5256cc` | **FP16 Intermediate Buffer** | ✅✅ | AB-test mean +4.5%，13/19 improved，1 regressed。`USE_FP16_INTER` constexpr + `×0.125/×8.0` scale-and-cast，T≥32 fp16，T<32 fp32 fallback |
 
 ### Phase 5: 竞赛规则感知优化 — Round 10 (2026-04-15)
 
@@ -314,7 +318,7 @@ mlsys_note/
 
 | Commit | 优化内容 | 结果 | 说明 |
 |--------|---------|------|------|
-| `c1effcc` | **bf16 expert_out (T≥128)** | ✅ 19/19 PASSED | `expert_out [MAX_PADDED, 7168]` 从 fp32→bf16，节省 50% 写带宽。bf16 range=3.4e38 不溢出。AB-test mean +0.2%（噪声内），large-T 趋势 +1.4~2.0% |
+| `c1effcc` | **bf16 expert_out (T≥32)** | ✅ 19/19 PASSED | `expert_out [MAX_PADDED, 7168]` 从 fp32→bf16，节省 50% 写带宽。bf16 range=3.4e38 不溢出。AB-test mean +0.4%，large-T +2.5% (T=14107) |
 | `c1effcc` | **CUBLAS_ENABLED=False** | ✅ 策略调整 | 禁用 cuBLAS GEMM2 dispatch。组委会倾向团队自研实现，cuBLAS 仅影响 1/19 workload (T≥2048)，边际收益不值得 review 风险 |
 | (tested) | **bf16 Intermediate** | ❌ 10/19 PASSED | 即使在 contest 容差下仍 9/19 INCORRECT_NUMERICAL。bf16 7-bit mantissa 太粗糙 vs fp16 10-bit。fp16 + `×0.125/×8.0` scaling hack 是正确方案 |
 
