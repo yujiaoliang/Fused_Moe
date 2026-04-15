@@ -375,7 +375,7 @@ mlsys_note/
 | cuBLAS GEMM2 dispatch (R8) | ✅ 可工作但禁用 | 组委会倾向自研实现。仅影响 1/19 (T≥2048)，边际收益不值得 review 风险 |
 | Warp Specialization (`tl.range(warp_specialize=True)`) | ❌ 编译崩溃 | Triton 3.7.0 TTGIR lowering `PassManager::run failed`。复杂 MoE kernel (masked loads, expert lookup, SwiGLU, multi-dot) 触发编译器 bug。简单 fp16 GEMM 可编译但 **-34%** (无 TMA block pointer 无法受益)。`tl.range()` 无 WS = `range()` 性能持平 (+0.8% noise)。需 `tl.make_block_ptr` + TMA 重写才可能受益，ROI 极低 |
 | **Persistent Grouped GEMM2 (R13)** | ❌ -1.0% mean | 148 CTAs 跨 expert block-contiguous tile loop + `tl.range(start,end,num_stages=1)` 外层循环。AB test: 7/19 regressed, 1/19 improved。large-T -2.7%, medium-T -3.4%~-5.3%。K=2048 仅 16 次内层 K-loop，persistent 受益于 large-K 场景的 weight tile reuse，我们的 GEMM2 K 太短。PyTorch blog 1.5x 增益针对 K>>2048 |
-| **TMA Device Descriptors (R13)** | ❌ API 不可用 | Triton 3.7.0 无 `experimental_device_tensormap_create2d`。`tl.make_block_ptr` 已 DEPRECATED，推荐 `tl.make_tensor_descriptor`。Mixed ptr GEMM (A=ptr_arith, B=block_ptr+advance) 可编译运行（max_diff=5.3e-5），但无 TMA 硬件加速。eval Docker PyTorch=2.12.0.dev20260408+cu132 |
+| **TMA / Block Pointer / Tensor Descriptor (R13)** | ❌ 全部无收益 | 三种 B-side load 策略在 GEMM2-like shape (4096×7168×2048) 上 AB benchmark：**ptr_arith=0.169ms, block_ptr=0.169ms (0.998x), tensor_desc=0.176ms (0.959x, -4%)**。`experimental_device_tensormap_create2d` 不存在。`tl.make_block_ptr` DEPRECATED。`tl.make_tensor_descriptor` 需 `triton.set_allocator()`，运行时 base offset + 运行时 strides 均可编译运行，但 TMA descriptor setup cost 无法在 16 次 K-loop 中摊销。**Pointer arithmetic 是最优 load 策略** |
 
 ### Microbatch 调度失败 (Direction 4)
 
@@ -397,7 +397,10 @@ mlsys_note/
 
 | **Persistent GEMM2 (R13, cross-expert)** | **-1.0% mean** | 148 CTAs block-contiguous tile assignment, `tl.range(start,end,num_stages=1)` outer loop, GROUP_M=4/8/16/32/64 sweep。K=2048 太短，L2 weight reuse 不够补偿 persistent loop overhead |
 
-**结论：所有 autotune 方向已饱和，persistent kernel 无效。后续提升需要算法级/架构级变化。**
+| **`tl.make_tensor_descriptor` (R13)** | **-4%** | TMA descriptor setup cost 无法在 16 次 K-loop (K=2048) 中摊销。需 `triton.set_allocator()`。Runtime base+strides 可编译运行 |
+| **`tl.make_block_ptr` (R13)** | **0.998x (中性)** | 和 ptr_arith 生成相同 load 指令。deprecated API |
+
+**结论：所有 autotune/架构/load 策略方向已饱和。Pointer arithmetic 是最优 load 策略。后续提升需要算法级变化。**
 
 ---
 
