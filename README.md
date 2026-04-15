@@ -344,7 +344,8 @@ mlsys_note/
 | 尝试 | 结果 | 原因 |
 |------|------|------|
 | bf16 Intermediate (strict tol) | 6/19 PASSED | SwiGLU fp32→bf16 截断，abs_err ~4096 |
-| bf16 Intermediate (contest tol, R10) | 10/19 PASSED | 即使 atol=1.0，bf16 7-bit mantissa 仍太粗糙。**彻底封棺** |
+| bf16 Intermediate (contest tol, R10) | 10/19 PASSED | 即使 atol=1.0，bf16 7-bit mantissa 仍太粗糙 |
+| bf16 Intermediate (contest tol, R13 re-test) | 8/19 PASSED | 更差：bf16 增加 register pressure → 2/19 ptxas 255-reg 失败 (large-T) + 9/19 precision FAIL。**彻底封棺** |
 | **fp16 Intermediate (全局)** | **❌ T=7 matched_ratio=0.0** | SwiGLU 极端值超 fp16 max (65504)，小 T 数据密集度高更易溢出 |
 | **fp16 Intermediate (T≥32 only)** | **✅ 19/19 PASSED, +4.5%** | fp16 10-bit mantissa 精度可接受，`×0.125` 缩放 + `×8.0` 补偿，T<32 走 fp32 fallback |
 | **bf16 expert_out (T≥128, R10)** | **✅ 19/19 PASSED** | bf16 range=3.4e38 不溢出（fp16 失败因超 65504）。abs_err ~2K-600K 但在 contest tol 内。节省 50% expert_out 带宽 |
@@ -372,6 +373,9 @@ mlsys_note/
 | CUDA Graph for GEMMs | 无收益 | CUPTI 仅计 GPU kernel 时间，launch overhead 不计入评分 |
 | torch.compile on routing | 无收益 | 同上，CPU overhead 不在评分范围 |
 | cuBLAS GEMM2 dispatch (R8) | ✅ 可工作但禁用 | 组委会倾向自研实现。仅影响 1/19 (T≥2048)，边际收益不值得 review 风险 |
+| Warp Specialization (`tl.range(warp_specialize=True)`) | ❌ 编译崩溃 | Triton 3.7.0 TTGIR lowering `PassManager::run failed`。复杂 MoE kernel (masked loads, expert lookup, SwiGLU, multi-dot) 触发编译器 bug。简单 fp16 GEMM 可编译但 **-34%** (无 TMA block pointer 无法受益)。`tl.range()` 无 WS = `range()` 性能持平 (+0.8% noise)。需 `tl.make_block_ptr` + TMA 重写才可能受益，ROI 极低 |
+| **Persistent Grouped GEMM2 (R13)** | ❌ -1.0% mean | 148 CTAs 跨 expert block-contiguous tile loop + `tl.range(start,end,num_stages=1)` 外层循环。AB test: 7/19 regressed, 1/19 improved。large-T -2.7%, medium-T -3.4%~-5.3%。K=2048 仅 16 次内层 K-loop，persistent 受益于 large-K 场景的 weight tile reuse，我们的 GEMM2 K 太短。PyTorch blog 1.5x 增益针对 K>>2048 |
+| **TMA Device Descriptors (R13)** | ❌ API 不可用 | Triton 3.7.0 无 `experimental_device_tensormap_create2d`。`tl.make_block_ptr` 已 DEPRECATED，推荐 `tl.make_tensor_descriptor`。Mixed ptr GEMM (A=ptr_arith, B=block_ptr+advance) 可编译运行（max_diff=5.3e-5），但无 TMA 硬件加速。eval Docker PyTorch=2.12.0.dev20260408+cu132 |
 
 ### Microbatch 调度失败 (Direction 4)
 
@@ -391,7 +395,9 @@ mlsys_note/
 | token_reduce +4 configs (BLOCK_N=512) | neutral | 5 个现有 configs 已覆盖 |
 | **bf16 expert_out AB test** (fp32 vs bf16) | **+0.4% mean, +2.5% T=14107** | **正向确认，保留** |
 
-**结论：所有 autotune 方向已饱和。后续提升需要算法级/架构级变化。**
+| **Persistent GEMM2 (R13, cross-expert)** | **-1.0% mean** | 148 CTAs block-contiguous tile assignment, `tl.range(start,end,num_stages=1)` outer loop, GROUP_M=4/8/16/32/64 sweep。K=2048 太短，L2 weight reuse 不够补偿 persistent loop overhead |
+
+**结论：所有 autotune 方向已饱和，persistent kernel 无效。后续提升需要算法级/架构级变化。**
 
 ---
 
