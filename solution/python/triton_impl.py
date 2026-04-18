@@ -39,8 +39,8 @@ TOP_K = 8
 SORT_BLOCK_ITEMS = 256
 TOKEN_SCATTER_BLOCK_TOKENS = 8
 BLOCK_M = 128
-TARGET_TS = (11948,)
-TARGET_BLOCK_M = {11948: BLOCK_M}
+TARGET_TS = (14107,)
+TARGET_BLOCK_M = {14107: BLOCK_M}
 CUTE_GEMM1_RAW_DTYPE = torch.bfloat16
 T11948_CUTE_GEMM2_EXPERT_OUT_DTYPE = torch.bfloat16
 
@@ -295,7 +295,7 @@ def kernel(
         return output
     num_rows = exact_pid_m * block_m
 
-    buf_key = (T, block_m, T11948_CUTE_GEMM2_EXPERT_OUT_DTYPE)
+    buf_key = (T, block_m, CUTE_GEMM2_EXPERT_OUT_DTYPE)
     if buf_key in _buf_cache:
         intermediate, expert_out = _buf_cache[buf_key]
     else:

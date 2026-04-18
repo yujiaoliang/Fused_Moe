@@ -10,7 +10,6 @@ _B_FP16_CACHE = {}
 _METADATA_CACHE = {}
 
 TARGET_BLOCK_M = {
-    11948: 128,
     14107: 128,
 }
 H = 7168
