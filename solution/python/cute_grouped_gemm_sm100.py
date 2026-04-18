@@ -168,6 +168,8 @@ class GroupedGemmKernel:
             barrier_id=3,
             num_threads=32 * (len(self.epilog_warp_id) + 1),
         )
+        # The contest image's CUTLASS DSL SMEM-capacity helper recognizes sm_100.
+        # CuTe compile target selection is left to the runtime/device.
         self.smem_capacity = utils.get_smem_capacity_in_bytes("sm_100")
         self.num_tma_load_bytes = 0
 
