@@ -1,8 +1,8 @@
 """Pack solution source files into solution.json.
 
 Usage:
-  python scripts/pack_solution_simple.py          # Pack Triton solution (default)
-  python scripts/pack_solution_simple.py --cuda    # Pack CUDA baseline (binding.py)
+  python scripts/pack_solution_simple.py          # Pack configured solution
+  python scripts/pack_solution_simple.py --cuda   # Pack pure CUDA solution
 """
 
 import argparse
@@ -19,33 +19,42 @@ from flashinfer_bench.data import BuildSpec, Solution, SourceFile
 PROJECT_ROOT = Path(__file__).parent.parent
 
 
+def _gather_sources(language: str, source_dir_name: str) -> list[SourceFile]:
+    source_dir = PROJECT_ROOT / "solution" / source_dir_name
+    if not source_dir.exists():
+        raise FileNotFoundError(f"Source directory not found: {source_dir}")
+
+    sources: list[SourceFile] = []
+    if source_dir_name == "python":
+        patterns = ("*.py", "*.cu", "*.cpp")
+    else:
+        patterns = ("*.cu", "*.cpp", "*.py") if language == "cuda" else ("*.py",)
+    for pattern in patterns:
+        for p in sorted(source_dir.rglob(pattern)):
+            rel = p.relative_to(source_dir).as_posix()
+            sources.append(SourceFile(path=rel, content=p.read_text(encoding="utf-8")))
+
+    return sources
+
+
 def pack_solution(use_cuda: bool = False) -> Path:
     config_path = PROJECT_ROOT / "config.toml"
     with open(config_path, "rb") as f:
         config = tomli.load(f)
 
     if use_cuda:
-        # Pack CUDA baseline (binding.py) as a triton solution
-        # The benchmark framework only runs .py via triton builder,
-        # so we pretend it's triton and rename binding.py → kernel.py
-        lang = "triton"
-        entry_point = "kernel.py::kernel"
-        cuda_binding = PROJECT_ROOT / "solution" / "cuda" / "binding.py"
-        sources = [SourceFile(path="kernel.py", content=cuda_binding.read_text(encoding="utf-8"))]
-        print("[CUDA mode] Packing solution/cuda/binding.py as kernel.py")
+        lang = "cuda"
+        source_dir_name = "cuda"
+        entry_point = config["build"].get("cuda_entry_point", "binding.py::kernel")
+        binding = config["build"].get("cuda_binding", "torch")
+        sources = _gather_sources(lang, source_dir_name)
+        print("[CUDA mode] Packing solution/cuda")
     else:
         lang = config["build"]["language"]
+        source_dir_name = config["build"].get("source_dir", lang)
         entry_point = config["build"]["entry_point"]
-        src_dir = PROJECT_ROOT / "solution" / lang
-
-        sources = []
-        for p in sorted(src_dir.rglob("*.py" if lang == "triton" else "*.cu")):
-            rel = p.relative_to(src_dir).as_posix()
-            sources.append(SourceFile(path=rel, content=p.read_text(encoding="utf-8")))
-        if lang == "cuda":
-            for p in sorted(src_dir.rglob("*.py")):
-                rel = p.relative_to(src_dir).as_posix()
-                sources.append(SourceFile(path=rel, content=p.read_text(encoding="utf-8")))
+        binding = None
+        sources = _gather_sources(lang, source_dir_name)
 
     solution = Solution(
         name=config["solution"]["name"],
@@ -59,13 +68,21 @@ def pack_solution(use_cuda: bool = False) -> Path:
         sources=sources,
     )
 
+    payload = json.loads(solution.model_dump_json(indent=2))
+    if binding:
+        payload["spec"]["binding"] = binding
+
     out_path = PROJECT_ROOT / "solution.json"
-    out_path.write_text(solution.model_dump_json(indent=2), encoding="utf-8")
+    out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     print(f"Solution packed: {out_path}")
     print(f"  Name: {solution.name}")
     print(f"  Definition: {solution.definition}")
     print(f"  Author: {solution.author}")
     print(f"  Language: {lang}")
+    if binding:
+        print(f"  Binding: {binding}")
+    if not use_cuda:
+        print(f"  Source dir: {source_dir_name}")
     print(f"  Sources: {[s.path for s in sources]}")
     return out_path
 
@@ -73,6 +90,6 @@ def pack_solution(use_cuda: bool = False) -> Path:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pack solution for submission")
     parser.add_argument("--cuda", action="store_true",
-                        help="Pack CUDA baseline (solution/cuda/binding.py) instead of Triton kernel")
+                        help="Pack pure CUDA solution from solution/cuda")
     args = parser.parse_args()
     pack_solution(use_cuda=args.cuda)

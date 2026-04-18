@@ -1,10 +1,10 @@
 """
-Accurate Modal profiler for Track-A MoE Triton kernel.
+Accurate Modal profiler for Track-A MoE hybrid solutions.
 
 This script focuses on reliable timing data:
 1) End-to-end wall time (CUDA events)
 2) Per-kernel CUDA time breakdown (torch.profiler)
-3) FLOPs/TFLOPS based on actual num_padded from Triton sort kernel
+3) FLOPs/TFLOPS based on actual num_padded when sort helpers are exposed
 4) Optional NCU counters if `ncu` is available in the Modal runtime
 """
 
@@ -26,11 +26,89 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 VOLUME_MOUNT = "/data"
 TRACE_SET_PATH = "/data/mlsys26-contest"
 TRACE_DEF_NAME = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
+REMOTE_REPORT_PATH = f"{VOLUME_MOUNT}/ncu_profiler_yjl_latest.txt"
+ENABLE_NCU_COUNTERS = os.environ.get("YJL_ENABLE_NCU_COUNTERS", "0") == "1"
+
+
+def _parse_target_t_values():
+    raw = os.environ.get("YJL_TARGET_T_VALUES", "").strip()
+    if not raw or raw.lower() in {"all", "none", "*"}:
+        return None
+    values = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item:
+            values.append(int(item))
+    return values or None
+
+
+TARGET_T_VALUES = _parse_target_t_values()
+BIG_T_EXPERIMENT_VALUES = [11948, 14107]
+
+
+def _is_modal_return_channel_error(exc: Exception) -> bool:
+    msg = f"{type(exc).__name__}: {exc}"
+    markers = (
+        "Function call has expired",
+        "APP_STATE_STOPPED",
+        "ConflictError",
+        "Deadline exceeded",
+        "TimeoutError",
+        "ConnectionError",
+    )
+    return any(marker in msg for marker in markers)
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
+    .entrypoint([])
+    .apt_install("build-essential", "ninja-build")
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .env(
+        {
+            "CUDA_HOME": "/usr/local/cuda",
+            "TRITON_PRINT_AUTOTUNING": "0",
+            "TRITON_DUMP_ASSEMBLY": "0",
+            "TRITON_KERNEL_DUMP": "0",
+            "TRITON_CACHE_DUMP": "0",
+            "TRITON_DEBUG": "0",
+            "MLIR_ENABLE_DUMP": "0",
+            "LLVM_IR_ENABLE_DUMP": "0",
+        }
+    )
 )
+
+
+def _quiet_compiler_dump_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for key in (
+        "TRITON_DUMP_ASSEMBLY",
+        "TRITON_KERNEL_DUMP",
+        "TRITON_CACHE_DUMP",
+        "TRITON_ENABLE_LLVM_DEBUG",
+        "TRITON_LLVM_DEBUG_ONLY",
+        "TRITON_DEBUG",
+        "MLIR_ENABLE_DUMP",
+        "LLVM_IR_ENABLE_DUMP",
+        "LLVM_ENABLE_DUMP",
+        "LLVM_VERBOSE_ASM",
+        "TORCH_LOGS",
+    ):
+        env.pop(key, None)
+        os.environ.pop(key, None)
+    quiet_values = {
+        "TRITON_PRINT_AUTOTUNING": "0",
+        "TRITON_DUMP_ASSEMBLY": "0",
+        "TRITON_KERNEL_DUMP": "0",
+        "TRITON_CACHE_DUMP": "0",
+        "TRITON_DEBUG": "0",
+        "MLIR_ENABLE_DUMP": "0",
+        "LLVM_IR_ENABLE_DUMP": "0",
+        "LLVM_ENABLE_DUMP": "0",
+        "LLVM_VERBOSE_ASM": "0",
+    }
+    env.update(quiet_values)
+    os.environ.update(quiet_values)
+    return env
 
 
 def _get_cuda_us(event) -> float:
@@ -61,6 +139,12 @@ def _classify_event(name: str) -> str:
         or "_mapped_small_fused_moe_gemm1_swiglu_kernel" in name_l
         or "_t1_fused_gemm1_swiglu_kernel" in name_l
         or "_medium_no_swiglu_gemm1_kernel" in name_l
+        or "gemm1_swiglu_kernel" in name_l
+        or "cute_gemm1_mma" in name_l
+        or "groupedgemm1kernel" in name_l
+        or "grouped_gemm1" in name_l
+        or "dequantize_gemm1_sorted_a" in name_l
+        or "cute_gemm1_swiglu_epilogue" in name_l
     ):
         return "gemm1"
     if "_t1_fused_gemm2_reduce_kernel" in name_l:
@@ -69,8 +153,31 @@ def _classify_event(name: str) -> str:
         "_fused_moe_gemm2_kernel" in name_l
         or "_fused_moe_gemm2_scatter_kernel" in name_l
         or "_fused_moe_gemm2_t901_kernel" in name_l
+        or "gemm2_scatter_kernel" in name_l
+        or "gemm2_scatter_large_kernel" in name_l
+        or "gemm2_t14107" in name_l
+        or "cute_gemm2_mma" in name_l
+        or "cute_grouped_gemm" in name_l
+        or "groupedgemm" in name_l
+        or "grouped_gemm" in name_l
+        or "cute_t14107" in name_l
+        or "gemm2_reduce_t14107" in name_l
+        or "fused_moe_gemm2_reduce_atomic" in name_l
+        or "fused_moe_gemm2_single_local_direct" in name_l
     ):
         return "gemm2"
+    if (
+        "token_reduce_t14107" in name_l
+        or "cute_token_reduce" in name_l
+        or "pos_reduce_t14107" in name_l
+        or "cute_pos_reduce" in name_l
+        or "token_reduce_posmap" in name_l
+        or "token_reduce_weighted" in name_l
+        or "build_token_pos_map" in name_l
+        or "token_reduce_counted" in name_l
+        or "count_local_experts" in name_l
+    ):
+        return "routing"
     if "triton_ds_routing_kernel" in name_l or "triton_ds_routing_t1_local_kernel" in name_l:
         return "routing"
     if (
@@ -88,7 +195,7 @@ def _classify_event(name: str) -> str:
         or "triton_small_row_map_kernel" in name_l
     ):
         return "sorting"
-    if any(x in name_l for x in ("copy", "zero_", "fill_", "memset", "memcpy")):
+    if any(x in name_l for x in ("copy", "zero_", "fill_", "memset", "memcpy", "cast_fp32_to_bf16")):
         return "memops"
     return "other"
 
@@ -120,6 +227,31 @@ def _find_ncu_binary() -> str | None:
     except Exception:
         return None
     return None
+
+
+def _materialize_solution_sources(solution: dict, root_dir: str) -> str:
+    spec = solution.get("spec", {})
+    entry_point = spec.get("entry_point", "kernel.py::kernel")
+    entry_file = entry_point.split("::")[0]
+
+    found_entry = False
+    for src in solution.get("sources", []):
+        if not isinstance(src, dict):
+            continue
+        rel_path = src.get("path")
+        if not rel_path:
+            continue
+        abs_path = os.path.join(root_dir, rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, "w", encoding="utf-8") as f:
+            f.write(src.get("content", ""))
+        if rel_path == entry_file:
+            found_entry = True
+
+    if not found_entry:
+        raise RuntimeError(f"Cannot find source for entry file: {entry_file}")
+
+    return os.path.join(root_dir, entry_file)
 
 
 def _format_triton_config(cfg) -> str:
@@ -203,8 +335,10 @@ def _log_small_t_gemm1_autotune(module, t: int, log) -> None:
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOLUME_MOUNT: trace_volume})
-def run_profile(solution_json: str) -> str:
+def run_profile(solution_json: str, remote_report_path: str = REMOTE_REPORT_PATH) -> str:
     import importlib.util
+
+    quiet_env = _quiet_compiler_dump_env()
 
     import torch
     from torch.profiler import ProfilerActivity, profile
@@ -225,35 +359,39 @@ def run_profile(solution_json: str) -> str:
 
     # Load kernel module from packed solution JSON
     solution = json.loads(solution_json)
-    entry_point = solution.get("spec", {}).get("entry_point", "kernel.py::kernel")
-    entry_file = entry_point.split("::")[0]
-    source_code = None
-    for src in solution.get("sources", []):
-        if isinstance(src, dict) and src.get("path") == entry_file:
-            source_code = src.get("content", "")
-            break
-    if source_code is None:
-        raise RuntimeError(f"Cannot find source for entry file: {entry_file}")
+    spec_info = solution.get("spec", {})
+    entry_point = spec_info.get("entry_point", "kernel.py::kernel")
+    entry_symbol = entry_point.split("::")[1] if "::" in entry_point else "kernel"
+    log(
+        f"Solution spec: language={spec_info.get('language', 'unknown')}, "
+        f"entry={entry_point}, binding={spec_info.get('binding', 'default')}, "
+        f"source_count={len(solution.get('sources', []))}"
+    )
 
     tmp_dir = tempfile.mkdtemp(prefix="moe_profile_")
-    kernel_path = os.path.join(tmp_dir, "kernel.py")
-    with open(kernel_path, "w", encoding="utf-8") as f:
-        f.write(source_code)
+    kernel_path = _materialize_solution_sources(solution, tmp_dir)
 
     spec = importlib.util.spec_from_file_location("kernel_module", kernel_path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
-    kernel_fn = module.kernel
+    kernel_fn = getattr(module, entry_symbol)
     log("Kernel loaded")
+    if hasattr(module, "get_runtime_status"):
+        try:
+            log(f"Runtime status: {module.get_runtime_status()}")
+        except Exception as exc:
+            log(f"Runtime status unavailable: {exc!r}")
 
     # Optional NCU availability
     ncu_path = _find_ncu_binary()
-    if ncu_path:
+    if ncu_path and ENABLE_NCU_COUNTERS:
         ncu_ver = subprocess.run([ncu_path, "--version"], capture_output=True, text=True, check=False)
         log(f"NCU: {ncu_ver.stdout.strip() or 'available'}")
-    else:
+    elif not ncu_path:
         log("NCU: not found (skip hardware counters)")
+    else:
+        log("NCU: available (hardware counters disabled; set YJL_ENABLE_NCU_COUNTERS=1 to enable)")
 
     # Shapes from definition
     H = int(getattr(module, "H", 7168))
@@ -542,6 +680,13 @@ def run_profile(solution_json: str) -> str:
         run_t_values = DEFAULT_T_VALUES
         log(f"Using fallback T values: {run_t_values}")
 
+    if TARGET_T_VALUES:
+        run_t_values = [t for t in run_t_values if t in TARGET_T_VALUES]
+        log(f"Filtered target T values: {run_t_values}")
+    else:
+        run_t_values = [t for t in run_t_values if t in BIG_T_EXPERIMENT_VALUES]
+        log(f"No target T filter; profiling big-T experiment values only: {run_t_values}")
+
     for t in run_t_values:
         log("")
         log("=" * 96)
@@ -591,6 +736,11 @@ def run_profile(solution_json: str) -> str:
             output.zero_()
             kernel_fn(*args)
         torch.cuda.synchronize()
+        if hasattr(module, "get_runtime_status"):
+            try:
+                log(f"Runtime status after warmup: {module.get_runtime_status()}")
+            except Exception as exc:
+                log(f"Runtime status after warmup unavailable: {exc!r}")
         if t == 1:
             _log_t1_autotune(module, log)
         if t in (32, 52, 80):
@@ -764,7 +914,7 @@ def run_profile(solution_json: str) -> str:
         )
 
     # Optional hardware counters
-    if ncu_path:
+    if ncu_path and ENABLE_NCU_COUNTERS:
         log("")
         log("=" * 96)
         log("NCU COUNTERS (if available in runtime)")
@@ -772,10 +922,14 @@ def run_profile(solution_json: str) -> str:
         ncu_script_path = os.path.join(tmp_dir, "ncu_once.py")
         with open(ncu_script_path, "w", encoding="utf-8") as f:
             f.write(
+                "import os\n"
+                "for key in ('TRITON_DUMP_ASSEMBLY','TRITON_KERNEL_DUMP','TRITON_CACHE_DUMP','TRITON_ENABLE_LLVM_DEBUG','TRITON_LLVM_DEBUG_ONLY','TRITON_DEBUG','MLIR_ENABLE_DUMP','LLVM_IR_ENABLE_DUMP','LLVM_ENABLE_DUMP','LLVM_VERBOSE_ASM','TORCH_LOGS'):\n"
+                "    os.environ.pop(key, None)\n"
+                "os.environ.update({'TRITON_PRINT_AUTOTUNING':'0','TRITON_DUMP_ASSEMBLY':'0','TRITON_KERNEL_DUMP':'0','TRITON_CACHE_DUMP':'0','TRITON_DEBUG':'0','MLIR_ENABLE_DUMP':'0','LLVM_IR_ENABLE_DUMP':'0','LLVM_ENABLE_DUMP':'0','LLVM_VERBOSE_ASM':'0'})\n"
                 "import torch, importlib.util\n"
                 f"spec=importlib.util.spec_from_file_location('km','{kernel_path}')\n"
                 "m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)\n"
-                "k=m.kernel\n"
+                f"k=getattr(m,'{entry_symbol}')\n"
                 "T=1024; H=7168\n"
                 "rl=torch.randn(T,256,device='cuda',dtype=torch.float32)\n"
                 "rb=torch.randn(256,device='cuda',dtype=torch.bfloat16)\n"
@@ -798,7 +952,7 @@ def run_profile(solution_json: str) -> str:
         cmd = [
             ncu_path,
             "--kernel-name",
-            "regex:.*(fused_moe|t1_fused_gemm2_reduce|triton_ds_routing|triton_sort_|triton_dual_).*",
+            "regex:.*(fused_moe|fused_moe_gemm2_reduce_atomic|fused_moe_gemm2_single_local_direct|token_reduce_counted|token_reduce_posmap|token_reduce_weighted|build_token_pos_map|count_local_experts|t1_fused_gemm2_reduce|triton_ds_routing|triton_sort_|triton_dual_|gemm1_swiglu_kernel|dequantize_gemm1_sorted_a|cute_gemm1_swiglu_epilogue|cute_gemm1_mma|groupedgemm1kernel|grouped_gemm1|gemm2_scatter_kernel|gemm2_scatter_large_kernel|gemm2_t14107|cute_gemm2_mma|cute_grouped_gemm|grouped_gemm|cute_t14107|token_reduce_t14107|cute_token_reduce|pos_reduce_t14107|cute_pos_reduce|dequant_fp8_blockscale_kernel).*",
             "--metrics",
             ",".join(
                 [
@@ -817,7 +971,7 @@ def run_profile(solution_json: str) -> str:
             ncu_script_path,
         ]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False, env=quiet_env)
             log(f"NCU exit code: {result.returncode}")
             if result.returncode != 0 and result.stderr:
                 for line in result.stderr.splitlines()[:12]:
@@ -832,12 +986,28 @@ def run_profile(solution_json: str) -> str:
         except Exception as exc:
             log(f"NCU profiling failed: {exc}")
 
-    return "\n".join(logs)
+    report = "\n".join(logs)
+    try:
+        Path(remote_report_path).write_text(report, encoding="utf-8")
+        if remote_report_path != REMOTE_REPORT_PATH:
+            Path(REMOTE_REPORT_PATH).write_text(report, encoding="utf-8")
+        trace_volume.commit()
+    except Exception as exc:
+        print(f"Warning: failed to persist remote report: {exc!r}")
+    return report
+
+
+@app.function(image=image, timeout=300, volumes={VOLUME_MOUNT: trace_volume})
+def read_latest_remote_report(remote_report_path: str = REMOTE_REPORT_PATH) -> str:
+    path = Path(remote_report_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Remote report not found: {remote_report_path}")
+    return path.read_text(encoding="utf-8")
 
 
 @app.local_entrypoint()
 def main():
-    print("Packing solution...")
+    print("Packing hybrid Python solution from solution/python...")
     subprocess.run(
         [sys.executable, str(PROJECT_ROOT / "scripts" / "pack_solution_simple.py")],
         cwd=str(PROJECT_ROOT),
@@ -847,11 +1017,38 @@ def main():
     solution_path = PROJECT_ROOT / "solution.json"
     solution_json = solution_path.read_text(encoding="utf-8")
     print(f"Loaded packed solution: {solution_path}")
+    import time
+
+    remote_report_path = f"{VOLUME_MOUNT}/ncu_profiler_yjl_{int(time.time())}.txt"
 
     print("Running profile on Modal B200...")
-    report = run_profile.remote(solution_json)
+    try:
+        report = run_profile.remote(solution_json, remote_report_path)
+    except Exception as exc:
+        msg = f"{type(exc).__name__}: {exc}"
+        if not _is_modal_return_channel_error(exc):
+            raise
+        print(f"Modal return channel expired after profiling; reading persisted report from volume. ({msg})")
+        last_read_error = None
+        max_read_attempts = 30
+        for attempt in range(1, max_read_attempts + 1):
+            try:
+                report = read_latest_remote_report.remote(remote_report_path)
+                break
+            except Exception as read_exc:
+                last_read_error = read_exc
+                print(
+                    "Persisted report is not available yet; "
+                    f"retrying ({attempt}/{max_read_attempts}). ({type(read_exc).__name__}: {read_exc})"
+                )
+                time.sleep(20)
+        else:
+            raise RuntimeError(
+                "Modal return channel failed and persisted profiler report could not be read"
+            ) from last_read_error
 
     out_path = PROJECT_ROOT / "ncu_profiler_yjl.txt"
     out_path.write_text(report, encoding="utf-8")
     print(f"Saved report: {out_path}")
-    print(report)
+    if os.environ.get("YJL_PRINT_REPORT_LOCAL", "0") == "1":
+        print(report)

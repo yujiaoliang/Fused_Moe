@@ -10,6 +10,8 @@ Setup (one-time):
     modal volume put flashinfer-trace /path/to/flashinfer-trace/
 """
 
+import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -27,16 +29,24 @@ VOLUME_MOUNT = "/data"
 TRACE_SET_PATH = "/data/mlsys26-contest"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest", add_python="3.12")
+    .entrypoint([])
     .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .env({"CUDA_HOME": "/usr/local/cuda"})
 )
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOLUME_MOUNT: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+def run_benchmark(solution_json: str, config: dict | None = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        config_obj = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+    else:
+        config_obj = BenchmarkConfig(**config)
+
+    solution = Solution.model_validate_json(solution_json)
+    solution_obj = json.loads(solution_json)
+    source_paths = [source.get("path", "") for source in solution_obj.get("sources", [])]
 
     trace_set = TraceSet.from_path(TRACE_SET_PATH)
 
@@ -44,6 +54,13 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     print(f"TRACE_SET_PATH: {TRACE_SET_PATH}")
     print(f"Contents of {TRACE_SET_PATH}: {os.listdir(TRACE_SET_PATH) if os.path.exists(TRACE_SET_PATH) else 'PATH NOT FOUND'}")
     print(f"Available definitions: {list(trace_set.definitions.keys())}")
+    print(
+        "Loaded packed solution on remote: "
+        f"name={solution.name}, definition={solution.definition}, "
+        f"entry={solution_obj.get('spec', {}).get('entry_point')}, "
+        f"source_count={len(source_paths)}"
+    )
+    print(f"Source paths: {source_paths}")
 
     if solution.definition not in trace_set.definitions:
         raise ValueError(f"Definition '{solution.definition}' not found in trace set")
@@ -62,7 +79,7 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
         traces={definition.name: []},
     )
 
-    benchmark = Benchmark(bench_trace_set, config)
+    benchmark = Benchmark(bench_trace_set, config_obj)
     result_trace_set = benchmark.run_all(dump_traces=True)
 
     traces = result_trace_set.traces.get(definition.name, [])
@@ -120,22 +137,27 @@ def print_results(results: dict):
 @app.local_entrypoint()
 def main():
     """Pack solution and run benchmark on Modal."""
-    import subprocess
-    import json
-
-    print("Packing solution manually bypassed! Already packed.")
-    # subprocess.run(
-    #     [sys.executable, str(PROJECT_ROOT / "scripts" / "pack_solution_simple.py")],
-    #     cwd=str(PROJECT_ROOT), check=True,
-    # )
+    print("Packing hybrid Python solution from solution/python...")
+    subprocess.run(
+        [sys.executable, str(PROJECT_ROOT / "scripts" / "pack_solution_simple.py")],
+        cwd=str(PROJECT_ROOT), check=True,
+    )
 
     solution_path = PROJECT_ROOT / "solution.json"
-    print("\nLoading solution...")
-    solution = Solution.model_validate_json(solution_path.read_text(encoding="utf-8"))
-    print(f"Loaded: {solution.name} ({solution.definition})")
+    solution_json = solution_path.read_text(encoding="utf-8")
+    solution_obj = json.loads(solution_json)
+    source_paths = [source.get("path", "") for source in solution_obj.get("sources", [])]
+    solution = Solution.model_validate_json(solution_json)
+
+    print("\nLoaded freshly packed solution:")
+    print(f"  Path: {solution_path}")
+    print(f"  Name: {solution.name}")
+    print(f"  Definition: {solution.definition}")
+    print(f"  Entry: {solution_obj.get('spec', {}).get('entry_point')}")
+    print(f"  Sources ({len(source_paths)}): {source_paths}")
 
     print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    results = run_benchmark.remote(solution_json)
 
     if not results:
         print("No results returned!")

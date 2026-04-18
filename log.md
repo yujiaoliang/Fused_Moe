@@ -1,4 +1,4 @@
-# 笔记
+﻿# 笔记
 ## 1、环境准备
         
     * https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest 似乎没有release
@@ -677,3 +677,256 @@ Summary: 8 improved, 0 regressed, 11 neutral (±2% threshold)
 #### 结论
 
 这是一个纯 autotune search space 扩展，没有改任何 kernel 逻辑。零退化、8 workload 显著提升。后续可以结合 profiling 继续针对 GEMM2 的 memory-bound 特性做更深层优化（如 Intermediate fp32→bf16）。
+
+---
+
+### 2026-04-18 CuTe DSL large-T hybrid path: 已验证有效修改
+
+#### 背景
+
+Pure Triton 路线在大 T 上主要瓶颈集中在 GEMM1/GEMM2。Triton 主体已经比较成熟，继续在 Triton kernel 内部小修收益有限，因此尝试用 `solution/python` 做 hybrid entry：非大 T 保持 pure Triton，大 T 使用 CuTe DSL grouped GEMM 做专用路径。
+
+当前只把 CuTe 分支打开给：
+
+* `T = 11948`
+* `T = 14107`
+* `block_m = 128`
+
+非大 T 要继续走 pure Triton 路径，避免小 T/中 T 因 Python wrapper 或 CuTe lazy import 产生额外开销。
+
+#### 已验证有效的实现点
+
+1. `solution/python/kernel.py` 作为主入口，主体保持 pure Triton 代码，只在 `T in {11948, 14107} && block_m == 128` 时早跳到 `triton_impl.py` 的 hybrid/CuTe 路径。
+
+2. `solution/python/triton_impl.py` 中的大 T 路径接入 CuTe GEMM2：`Intermediate` 为 fp16，GEMM2 weight 预先 dequant/cache 成 fp16，CuTe grouped GEMM2 输出 `expert_out` 使用 bf16，后续 reduce 从 bf16/fp32 expert_out load 后转 fp32 累加。
+
+3. `solution/python/triton_impl.py` 中的大 T 路径接入 CuTe GEMM1：先用 `_dequantize_gemm1_sorted_a_kernel` 将 sorted hidden states 从 fp8 dequant 到 fp16，GEMM1 weight 预先 dequant/cache 成 fp16，CuTe grouped GEMM1 输出 raw W1/W3，再用 `_cute_gemm1_swiglu_epilogue_kernel` 做 `silu(W3) * W1 * 0.125`，写 fp16 `Intermediate`。
+
+4. GEMM1 raw W1/W3 输出从 fp32 改为 bf16：`RAW_OUT_DTYPE = torch.bfloat16`，`c_dtype = cutlass.BFloat16`，epilogue 中 `tl.load(...).to(tl.float32)` 后再做 SiLU 和乘法。已确认精度通过当前 tolerance，不影响 correctness。
+
+#### 最新验证数据
+
+Profiling 文件：`ncu_profiler_yjl.txt`
+
+环境：
+
+* GPU: NVIDIA B200
+* PyTorch: `2.11.0+cu130`
+* Triton: `3.6.0`
+* Solution spec: `language=python`, `entry=kernel.py::kernel`, `source_count=7`
+
+Runtime status 确认命中 CuTe：
+
+* `last_active_impl = hybrid_cute_large_t`
+* `triton_gemm1_backend = cute_gemm1_mma_predequant_t11948 / t14107`
+* `triton_gemm2_backend = cute_gemm2_mma_t11948 / t14107`
+* `cute_gemm1_mma_viability = grouped_fp16_predequant_w13_bf16_raw_large_t`
+* `cute_gemm2_mma_viability = grouped_fp16_prepacked_b_bf16_out_large_t`
+
+当前结果：
+
+| T | Wall | CUDA | GEMM1 | GEMM2 | Route | G1 TFLOPS | G2 TFLOPS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 11948 | 1.586 ms | 1.513 ms | 0.746 ms | 0.349 ms | 0.135 ms | 966.6T | 1034.3T |
+| 14107 | 2.202 ms | 2.160 ms | 1.140 ms | 0.505 ms | 0.171 ms | 942.6T | 1064.0T |
+
+对比 `ncu_profiler_yjl_0415base.txt` pure Triton：
+
+| T | 0415 pure Triton Wall | CuTe bf16 raw Wall | Wall 改善 |
+|---:|---:|---:|---:|
+| 11948 | 2.451 ms | 1.586 ms | 约 35.3% |
+| 14107 | 3.501 ms | 2.202 ms | 约 37.1% |
+
+对比 CuTe GEMM1 fp32 raw：
+
+| T | fp32 raw Wall | bf16 raw Wall | Wall 改善 |
+|---:|---:|---:|---:|
+| 11948 | 1.864 ms | 1.586 ms | 约 14.9% |
+| 14107 | 2.317 ms | 2.202 ms | 约 5.0% |
+
+#### 结论
+
+CuTe DSL 对大 T 是明确有效的。GEMM1 从 pure Triton 的约 540T 提升到约 940-970T，GEMM2 也通过 fp16 prepacked B + bf16 expert_out 稳定达到约 1000T。当前最有价值的 hybrid 结构是：
+
+`pure Triton routing/sort/reduce scaffold + CuTe GEMM1 + CuTe GEMM2 + Triton epilogue/reduce`
+
+这条路径已经在 `T=11948` 和 `T=14107` 上同时获得明显 wall time 收益，并且 bf16 raw 的精度已确认可接受。
+
+#### 已验证有效：metadata host sync 合并
+
+最新 profiler 已确认这条修改有效。修改内容：
+
+* 原来 CuTe large-T 路径中存在 3 次 host 回读/同步：`total_blocks.item()`、GEMM1 metadata 的 `block_offsets.detach().cpu().tolist()`、GEMM2 metadata 的 `block_offsets.detach().cpu().tolist()`。
+* 现在在 `triton_impl.py` 中统一执行一次 `block_offsets.detach().cpu().tolist()`，然后把同一份 `block_offsets_host` 传给 CuTe GEMM1/GEMM2 metadata。
+* `exact_pid_m` 改为使用 `block_offsets_host[-1]`，等价于 `total_blocks`，计算逻辑保持不变。
+
+验证结果：
+
+| T | bf16 raw baseline Wall | metadata sync 合并后 Wall | Wall 改善 |
+|---:|---:|---:|---:|
+| 11948 | 1.586 ms | 1.548 ms | 约 2.4% |
+| 14107 | 2.202 ms | 2.168 ms | 约 1.5% |
+
+CPU/API 侧证据：
+
+| T | 优化前 `cudaMemcpyAsync` | 优化后 `cudaMemcpyAsync` |
+|---:|---:|---:|
+| 11948 | x3 | x1 |
+| 14107 | x3 | x1 |
+
+最新结果：
+
+| T | Wall | CUDA | CPU overhead | GEMM1 | GEMM2 | G1 TFLOPS | G2 TFLOPS |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 11948 | 1.548 ms | 1.514 ms | 0.034 ms | 0.748 ms | 0.357 ms | 964.8T | 1011.8T |
+| 14107 | 2.168 ms | 2.199 ms | 0.000 ms | 1.175 ms | 0.514 ms | 915.1T | 1044.7T |
+
+对比 `ncu_profiler_yjl_0415base.txt` pure Triton：
+
+| T | 0415 pure Triton Wall | 当前 CuTe large-T Wall | 总改善 |
+|---:|---:|---:|---:|
+| 11948 | 2.451 ms | 1.548 ms | 约 36.8% |
+| 14107 | 3.501 ms | 2.168 ms | 约 38.1% |
+
+结论：metadata host-sync 合并是小幅但稳定的正收益，主要体现在 CPU/API 同步开销下降。大 T CuTe 路径当前已验证有效的组合为：CuTe GEMM1 + bf16 raw + CuTe GEMM2 bf16 expert_out + metadata host sync 合并。
+
+---
+
+### 2026-04-18 T=901 CuTe / fused reduce 实验：已验证不保留
+
+#### 背景
+
+`T=901` 是一个典型的中等 T / 碎 block workload：
+
+* `block_m = 64`
+* `total_blocks = 36`
+* `num_padded = 2304`
+* `num_local_rows = 1331`
+* `tail_rows = 973`
+* `tail_experts = 32`
+
+0415 pure Triton baseline 中，`T=901` 已经有专门的 `_fused_moe_gemm2_t901_kernel`，整体表现为：
+
+| T | Wall | CUDA | GEMM1 | GEMM2 | Route | Sort |
+|---:|---:|---:|---:|---:|---:|---:|
+| 901 | 0.531 ms | 0.524 ms | 0.273 ms | 0.196 ms | 0.016 ms | 0.019 ms |
+
+目标是验证：能否用 CuTe DSL 或 fused reduce 把 901 的碎 block GEMM2 进一步拉高。
+
+#### 实验 1：Grouped CuTe GEMM2 for T=901
+
+实现方式：
+
+* 将 `T=901, block_m=64` 加入 CuTe GEMM2 target。
+* GEMM1 仍走 Triton。
+* GEMM2 走 CuTe grouped GEMM2，输出 bf16 `expert_out`。
+* 后续使用 `_token_reduce_weighted_kernel` 做 weighted reduce。
+
+结果：
+
+| T | Wall | GEMM1 | GEMM2 | Route / Reduce | 结论 |
+|---:|---:|---:|---:|---:|---|
+| 901 | 0.536 ms | 0.274 ms | 0.168 ms | 0.027 ms | GEMM2 单 kernel 更快，但端到端小亏 |
+
+分析：
+
+* CuTe GEMM2 本体从 `0.196 ms -> 0.168 ms`，单看 GEMM2 快约 14%。
+* 但 CuTe grouped path 引入 metadata / host-device copy / sync 固定成本。
+* CuTe GEMM2 输出是 unweighted，额外需要 `_token_reduce_weighted_kernel`。
+* 对 901 这种规模，固定成本和额外 reduce 吃掉了 GEMM2 本体收益。
+
+结论：**Grouped CuTe GEMM2 不适合直接推广到 T=901。**
+
+#### 实验 2：T=901 atomic direct reduce
+
+实现方式：
+
+* GEMM2 仍按 sorted expert rows 计算。
+* 不再写 `expert_out`。
+* 计算后直接 `atomic_add` 到 fp32 token accumulator。
+* 最后 cast fp32 accumulator 到 bf16 output。
+
+结果：
+
+| T | Wall | 主要 kernel | 结论 |
+|---:|---:|---|---|
+| 901 | 0.558 ms | `_fused_moe_gemm2_t901_atomic_reduce_kernel`: 226 us | 比 pure Triton 更慢 |
+
+分析：
+
+* 虽然省掉了 `_token_reduce_kernel`，但 atomic reduce 让 GEMM2 kernel 从 `196 us` 变成约 `226 us`。
+* 还额外需要 fp32 accumulator 清零和 bf16 cast。
+* 对 901 来说，atomic 冲突和额外 memops 不划算。
+
+结论：**Atomic direct reduce 路线不保留。**
+
+#### 实验 3：T=901 token-centric non-atomic direct reduce
+
+实现方式：
+
+* 每个 program 负责一个 `token_id + N tile`。
+* program 内循环 `TOP_K=8` 个 routed slot。
+* 每个 slot 从 `scatter_map` 找到 sorted position，再做 GEMM2 dot，乘 routing weight 后累加。
+* 直接写最终 bf16 output，无 `expert_out`、无 token_reduce、无 atomic。
+
+结果：
+
+| T | Wall | 主要 kernel | 结论 |
+|---:|---:|---|---|
+| 901 | 16.397 ms | `_fused_moe_gemm2_t901_token_reduce_kernel`: 16116 us | 完全不可用 |
+
+分析：
+
+* 该方案避免了 atomic 和 reduce kernel，但把 GEMM2 的矩阵结构彻底打散。
+* 每个 token/slot 都在做细粒度 vector dot，几乎无法利用 tensor core / grouped GEMM 的 tile 复用。
+* B 权重访问也变成 per-token/per-slot 的动态 expert gather，访存和调度都很差。
+
+结论：**Token-centric non-atomic fused reduce 路线不保留。**
+
+#### 总结
+
+`T=901` 的三条 CuTe / fused reduce 路线都不如现有 pure Triton 专用路径：
+
+| 路线 | Wall | 相对 0415 pure Triton |
+|---|---:|---:|
+| 0415 pure Triton `_fused_moe_gemm2_t901_kernel` | 0.531 ms | baseline |
+| grouped CuTe GEMM2 + weighted reduce | 0.536 ms | 慢约 0.9% |
+| atomic direct reduce | 0.558 ms | 慢约 5.1% |
+| token-centric non-atomic direct reduce | 16.397 ms | 完全失败 |
+
+当前结论：
+
+* `T=901` 应回退并保持 pure Triton T901 专用 GEMM2。
+* CuTe grouped GEMM 的固定 metadata 成本只有在 `T=11948/14107` 这类大 T 上才能摊薄。
+* 中小 T 的优化不应照搬 large-T grouped CuTe 方案。
+* 若未来继续尝试中小 T，必须保持 GEMM tile 结构，不能把 GEMM2 改成 token-centric scalar/vector dot。
+
+#### 实验 4：T=901 CuTe GEMM1-only
+
+实现方式：
+
+* 新增独立 `cute_gemm1_t901_*` 实验通路，只在 `T=901 && block_m=64` 时启用。
+* GEMM1 拆成三段：sorted hidden states fp8 dequant 到 fp16、CuTe grouped GEMM1 输出 bf16 raw W1/W3、Triton epilogue 做 SwiGLU 并写 fp16 Intermediate。
+* GEMM2、token reduce、T901 Triton GEMM2 专用 kernel 保持原逻辑不变。
+
+结果：
+
+| T | Wall | CuTe GEMM1 main | dequant | epilogue | GEMM2 | 结论 |
+|---:|---:|---:|---:|---:|---:|---|
+| 901 | 0.653 ms | 308.84 us | 9.84 us | 6.18 us | 205.18 us | 比 pure Triton baseline 明显更慢 |
+
+对比 baseline：
+
+| 路线 | Wall | 相对 0415 pure Triton |
+|---|---:|---:|
+| 0415 pure Triton `_fused_moe_gemm2_t901_kernel` | 0.531 ms | baseline |
+| CuTe GEMM1-only + Triton GEMM2 | 0.653 ms | 慢约 23% |
+
+分析：
+
+* 该路径确实进入 `hybrid_cute_t901_gemm1_only`，`triton_gemm1_backend = cute_gemm1_t901_predequant_t901`。
+* Profiler 中 CuTe GEMM1 main kernel 被归类到 `[gemm2]`，但 kernel 名为 `GroupedGemm1T901`，实际是 GEMM1 主体。
+* GEMM1-only 拆分后带来了额外 kernel launch、metadata host read / `cudaMemcpyAsync`，且 CuTe grouped GEMM1 本体在 T=901 的碎 block 规模下没有打赢原 Triton GEMM1。
+* 该实验不保留，回退到原来的 901 pure Triton 路径。
+
+结论：**T=901 CuTe GEMM1-only 路线失败，不保留。**
