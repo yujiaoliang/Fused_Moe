@@ -19,14 +19,6 @@ import torch
 import triton
 import triton.language as tl
 
-# Lazy-import cuBLAS GEMM2 module (compiled on first use)
-try:
-    import cutlass_kernels as _ck_mod
-    _HAS_CUBLAS_MODULE = True
-except ImportError:
-    _ck_mod = None
-    _HAS_CUBLAS_MODULE = False
-
 # ── Constants (DeepSeek-V3 / R1) ──
 H = 7168
 I_SIZE = 2048
@@ -63,9 +55,6 @@ T1_GENERIC_MAX_PADDED = TOP_K * T1_GENERIC_BLOCK_M
 TOKEN_SCATTER_BLOCK_TOKENS = 8
 
 # cuBLAS GEMM2 dispatch threshold (only for large-T where GEMM compute dominates)
-CUBLAS_GEMM2_T_MIN = 2048
-CUBLAS_ENABLED = False  # Disable cuBLAS in final submission (organizers value own implementation)
-
 # bf16 expert_out: saves 50% bandwidth on largest buffer [MAX_PADDED, 7168]
 # bf16 range = 3.4e38 (same as fp32) — no overflow risk unlike fp16
 BF16_EXPERT_OUT_T_MIN = 32  # bf16 expert_out for all T>=32 workloads
@@ -2351,72 +2340,36 @@ def kernel(
         )
 
     # -- 5. GEMM2 (non-atomic, writes to expert_out) --
-    # cuBLAS path disabled for final submission (organizers value own implementation)
-    _use_cublas_gemm2 = (
-        CUBLAS_ENABLED
-        and _HAS_CUBLAS_MODULE
-        and T >= CUBLAS_GEMM2_T_MIN
-        and use_exact_dispatch
-        and _ck_mod.ensure_compiled()
-    )
+    grid2 = lambda META: (exact_pid_m * triton.cdiv(7168, META['BLOCK_N']),)
+    use_gemm2_t901 = _use_gemm2_t901_override(T, block_m, use_exact_dispatch)
 
-    if _use_cublas_gemm2:
-        # Per-expert cuBLAS GEMM2: read block_offsets (already synced via exact_pid_m)
-        offsets = block_offsets.cpu().tolist()
-        for e in range(E_LOCAL):
-            start_blk = offsets[e]
-            end_blk = offsets[e + 1]
-            if end_blk <= start_blk:
-                continue
-            start_row = start_blk * block_m
-            end_row = end_blk * block_m
-            # A slice: [num_rows, 2048] from Intermediate
-            A_slice = Intermediate[start_row:end_row]
-            # token_weights slice
-            tw_slice = sorted_weights[start_row:end_row]
-            # Output slice
-            C_slice = expert_out[start_row:end_row]
-            # B: gemm2_weights[e] is [N=7168, K=2048] — native layout, no transpose
-            # B_scale: gemm2_weights_scale[e] is [N//128, K//128] = [56, 16]
-            _ck_mod.cublas_gemm2_expert(
-                A_slice,
-                gemm2_weights[e],
-                gemm2_weights_scale[e],
-                tw_slice,
-                C_slice,
-                use_fp16_inter,
-            )
+    if use_small_medium_gemm:
+        gemm2_kernel = _small_medium_fused_moe_gemm2_kernel
+    elif use_upper_medium_gemm:
+        gemm2_kernel = _medium_fused_moe_gemm2_kernel
+    elif use_gemm2_t901:
+        gemm2_kernel = _fused_moe_gemm2_t901_kernel
     else:
-        grid2 = lambda META: (exact_pid_m * triton.cdiv(7168, META['BLOCK_N']),)
-        use_gemm2_t901 = _use_gemm2_t901_override(T, block_m, use_exact_dispatch)
-
-        if use_small_medium_gemm:
-            gemm2_kernel = _small_medium_fused_moe_gemm2_kernel
-        elif use_upper_medium_gemm:
-            gemm2_kernel = _medium_fused_moe_gemm2_kernel
-        elif use_gemm2_t901:
-            gemm2_kernel = _fused_moe_gemm2_t901_kernel
-        else:
-            gemm2_kernel = _fused_moe_gemm2_kernel
-        gemm2_kwargs = dict(
-            A_ptr=Intermediate,
-            B_ptr=gemm2_weights,
-            C_ptr=expert_out,
-            B_scale_ptr=gemm2_weights_scale,
-            token_weights_ptr=sorted_weights,
-            block_offsets_ptr=block_offsets,
-            total_blocks_ptr=total_blocks,
-            MAX_PID_M=exact_pid_m, N=7168, K=2048,
-            stride_am=Intermediate.stride(0), stride_ak=Intermediate.stride(1),
-            stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1), stride_bk=gemm2_weights.stride(2),
-            stride_cm=expert_out.stride(0), stride_cn=expert_out.stride(1),
-            stride_bse=gemm2_weights_scale.stride(0), stride_bsn=gemm2_weights_scale.stride(1), stride_bsk=gemm2_weights_scale.stride(2),
-            E_LOCAL=E_LOCAL,
-            BLOCK_M=block_m,
-        )
-        gemm2_kwargs['USE_FP16_INTER'] = use_fp16_inter
-        gemm2_kwargs['USE_BF16_EXPERT_OUT'] = use_bf16_expert_out
-        gemm2_kernel[grid2](**gemm2_kwargs)
+        gemm2_kernel = _fused_moe_gemm2_kernel
+    gemm2_kwargs = dict(
+        A_ptr=Intermediate,
+        B_ptr=gemm2_weights,
+        C_ptr=expert_out,
+        B_scale_ptr=gemm2_weights_scale,
+        token_weights_ptr=sorted_weights,
+        block_offsets_ptr=block_offsets,
+        total_blocks_ptr=total_blocks,
+        MAX_PID_M=exact_pid_m, N=7168, K=2048,
+        stride_am=Intermediate.stride(0), stride_ak=Intermediate.stride(1),
+        stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1), stride_bk=gemm2_weights.stride(2),
+        stride_cm=expert_out.stride(0), stride_cn=expert_out.stride(1),
+        stride_bse=gemm2_weights_scale.stride(0), stride_bsn=gemm2_weights_scale.stride(1), stride_bsk=gemm2_weights_scale.stride(2),
+        E_LOCAL=E_LOCAL,
+        BLOCK_M=block_m,
+    )
+    gemm2_kwargs['USE_FP16_INTER'] = use_fp16_inter
+    gemm2_kwargs['USE_BF16_EXPERT_OUT'] = use_bf16_expert_out
+    gemm2_kernel[grid2](**gemm2_kwargs)
 
     # -- 6. Token-Centric Reduce (zero-free, atomic-free, bf16 fused) --
     grid3 = lambda META: (triton.cdiv(T, META['BLOCK_T']) * triton.cdiv(7168, META['BLOCK_N']),)
