@@ -1,10 +1,11 @@
 # Fused MoE Kernel — Track A (MLSys 2026 FlashInfer Contest)
 
 > **赛道:** Track A — Fused MoE
-> **硬件:** NVIDIA B200 (Blackwell, sm100)
-> **状态:** ✅ 19/19 PASSED
-> **当前可复现口径 (Modal B200):** peak ~56x, mean ~41x (2026-04-15 基准)
-> **历史最佳 (Round 15, Modal 好运时段):** peak 106.65x, mean 55.77x
+> **硬件:** NVIDIA B200 (Blackwell, sm100a)
+> **架构:** Hybrid CuTe DSL + Pure Triton dispatch
+> **状态:** ✅ 18/19 PASSED (T=14107 CuTe GEMM 精度 bug 修复中)
+> **最新 AB test (Modal B200, 官方镜像):** mean 48.71x, peak 69.98x
+> **大 T 加速:** 5e8dc11c (T=11948) 13.04x → **20.80x** (+59.6%)
 
 > ⚠️ **关于绝对 speedup 数值**：Modal B200 共享实例无锁频，同一代码不同时段的 speedup 可波动 20-30%。
 > 官方评测在裸金属 B200 + 锁频 (`nvidia-smi -ac 3996,1965`) 下运行，结果更稳定。
@@ -66,15 +67,19 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 
 ### Runtime Dispatch 策略
 
-| 条件 | BLOCK_M | GEMM Kernel |
-|------|---------|-------------|
-| T=1 | 16 | `_t1_*` 专用路径 |
-| 32 ≤ T ≤ 64 | 32 | `_small_medium_*` |
-| 65 ≤ T ≤ 128 | 32/64 | `_medium_*` |
-| T > 128 | 64 | `_fused_moe_*` (generic) |
-| **T = 901** | 64 | `_fused_moe_gemm2_t901_kernel` (GEMM2 专用) |
-| T > 2048 | 128 | `_fused_moe_*` (generic) |
-| T ≥ 4096 | dynamic | Exact dispatch (`total_blocks.item()`) |
+`kernel.py` 入口根据 T 自动选择路径：
+
+| 条件 | 路径 | BLOCK_M | GEMM Kernel |
+|------|------|---------|-------------|
+| **T=11948** | **CuTe DSL grouped GEMM** | 128 | `cute_gemm1_mma` + `cute_gemm2_mma` |
+| **T=14107** | **CuTe DSL grouped GEMM** | 128 | 同上 (⚠️ 精度 bug 修复中) |
+| T=1 | Pure Triton | 16 | `_t1_*` 专用路径 |
+| 32 ≤ T ≤ 64 | Pure Triton | 32 | `_small_medium_*` |
+| 65 ≤ T ≤ 128 | Pure Triton | 32/64 | `_medium_*` |
+| T > 128 | Pure Triton | 64 | `_fused_moe_*` (generic) |
+| **T = 901** | Pure Triton | 64 | `_fused_moe_gemm2_t901_kernel` (GEMM2 专用) |
+| T > 2048 | Pure Triton | 128 | `_fused_moe_*` (generic) |
+| T ≥ 4096 | Pure Triton | dynamic | Exact dispatch (`total_blocks.item()`) |
 
 ### Profiling 瓶颈分布 (`yjl_ncu.py`, B200, 19 real traces)
 
@@ -106,6 +111,18 @@ git clone https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest
 # 4. Modal 登录（一次性）
 modal setup
 ```
+
+### 官方评测环境
+
+| 项目 | 值 |
+|------|----|
+| Docker Image | `flashinfer/flashinfer-ci-cu132:20260401-2c675fb` |
+| PyTorch | `2.12.0.dev20260331+cu132` |
+| GPU | B200 (bare-metal, sm_100a) |
+| 容差 | `--atol 1 --rtol 0.3 --required-matched-ratio 0.9` |
+| 评分 | CUPTI GPU kernel 时间之和 (CPU 开销不计入) |
+
+> 所有 Modal 脚本已统一使用上述官方镜像 + 容差参数 (`1bd784b`)。
 
 ---
 
@@ -168,28 +185,39 @@ git push origin submission-vX
 ```
 mlsys_note/
 ├── solution/
-│   ├── triton/
-│   │   ├── kernel.py            # ← 主力 Triton kernel
-│   │   └── cutlass_kernels.py   # cuBLAS GEMM2 JIT 扩展 (已禁用，保留备用)
-│   └── cuda/
-│       ├── binding.py           # CUDA baseline (PyTorch/cuBLAS, 19/19 PASSED)
-│       └── kernel.cu            # CUDA kernel 模板 (已废弃, Modal 无 nvcc)
+│   └── python/                  # ← 提交代码目录 (config.toml: language=python)
+│       ├── kernel.py            # 入口：hybrid dispatch (CuTe DSL / Pure Triton)
+│       ├── pure_triton_impl.py  # Pure Triton 主实现 (17/19 workloads)
+│       ├── triton_impl.py       # Hybrid CuTe+Triton 实现 (大 T workloads)
+│       ├── cute_gemm1_mma.py    # CuTe DSL GEMM1 runtime wrapper
+│       ├── cute_gemm2_mma.py    # CuTe DSL GEMM2 runtime wrapper
+│       ├── cute_grouped_gemm_sm100.py  # CuTe DSL grouped GEMM 核心 (NVIDIA 参考)
+│       └── cutlass_kernels.py   # cuBLAS GEMM2 JIT 扩展 (已禁用，保留备用)
 ├── scripts/
-│   ├── test_modal.py            # Modal B200 benchmark（推荐）
-│   ├── ab_test_modal.py         # A/B 对比测试（同 session）
-│   ├── run_modal.py             # Modal 完整 benchmark
-│   ├── profile_modal.py         # Modal NCU profiling
-│   ├── debug_modal.py           # 逐步对比 kernel vs reference
-│   ├── yjl_ncu.py               # NCU profiling + autotune 日志（支持 T901 kernel 分类）
+│   ├── ab_test_modal.py         # A/B 对比测试（同 B200 session）⭐推荐
+│   ├── test_modal.py            # Modal B200 单次 benchmark
+│   ├── run_modal.py             # Modal 完整 benchmark (含 auto-pack)
+│   ├── run_local.py             # 本地 benchmark (需 B200)
+│   ├── profile_modal.py         # Modal torch.profiler profiling
+│   ├── ncu_profile_modal.py     # Modal NCU per-kernel 时间分解
+│   ├── yjl_ncu.py               # NCU profiling + autotune 日志
 │   ├── pack_solution_simple.py  # 打包 solution.json
-│   ├── ncu_profile_modal.py     # per-kernel 时间分解
 │   └── test_cutlass_modal.py    # cuBLAS JIT 编译测试
-├── config.toml                  # 配置（队名、赛道）
+├── config.toml                  # 配置（队名、赛道、entry_point）
+├── test_bench.py                # 官方 CLI 评测脚本 (Docker + isolated runner)
 ├── profiling_notes.md           # Profiling 分析 & 优化记录
-├── CHANGELOG-cublas-gemm2.md    # cuBLAS GEMM2 dispatch 实验日志
-├── log.md                       # 详细实验日志
 ├── solution.json                # 打包后的提交文件
-└── mlsys26-contest/             # 比赛数据集
+└── mlsys26-contest/             # 比赛数据集 (submodule)
+```
+
+### 双路径架构
+
+```
+kernel.py (入口)
+  ├── T in {11948, 14107}  →  triton_impl.py  →  CuTe DSL grouped GEMM
+  │                            ├── cute_gemm1_mma.py + cute_gemm2_mma.py
+  │                            └── cute_grouped_gemm_sm100.py
+  └── 其他 T              →  pure_triton_impl.py  →  Pure Triton kernels
 ```
 
 ---
@@ -400,10 +428,14 @@ mlsys_note/
 | 约束 | 说明 |
 |------|------|
 | Destination-passing style | `kernel(*inputs, *outputs)`，output 是最后一个参数 |
-| 正确性标准（我们的严格测试） | 95% 元素满足 `abs_err ≤ 0.01` OR `rel_err ≤ 0.01` |
-| **官方评测容差（实际评分）** | **`atol=1.0, rtol=0.3, matched_ratio=0.9`**（宽 ~100x） |
+| **官方评测容差** | **`atol=1.0, rtol=0.3, matched_ratio=0.9`** — 元素仅在 abs>1 AND rel>0.3 时才 fail |
 | 评分方式 | **CUPTI GPU kernel 时间之和**，CPU 开销不计入 |
-| cuBLAS/CUTLASS 政策 | 不硬禁，但组委会倾向团队自研实现，manual review 会关注 |
+| Docker Image | `flashinfer/flashinfer-ci-cu132:20260401-2c675fb` (pinned) |
+| GPU 架构 | sm_100a — 需在 build flags 中显式指定 `-arch=sm_100a` |
+| cuBLAS/CUTLASS 政策 | 不硬禁，组委会 "value seeing team's own implementation"。CuTe DSL + Triton fallback 是推荐方式 |
+| FlashInfer runtime | ❌ 不允许 runtime 调用 flashinfer API。可复制源码到 repo |
+| Manual review | 仅查合规（self-contained, 无预计算），不会有比公布容差更严格的数值标准 |
+| Self-contained | 所有代码必须在 `solution/python/` 目录内，打包进 solution.json |
 | Scalar tensor | `local_expert_offset` 和 `routed_scaling_factor` 是 tensor 非 Python scalar |
 | 显存 | 32 experts 权重 ~1.8GB FP8；B200 ~180GB 显存，不是瓶颈 |
 
@@ -411,16 +443,17 @@ mlsys_note/
 
 ## 注意事项
 
-1. **Modal 环境 vs 本地环境：**
-   - Modal: PyTorch 2.11.0+cu130, flashinfer-bench, Python 3.12
+1. **评测环境统一：**
+   - 所有 Modal 脚本已统一使用官方 Docker image `flashinfer/flashinfer-ci-cu132:20260401-2c675fb`
+   - PyTorch: `2.12.0.dev20260331+cu132`, Python 3.12
+   - 容差: `atol=1.0, rtol=0.3, required_matched_ratio=0.9`
    - 本地 (Windows): 无法安装 triton，仅用于打包和代码审查
-   - 本地 GPU 显存 < 24GB 跑不了大 workloads（reference 也会 OOM）
 
-2. **flashinfer-bench API 差异：**
-   - `Solution.sources` 在 Modal 上是 `list` 类型（本地是 `dict`）
-   - 用 `pack_solution_simple.py` 打包更稳定
+2. **Hybrid Dispatch 注意事项：**
+   - Pure Triton 优化 → `solution/python/pure_triton_impl.py`
+   - 大 T CuTe 优化 → `solution/python/triton_impl.py` + `cute_gemm*_mma.py`
+   - 两条路径可以独立迭代，通过 `kernel.py` 的 `_CUTE_TARGET_BLOCK_M` dict 控制分发
 
-3. **CUDA Baseline (已废弃)：**
-   - `solution/cuda/binding.py` 是 PyTorch/cuBLAS 参考实现（19/19 PASSED）
-   - `solution/cuda/kernel.cu` 包含 fused kernel 模板 + FA4 fast_sigmoid
-   - 被 Modal 评测环境封死（无 nvcc），仅作参考
+3. **已知问题：**
+   - T=14107 (58a34f27) CuTe GEMM 路径存在精度 bug (INCORRECT_NUMERICAL)
+   - 保底方案：从 `_CUTE_TARGET_BLOCK_M` 中移除 14107，退回 Pure Triton (14.58x)
