@@ -9,7 +9,7 @@ _STATE = None
 _B_FP16_CACHE = {}
 _METADATA_CACHE = {}
 
-TARGET_TS = (14107,)
+TARGET_TS = (11948, 14107)
 MAX_TARGET_T = max(TARGET_TS)
 H = 7168
 N = 4096
@@ -17,7 +17,7 @@ E_LOCAL = 32
 TOP_K = 8
 BLOCK_M = 128
 MAX_PADDED = MAX_TARGET_T * TOP_K + E_LOCAL * BLOCK_M
-RAW_OUT_DTYPE = torch.bfloat16
+RAW_OUT_DTYPE = torch.float16
 
 
 def _load_cute_stack():
@@ -67,7 +67,7 @@ def _build_or_get_state():
         cutlass, cute, cutlass_torch, utils, grouped_gemm, grouped_gemm1_cls = _load_cute_stack()
 
         ab_dtype = cutlass.Float16
-        c_dtype = cutlass.BFloat16
+        c_dtype = cutlass.Float16
         acc_dtype = cutlass.Float32
         a_major = "k"
         b_major = "k"

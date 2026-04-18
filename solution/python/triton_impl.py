@@ -39,10 +39,12 @@ TOP_K = 8
 SORT_BLOCK_ITEMS = 256
 TOKEN_SCATTER_BLOCK_TOKENS = 8
 BLOCK_M = 128
-TARGET_TS = (14107,)
-TARGET_BLOCK_M = {14107: BLOCK_M}
-CUTE_GEMM1_RAW_DTYPE = torch.bfloat16
-T11948_CUTE_GEMM2_EXPERT_OUT_DTYPE = torch.bfloat16
+TARGET_TS = (11948,)
+TARGET_BLOCK_M = {11948: BLOCK_M}
+# T values that use CuTe for GEMM2 (others use Triton GEMM2 for precision)
+CUTE_GEMM2_TS = {11948}
+CUTE_GEMM1_RAW_DTYPE = torch.float16
+CUTE_GEMM2_EXPERT_OUT_DTYPE = torch.bfloat16
 
 
 @triton.jit
@@ -188,6 +190,134 @@ def _token_reduce_weighted_kernel(
     )
 
 
+# ═══════════════════════════════════════════════════════════════
+# Triton GEMM2: FP16×FP8 with post-dot block scale + fused routing weights
+# Used for T values NOT in CUTE_GEMM2_TS (avoids FP16 B pre-dequant error)
+# ═══════════════════════════════════════════════════════════════
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 16}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 4}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 2}, num_warps=8, num_stages=2),
+        triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_N': 256, 'BLOCK_K': 128, 'GROUP_M': 64}, num_warps=8, num_stages=3),
+    ],
+    key=['MAX_PID_M', 'N', 'K', 'BLOCK_M'],
+    restore_value=['C_ptr'],
+)
+@triton.jit
+def _triton_gemm2_kernel(
+    A_ptr,            # [num_padded, K] fp16 (intermediate)
+    B_ptr,            # [E, N, K] fp8
+    C_ptr,            # [num_padded, N] bf16 (expert_out)
+    B_scale_ptr,      # [E, N//128, K//128] fp32
+    token_weights_ptr,# [num_padded] fp32
+    block_offsets_ptr,# [E_LOCAL + 1] int32
+    total_blocks_ptr, # [1] int32
+    MAX_PID_M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+    stride_am, stride_ak,
+    stride_be, stride_bn, stride_bk,
+    stride_cm, stride_cn,
+    stride_bse, stride_bsn, stride_bsk,
+    E_LOCAL: tl.constexpr,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    total_blocks = tl.load(total_blocks_ptr)
+    if total_blocks <= 0:
+        return
+    if pid >= total_blocks * num_pid_n:
+        return
+    num_pid_m = total_blocks
+
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + (pid % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    e_idx = tl.arange(0, E_LOCAL)
+    b_start = tl.load(block_offsets_ptr + e_idx)
+    b_end = tl.load(block_offsets_ptr + e_idx + 1)
+    valid = (b_start <= pid_m) & (pid_m < b_end)
+    expert_id = tl.argmax(valid.to(tl.int32), axis=0)
+
+    rm = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    token_weights = tl.load(token_weights_ptr + rm)
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    a_base = A_ptr + rm[:, None] * stride_am
+    b_base = B_ptr + expert_id * stride_be + rn[None, :] * stride_bn
+    b_scale_base = B_scale_ptr + expert_id * stride_bse + (rn[None, :] // 128) * stride_bsn
+
+    for k in range(0, K, BLOCK_K):
+        rk = k + tl.arange(0, BLOCK_K)
+        a = tl.load(a_base + rk[None, :] * stride_ak, eviction_policy='evict_first')
+        b = tl.load(b_base + rk[:, None] * stride_bk, eviction_policy='evict_last')
+        b_scale = tl.load(b_scale_base + (k // 128) * stride_bsk, eviction_policy='evict_last')
+        partial = tl.dot(a, b.to(a.dtype), out_dtype=tl.float32)
+        acc += partial * b_scale
+
+    # Fuse routing weight + FP16 intermediate ×8.0 compensation
+    out = acc * token_weights[:, None] * 8.0
+    c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
+    tl.store(c_ptrs, out.to(tl.bfloat16), eviction_policy='evict_first')
+
+
+# Simple token reduce (no weight multiplication — weights already in GEMM2)
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_T': 16, 'BLOCK_N': 128}, num_warps=4, num_stages=3),
+        triton.Config({'BLOCK_T': 16, 'BLOCK_N': 256}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_T': 8, 'BLOCK_N': 256}, num_warps=4, num_stages=2),
+        triton.Config({'BLOCK_T': 32, 'BLOCK_N': 128}, num_warps=8, num_stages=3),
+        triton.Config({'BLOCK_T': 16, 'BLOCK_N': 64}, num_warps=4, num_stages=3),
+    ],
+    key=['T_val', 'N'],
+)
+@triton.jit
+def _token_reduce_kernel(
+    expert_out_ptr,
+    output_ptr,
+    scatter_map_ptr,
+    T_val: tl.constexpr,
+    N: tl.constexpr,
+    TOP_K: tl.constexpr,
+    stride_em, stride_en,
+    stride_ot, stride_on,
+    BLOCK_T: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    pid_t = (pid // num_pid_n) * BLOCK_T
+    pid_n = (pid % num_pid_n) * BLOCK_N
+    rt = pid_t + tl.arange(0, BLOCK_T)
+    rn = pid_n + tl.arange(0, BLOCK_N)
+    t_mask = rt < T_val
+    n_mask = rn < N
+    acc = tl.zeros((BLOCK_T, BLOCK_N), dtype=tl.float32)
+    for k in tl.static_range(TOP_K):
+        pos_idx = rt * TOP_K + k
+        pos = tl.load(scatter_map_ptr + pos_idx, mask=t_mask, other=-1)
+        valid_pos = (pos >= 0) & t_mask
+        load_mask = valid_pos[:, None] & n_mask[None, :]
+        e_ptrs = expert_out_ptr + pos[:, None] * stride_em + rn[None, :] * stride_en
+        vals = tl.load(e_ptrs, mask=load_mask, other=0.0, eviction_policy='evict_first')
+        acc += vals
+    o_ptrs = output_ptr + rt[:, None] * stride_ot + rn[None, :] * stride_on
+    tl.store(o_ptrs, acc.to(tl.bfloat16), mask=(t_mask[:, None] & n_mask[None, :]), eviction_policy='evict_first')
+
+
 _buf_cache = {}
 _cute_gemm1_buf_cache = {}
 _routing_cache = {}
@@ -300,7 +430,7 @@ def kernel(
         intermediate, expert_out = _buf_cache[buf_key]
     else:
         intermediate = torch.empty((max_padded, I_SIZE), dtype=torch.float16, device=device)
-        expert_out = torch.empty((max_padded, H), dtype=T11948_CUTE_GEMM2_EXPERT_OUT_DTYPE, device=device)
+        expert_out = torch.empty((max_padded, H), dtype=CUTE_GEMM2_EXPERT_OUT_DTYPE, device=device)
         _buf_cache[buf_key] = (intermediate, expert_out)
 
     cute_gemm1_key = (T, block_m, CUTE_GEMM1_RAW_DTYPE)
@@ -354,29 +484,64 @@ def kernel(
         num_warps=8,
     )
 
-    _cute_gemm2_mma_runtime.run_cute_gemm2_mma(
-        intermediate,
-        gemm2_weights,
-        gemm2_weights_scale,
-        expert_out,
-        block_offsets,
-        T,
-        block_m,
-        block_offsets_host=block_offsets_host,
-    )
+    if T in CUTE_GEMM2_TS:
+        # Full CuTe path: CuTe GEMM2 + weighted token reduce
+        _cute_gemm2_mma_runtime.run_cute_gemm2_mma(
+            intermediate,
+            gemm2_weights,
+            gemm2_weights_scale,
+            expert_out,
+            block_offsets,
+            T,
+            block_m,
+            block_offsets_host=block_offsets_host,
+        )
 
-    grid_weighted = lambda META: (triton.cdiv(T, META['BLOCK_T']) * triton.cdiv(H, META['BLOCK_N']),)
-    _token_reduce_weighted_kernel[grid_weighted](
-        expert_out_ptr=expert_out,
-        output_ptr=output,
-        scatter_map_ptr=scatter_map,
-        token_weights_ptr=sorted_weights,
-        T_val=T,
-        N=H,
-        TOP_K=TOP_K,
-        stride_em=expert_out.stride(0),
-        stride_en=expert_out.stride(1),
-        stride_ot=output.stride(0),
-        stride_on=output.stride(1),
-    )
+        grid_weighted = lambda META: (triton.cdiv(T, META['BLOCK_T']) * triton.cdiv(H, META['BLOCK_N']),)
+        _token_reduce_weighted_kernel[grid_weighted](
+            expert_out_ptr=expert_out,
+            output_ptr=output,
+            scatter_map_ptr=scatter_map,
+            token_weights_ptr=sorted_weights,
+            T_val=T,
+            N=H,
+            TOP_K=TOP_K,
+            stride_em=expert_out.stride(0),
+            stride_en=expert_out.stride(1),
+            stride_ot=output.stride(0),
+            stride_on=output.stride(1),
+        )
+    else:
+        # Hybrid path: Triton GEMM2 (FP8 B + post-dot scale) + simple reduce
+        grid2 = lambda META: (exact_pid_m * triton.cdiv(H, META['BLOCK_N']),)
+        _triton_gemm2_kernel[grid2](
+            A_ptr=intermediate,
+            B_ptr=gemm2_weights,
+            C_ptr=expert_out,
+            B_scale_ptr=gemm2_weights_scale,
+            token_weights_ptr=sorted_weights,
+            block_offsets_ptr=block_offsets,
+            total_blocks_ptr=total_blocks,
+            MAX_PID_M=exact_pid_m, N=H, K=I_SIZE,
+            stride_am=intermediate.stride(0), stride_ak=intermediate.stride(1),
+            stride_be=gemm2_weights.stride(0), stride_bn=gemm2_weights.stride(1), stride_bk=gemm2_weights.stride(2),
+            stride_cm=expert_out.stride(0), stride_cn=expert_out.stride(1),
+            stride_bse=gemm2_weights_scale.stride(0), stride_bsn=gemm2_weights_scale.stride(1), stride_bsk=gemm2_weights_scale.stride(2),
+            E_LOCAL=E_LOCAL,
+            BLOCK_M=block_m,
+        )
+
+        grid3 = lambda META: (triton.cdiv(T, META['BLOCK_T']) * triton.cdiv(H, META['BLOCK_N']),)
+        _token_reduce_kernel[grid3](
+            expert_out_ptr=expert_out,
+            output_ptr=output,
+            scatter_map_ptr=scatter_map,
+            T_val=T,
+            N=H,
+            TOP_K=TOP_K,
+            stride_em=expert_out.stride(0),
+            stride_en=expert_out.stride(1),
+            stride_ot=output.stride(0),
+            stride_on=output.stride(1),
+        )
     return output

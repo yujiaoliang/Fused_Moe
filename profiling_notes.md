@@ -4,10 +4,9 @@
 > **硬件:** NVIDIA B200 (Blackwell, sm100a)  
 > **峰值性能:** FP8 ~2500 TFLOPS, TF32 ~1250 TFLOPS, HBM3e ~8 TB/s
 
-> **当前最新版本:** FP16 Intermediate Optimization (post `c35907d`)  
-> **当前 Modal 可复现口径:** peak ~66x, mean ~47x  
-> **历史最佳 (Round 15, `d2fdf14`):** Peak 106.65x, Mean 55.77x, GMean 47.54x  
-> ⚠️ 绝对 speedup 数值受 Modal 环境漂移影响，同代码不同时段可差 20-30%
+> **当前最新版本:** CuTe DSL Precision Fix (Round 18, 2026-04-18)  
+> **当前 Modal 可复现口径:** 19/19 PASSED, peak ~71x, mean ~45x  
+> **CuTe 路径:** T=11948 full CuTe (13.3x), T=14107 Pure Triton fallback (22.4x)  
 
 ---
 
@@ -1416,3 +1415,68 @@ bf16 expert_out 节省 50% 写带宽 ([MAX_PADDED, 7168] buffer)。大 T workloa
 bf16 expert_out 是唯一确认正向的优化 (+0.4% mean, +2.5% 最大 T)，已保留。
 
 后续优化需要**算法级**或**架构级**变化，而非 autotune config 搜索。
+
+---
+
+## 16. Round 18: CuTe DSL Precision Investigation (2026-04-18)
+
+### 背景
+
+CuTe DSL grouped GEMM (T=11948, T=14107) 在队友的 fallback 后精度失败 (18/19)。T=14107 (`58a34f27`) 始终 `INCORRECT_NUMERICAL`。
+
+### 基础设施修复
+
+恢复 hybrid CuTe/Triton 基础设施时发现 4 个 bug：
+1. **NameError** — `triton_impl.py` 引用 `T11948_CUTE_GEMM2_EXPERT_OUT_DTYPE`（已改名），修复为 `CUTE_GEMM2_EXPERT_OUT_DTYPE`
+2. **路由丢失** — `kernel.py` `_CUTE_TARGET_BLOCK_M` 缺少 T=11948
+3. **TARGET_TS 不同步** — `cute_gemm1_mma.py` / `cute_gemm2_mma.py` 的 TARGET_TS/TARGET_BLOCK_M 缺少 T=11948
+4. **solution.json 过期** — 重新打包
+
+### 精度实验（5 轮）
+
+| 实验 | 方案 | T=14107 abs_err | 通过？ |
+|------|------|----------------|--------|
+| R1 | 原始 (BF16 GEMM1/2 out) | 1.54e+06 | ❌ |
+| R2 | FP16 GEMM1 output | 1.37e+06 | ❌ (-10%) |
+| R3 | + FP32 GEMM2 output | 1.46e+06 | ❌ (无效) |
+| R4 | CuTe GEMM1 + **Triton GEMM2** (post-dot scale) | 1.69e+06 | ❌ (更差!) |
+| R5 | **Pure Triton** (fallback) | 4.98e+05 | ✅ |
+
+### 根因分析
+
+CuTe DSL grouped GEMM 要求 A 和 B 都预解量化到 FP16：`(fp8 * block_scale).half()`。
+
+**纯 Triton 方式：** A 和 B 保持 FP8（lossless cast to FP16），block scale 在 FP32 post-dot 阶段才乘入：
+```python
+partial = tl.dot(A_fp8.to(fp16), B_fp8.to(fp16))
+acc += partial * (a_scale * b_scale)  # FP32 精度
+```
+
+**CuTe 方式：** A 和 B 的 block scale 在 GEMM 前就烘焙进 FP16：
+```python
+A_fp16 = (fp8_a * a_scale).half()  # FP16 rounding
+B_fp16 = (fp8_b * b_scale).half()  # FP16 rounding
+C = CuTe_GEMM(A_fp16, B_fp16)     # 双边 rounding error 累积
+```
+
+GEMM1 有 K=7168（56 个 K-blocks），双边 FP16 预解量化在 dot product 中累积的 rounding error 约 1.37e+06。
+这是 **FP16 mantissa (10-bit) 的物理限制**，与代码无关。
+
+**关键证据：** 实验 R4（CuTe GEMM1 + Triton GEMM2）的误差反而更大（1.69e+06 > 1.37e+06），证明 **GEMM1 的 A-side 预解量化是主要误差源**，不是 GEMM2。
+
+**合成数据验证：** 在合成 T=14107 数据上，CuTe vs Pure Triton 的 abs_err = 0（完美一致）。证明代码没有 bug，仅是真实 trace 的权重 scale 分布触发了 FP16 精度瓶颈。
+
+### 最终决策
+
+| T | 路径 | Speedup | abs_err |
+|---|------|---------|---------|
+| 11948 | CuTe DSL (full) | 13.3x | 5.65e+05 ✅ |
+| 14107 | Pure Triton (fallback) | 22.4x | 4.98e+05 ✅ |
+
+### 后续可探索方向
+
+要让 T=14107 也走 CuTe，需要以下**架构级**变化之一：
+1. **FP8 原生 CuTe GEMM** — 修改 `cute_grouped_gemm_sm100.py` (~1600 行) 的 K-loop，保持 FP8 输入并在 MMA tile 级别做 FP32 post-dot scale
+2. **TF32 MMA** — 将 CuTe DSL 改为 TF32×TF32 MMA（23-bit mantissa 消除预解量化精度问题），但可能需要 CUTLASS DSL 原生支持
+3. **Per-K-block 分解** — 拆成 K_blocks 个独立 CuTe GEMMs 并逐块应用 scale，但 K_per_block=128 太小导致 MMA 利用率不足
+

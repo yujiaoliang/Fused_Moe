@@ -3,9 +3,8 @@
 > **赛道:** Track A — Fused MoE
 > **硬件:** NVIDIA B200 (Blackwell, sm100a)
 > **架构:** Hybrid CuTe DSL + Pure Triton dispatch
-> **状态:** ✅ 18/19 PASSED (T=14107 CuTe GEMM 精度 bug 修复中)
-> **最新 AB test (Modal B200, 官方镜像):** mean 48.71x, peak 69.98x
-> **大 T 加速:** 5e8dc11c (T=11948) 13.04x → **20.80x** (+59.6%)
+> **状态:** ✅ 19/19 PASSED
+> **最新 Modal B200 full19 (官方镜像):** mean ~45x, peak ~71x, T=11948 CuTe 13.3x, T=14107 Pure Triton 22.4x
 
 > ⚠️ **关于绝对 speedup 数值**：Modal B200 共享实例无锁频，同一代码不同时段的 speedup 可波动 20-30%。
 > 官方评测在裸金属 B200 + 锁频 (`nvidia-smi -ac 3996,1965`) 下运行，结果更稳定。
@@ -71,8 +70,8 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 
 | 条件 | 路径 | BLOCK_M | GEMM Kernel |
 |------|------|---------|-------------|
-| **T=11948** | **CuTe DSL grouped GEMM** | 128 | `cute_gemm1_mma` + `cute_gemm2_mma` |
-| **T=14107** | **CuTe DSL grouped GEMM** | 128 | 同上 (⚠️ 精度 bug 修复中) |
+| **T=11948** | **CuTe DSL grouped GEMM** | 128 | `cute_gemm1_mma` + `cute_gemm2_mma` (full CuTe) |
+| **T=14107** | **Pure Triton** | 128 | 标准 large-T Triton 路径 (CuTe FP16 预解量化精度不足) |
 | T=1 | Pure Triton | 16 | `_t1_*` 专用路径 |
 | 32 ≤ T ≤ 64 | Pure Triton | 32 | `_small_medium_*` |
 | 65 ≤ T ≤ 128 | Pure Triton | 32/64 | `_medium_*` |
