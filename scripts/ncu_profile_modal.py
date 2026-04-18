@@ -20,9 +20,12 @@ app = modal.App("moe-ncu-profile")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 VOLUME_MOUNT = "/data"
 
+# Use the OFFICIAL evaluation Docker image
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:20260401-2c675fb")
+    .entrypoint([])
+    .pip_install("flashinfer-bench")
+    .env({"CUDA_HOME": "/usr/local/cuda"})
 )
 
 

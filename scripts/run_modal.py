@@ -28,10 +28,11 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 VOLUME_MOUNT = "/data"
 TRACE_SET_PATH = "/data/mlsys26-contest"
 
+
+# Use the OFFICIAL evaluation Docker image (pinned, not :latest)
 image = (
-    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:latest", add_python="3.12")
+    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:20260401-2c675fb")
     .entrypoint([])
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
     .env({"CUDA_HOME": "/usr/local/cuda"})
 )
 
@@ -40,7 +41,11 @@ image = (
 def run_benchmark(solution_json: str, config: dict | None = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
-        config_obj = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+        # Match official evaluation CLI: --atol 1 --rtol 0.3 --required-matched-ratio 0.9
+        config_obj = BenchmarkConfig(
+            warmup_runs=3, iterations=100, num_trials=5,
+            atol=1.0, rtol=0.3, required_matched_ratio=0.9,
+        )
     else:
         config_obj = BenchmarkConfig(**config)
 

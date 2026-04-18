@@ -15,9 +15,12 @@ trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True
 VOLUME_MOUNT = "/data"
 TRACE_SET_PATH = "/data/mlsys26-contest"
 
+# Use the OFFICIAL evaluation Docker image
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "ninja")
+    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:20260401-2c675fb")
+    .entrypoint([])
+    .pip_install("flashinfer-bench")
+    .env({"CUDA_HOME": "/usr/local/cuda"})
 )
 
 
@@ -47,7 +50,11 @@ def run_test(solution_json: str) -> str:
     log(f"Definition: {def_name}")
     log(f"Workloads: {len(workloads)}")
 
-    config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
+    # Match official evaluation CLI: --atol 1 --rtol 0.3 --required-matched-ratio 0.9
+    config = BenchmarkConfig(
+        warmup_runs=3, iterations=100, num_trials=5,
+        atol=1.0, rtol=0.3, required_matched_ratio=0.9,
+    )
 
     bench_ts = TraceSet(
         root=ts.root,

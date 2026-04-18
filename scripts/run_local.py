@@ -32,7 +32,12 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     if config is None:
         import os
         log_dir = os.path.join(os.getcwd(), "worker_logs")
-        config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5, log_dir=log_dir, use_isolated_runner=True)
+        # Match official evaluation CLI: --atol 1 --rtol 0.3 --required-matched-ratio 0.9
+        config = BenchmarkConfig(
+            warmup_runs=3, iterations=100, num_trials=5,
+            log_dir=log_dir, use_isolated_runner=True,
+            atol=1.0, rtol=0.3, required_matched_ratio=0.9,
+        )
 
     trace_set_path = get_trace_set_path()
     trace_set = TraceSet.from_path(trace_set_path)
