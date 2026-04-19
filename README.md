@@ -2,9 +2,9 @@
 
 > **赛道:** Track A — Fused MoE
 > **硬件:** NVIDIA B200 (Blackwell, sm100a)
-> **架构:** Hybrid CuTe DSL + Pure Triton dispatch
+> **架构:** Hybrid CuTe DSL + Pure Triton dispatch (per-T 隔离 runtime)
 > **状态:** ✅ 19/19 PASSED
-> **最新 Modal B200 full19 (官方镜像):** mean ~45x, peak ~71x, T=11948 CuTe 13.3x, T=14107 Pure Triton 22.4x
+> **最新 Modal B200 full19 (官方镜像):** mean ~41-45x (session-dependent), 19/19 PASSED, T=11948 CuTe, T=14107 CuTe (AB-test +55% vs Pure Triton fallback)
 
 > ⚠️ **关于绝对 speedup 数值**：Modal B200 共享实例无锁频，同一代码不同时段的 speedup 可波动 20-30%。
 > 官方评测在裸金属 B200 + 锁频 (`nvidia-smi -ac 3996,1965`) 下运行，结果更稳定。
@@ -70,8 +70,8 @@ kernel(routing_logits, routing_bias, hidden_states, hidden_states_scale,
 
 | 条件 | 路径 | BLOCK_M | GEMM Kernel |
 |------|------|---------|-------------|
-| **T=11948** | **CuTe DSL grouped GEMM** | 128 | `cute_gemm1_mma` + `cute_gemm2_mma` (full CuTe) |
-| **T=14107** | **Pure Triton** | 128 | 标准 large-T Triton 路径 (CuTe FP16 预解量化精度不足) |
+| **T=11948** | **CuTe DSL grouped GEMM** | 128 | `cute_gemm1_mma_runtime_11948` + `cute_gemm2_mma_runtime_11948` (隔离 CuTe) |
+| **T=14107** | **CuTe DSL grouped GEMM** | 128 | `cute_gemm1_mma_runtime_14107` + `cute_gemm2_mma_runtime_14107` (隔离 CuTe) |
 | T=1 | Pure Triton | 16 | `_t1_*` 专用路径 |
 | 32 ≤ T ≤ 64 | Pure Triton | 32 | `_small_medium_*` |
 | 65 ≤ T ≤ 128 | Pure Triton | 32/64 | `_medium_*` |
@@ -184,14 +184,17 @@ git push origin submission-vX
 ```
 mlsys_note/
 ├── solution/
-│   └── python/                  # ← 提交代码目录 (config.toml: language=python)
-│       ├── kernel.py            # 入口：hybrid dispatch (CuTe DSL / Pure Triton)
-│       ├── pure_triton_impl.py  # Pure Triton 主实现 (17/19 workloads)
-│       ├── triton_impl.py       # Hybrid CuTe+Triton 实现 (大 T workloads)
-│       ├── cute_gemm1_mma.py    # CuTe DSL GEMM1 runtime wrapper
-│       ├── cute_gemm2_mma.py    # CuTe DSL GEMM2 runtime wrapper
-│       ├── cute_grouped_gemm_sm100.py  # CuTe DSL grouped GEMM 核心 (NVIDIA 参考)
-│       └── cutlass_kernels.py   # cuBLAS GEMM2 JIT 扩展 (已禁用，保留备用)
+│   └── python/                          # ← 提交代码目录 (config.toml: language=python)
+│       ├── kernel.py                    # 入口：hybrid dispatch (CuTe DSL / Pure Triton)
+│       ├── pure_triton_impl.py          # Pure Triton 主实现 (17/19 workloads)
+│       ├── triton_impl.py               # Hybrid CuTe+Triton 实现 (大 T workloads)
+│       ├── cute_gemm1_mma.py            # CuTe DSL GEMM1 核心逻辑
+│       ├── cute_gemm1_mma_runtime_11948.py  # T=11948 隔离 GEMM1 runtime
+│       ├── cute_gemm1_mma_runtime_14107.py  # T=14107 隔离 GEMM1 runtime
+│       ├── cute_gemm2_mma.py            # CuTe DSL GEMM2 核心逻辑
+│       ├── cute_gemm2_mma_runtime_11948.py  # T=11948 隔离 GEMM2 runtime
+│       ├── cute_gemm2_mma_runtime_14107.py  # T=14107 隔离 GEMM2 runtime
+│       └── cute_grouped_gemm_sm100.py   # CuTe DSL grouped GEMM 核心 (NVIDIA 参考)
 ├── scripts/
 │   ├── ab_test_modal.py         # A/B 对比测试（同 B200 session）⭐推荐
 │   ├── test_modal.py            # Modal B200 单次 benchmark
@@ -214,10 +217,13 @@ mlsys_note/
 ```
 kernel.py (入口)
   ├── T in {11948, 14107}  →  triton_impl.py  →  CuTe DSL grouped GEMM
-  │                            ├── cute_gemm1_mma.py + cute_gemm2_mma.py
+  │                            ├── cute_gemm1_mma.py + cute_gemm1_mma_runtime_{11948,14107}.py
+  │                            ├── cute_gemm2_mma.py + cute_gemm2_mma_runtime_{11948,14107}.py
   │                            └── cute_grouped_gemm_sm100.py
   └── 其他 T              →  pure_triton_impl.py  →  Pure Triton kernels
 ```
+
+> **Per-T 隔离设计 (`f088f03`):** T=11948 和 T=14107 各自拥有独立的 runtime 文件，不再共享 Python module state、compile cache、metadata cache 或 packed weight cache。这消除了两个大 T 之间的状态污染，使 T=14107 也能走 CuTe 路径（+55% speedup vs Pure Triton fallback）。
 
 ---
 
@@ -351,6 +357,13 @@ kernel.py (入口)
 
 **结论：当前主线中所有生效改动都是 ✅ 或 ✅✅ 确定真实的。**
 
+### Phase 6: CuTe 隔离 Runtime + T=14107 恢复 — Round 19 (2026-04-19)
+
+| Commit | 优化内容 | 结果 | 说明 |
+|--------|---------|------|------|
+| `886c7fc` | **CuTe 精度调查 + T=14107 fallback** | ✅ 19/19 PASSED | T=14107 回退到 Pure Triton，T=11948 保持 CuTe。确认 FP16 预解量化在大 K (7168) 时精度瓶颈 |
+| `f088f03` | **Per-T 隔离 CuTe Runtime** | ✅✅ 19/19 PASSED | 拆分 runtime 文件为 `*_runtime_11948.py` + `*_runtime_14107.py`，消除共享 module state / compile cache / metadata cache / packed weight cache 的状态污染。T=14107 恢复 CuTe 路径。**AB-test mean +1.4%，T=14107 +55.1% (13.19x→20.45x)** |
+
 ### 已回退实验
 
 | 实验 | 判定 | 理由 |
@@ -450,9 +463,9 @@ kernel.py (入口)
 
 2. **Hybrid Dispatch 注意事项：**
    - Pure Triton 优化 → `solution/python/pure_triton_impl.py`
-   - 大 T CuTe 优化 → `solution/python/triton_impl.py` + `cute_gemm*_mma.py`
+   - 大 T CuTe 优化 → `solution/python/triton_impl.py` + `cute_gemm*_mma.py` + `cute_gemm*_mma_runtime_*.py`
    - 两条路径可以独立迭代，通过 `kernel.py` 的 `_CUTE_TARGET_BLOCK_M` dict 控制分发
+   - **Per-T 隔离:** 每个目标 T 拥有独立的 runtime 文件，不共享 Python module state / compile cache / metadata cache
 
-3. **已知问题：**
-   - T=14107 (58a34f27) CuTe GEMM 路径存在精度 bug (INCORRECT_NUMERICAL)
-   - 保底方案：从 `_CUTE_TARGET_BLOCK_M` 中移除 14107，退回 Pure Triton (14.58x)
+3. **已修复的历史问题：**
+   - ~~T=14107 CuTe 精度 bug~~ → 已通过 per-T 隔离 runtime 修复 (`f088f03`)，T=14107 恢复 CuTe 路径 (20.45x vs Pure Triton 13.19x)

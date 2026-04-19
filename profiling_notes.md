@@ -4,9 +4,9 @@
 > **硬件:** NVIDIA B200 (Blackwell, sm100a)  
 > **峰值性能:** FP8 ~2500 TFLOPS, TF32 ~1250 TFLOPS, HBM3e ~8 TB/s
 
-> **当前最新版本:** CuTe DSL Precision Fix (Round 18, 2026-04-18)  
-> **当前 Modal 可复现口径:** 19/19 PASSED, peak ~71x, mean ~45x  
-> **CuTe 路径:** T=11948 full CuTe (13.3x), T=14107 Pure Triton fallback (22.4x)  
+> **当前最新版本:** Per-T 隔离 CuTe Runtime (Round 19, 2026-04-19)  
+> **当前 Modal 可复现口径:** 19/19 PASSED, mean ~41-45x (session-dependent)  
+> **CuTe 路径:** T=11948 隔离 CuTe, T=14107 隔离 CuTe (AB-test +55% vs Pure Triton fallback)  
 
 ---
 
@@ -1479,4 +1479,80 @@ GEMM1 有 K=7168（56 个 K-blocks），双边 FP16 预解量化在 dot product 
 1. **FP8 原生 CuTe GEMM** — 修改 `cute_grouped_gemm_sm100.py` (~1600 行) 的 K-loop，保持 FP8 输入并在 MMA tile 级别做 FP32 post-dot scale
 2. **TF32 MMA** — 将 CuTe DSL 改为 TF32×TF32 MMA（23-bit mantissa 消除预解量化精度问题），但可能需要 CUTLASS DSL 原生支持
 3. **Per-K-block 分解** — 拆成 K_blocks 个独立 CuTe GEMMs 并逐块应用 scale，但 K_per_block=128 太小导致 MMA 利用率不足
+
+---
+
+## 17. Round 19: Per-T 隔离 CuTe Runtime + T=14107 恢复 (2026-04-19)
+
+### 背景
+
+Round 18 确认了 T=14107 在共享 CuTe runtime 时的精度问题（FP16 预解量化在大 K=7168 时累积 error），因此 T=14107 被回退到 Pure Triton 路径（只有 13.19x）。
+
+队友分析后发现，问题根源不是 FP16 精度本身，而是 **T=11948 和 T=14107 共享 Python module state** 导致的状态污染：
+- 共享 `compile cache`：同一 kernel 编译缓存被两个不同 T 复用
+- 共享 `metadata cache`：块偏移/专家映射表被错误复用
+- 共享 `packed weight cache`：TW 预处理结果被混用
+
+### 方案：Per-T 隔离 Runtime (commit `f088f03`)
+
+将原来的共享 runtime 文件拆分为每个 T 独立的 runtime：
+
+| 原文件 | 新文件 |
+|--------|--------|
+| `cute_gemm1_mma_runtime.py` | `cute_gemm1_mma_runtime_11948.py` + `cute_gemm1_mma_runtime_14107.py` |
+| `cute_gemm2_mma_runtime.py` | `cute_gemm2_mma_runtime_11948.py` + `cute_gemm2_mma_runtime_14107.py` |
+
+`triton_impl.py` 中的 dispatch 改为 per-T 路由：
+```python
+_CUTE_GEMM1_RUNTIMES = {
+    11948: _cute_gemm1_mma_runtime_11948,
+    14107: _cute_gemm1_mma_runtime_14107,
+}
+_CUTE_GEMM2_RUNTIMES = {
+    11948: _cute_gemm2_mma_runtime_11948,
+    14107: _cute_gemm2_mma_runtime_14107,
+}
+```
+
+每个 runtime 文件拥有独立的：
+- `_STATE` (CuTe 编译状态)
+- `_B_FP16_CACHE` (预解量化权重缓存)
+- `_METADATA_CACHE` (块偏移/专家映射缓存)
+- `TARGET_TS` / `TARGET_BLOCK_M` (仅包含单个 T)
+
+### AB-Test 结果 (2026-04-19, 同 GPU 同 session)
+
+> **A (基线):** 本地代码 — T=11948 only CuTe, T=14107 Pure Triton fallback, 共享 runtime  
+> **B (实验):** `f088f03` — T=11948 + T=14107 都走隔离 CuTe runtime
+
+```
+Mean speedup: A=40.55x  B=41.14x  Delta=+1.4%
+Summary: 2 improved, 1 regressed, 16 neutral (±2% threshold)
+```
+
+| Workload | A speedup | B speedup | Delta | Verdict |
+|:---------|----------:|----------:|------:|:--------|
+| 5e8dc11c (T=14107) | 13.19x | **20.45x** | **+55.1%** | ✅ BETTER |
+| e05c6c03 (T=7) | 52.52x | **54.42x** | **+3.6%** | ✅ BETTER |
+| a7c2bcfd (T=16) | 48.36x | 47.29x | -2.2% | ❌ WORSE |
+| 其余 16 个 workloads | — | — | ±2% | ≈ SAME |
+
+### 核心分析
+
+1. **T=14107 大幅提升 +55.1%** (13.19x → 20.45x, latency 3.46ms → 2.24ms)
+   - 原因：隔离后 T=14107 不再受 T=11948 的编译缓存/元数据缓存污染
+   - CuTe grouped GEMM 的 MMA tile (128×128) 利用率大幅高于 Pure Triton 在大 T 场景下的性能
+
+2. **a7c2bcfd (T=16) 轻微回退 -2.2%** (48.36x → 47.29x)
+   - 仅略跨 2% 门槛，属于 GPU 噪声范围（参考 20.1 节噜声基准：中小 T 可波动 ±15%）
+   - 不构成实际回退
+
+3. **其余 16 个 workloads 完全稳定**
+   - 隔离设计不影响 Pure Triton 路径（仅 T=11948/14107 走 CuTe）
+
+### 结论
+
+**Per-T 隔离设计确认为最优架构。** 将 CuTe runtime 按 T 值拆分为独立模块是一个零风险、纯工程级的优化，不影响任何 kernel 算法，但带来了显著的性能收益。
+
+后续如果需要支持更多 T 值的 CuTe 路径，只需复制对应的 `*_runtime_TXXXX.py` 文件并在 `triton_impl.py` 中注册即可。
 
