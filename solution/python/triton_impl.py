@@ -23,13 +23,21 @@ def _load_local_module(module_name: str, local_name: str):
 
 
 _pure = _load_local_module("hybrid_pure_triton_impl", "pure_triton_impl.py")
-_cute_gemm2_mma_runtime = _load_local_module(
-    "hybrid_cute_gemm2_mma_runtime",
-    "cute_gemm2_mma_runtime.py",
+_cute_gemm1_mma_runtime_11948 = _load_local_module(
+    "hybrid_cute_gemm1_mma_runtime_11948",
+    "cute_gemm1_mma_runtime_11948.py",
 )
-_cute_gemm1_mma_runtime = _load_local_module(
-    "hybrid_cute_gemm1_mma_runtime",
-    "cute_gemm1_mma_runtime.py",
+_cute_gemm1_mma_runtime_14107 = _load_local_module(
+    "hybrid_cute_gemm1_mma_runtime_14107",
+    "cute_gemm1_mma_runtime_14107.py",
+)
+_cute_gemm2_mma_runtime_11948 = _load_local_module(
+    "hybrid_cute_gemm2_mma_runtime_11948",
+    "cute_gemm2_mma_runtime_11948.py",
+)
+_cute_gemm2_mma_runtime_14107 = _load_local_module(
+    "hybrid_cute_gemm2_mma_runtime_14107",
+    "cute_gemm2_mma_runtime_14107.py",
 )
 
 H = 7168
@@ -39,12 +47,21 @@ TOP_K = 8
 SORT_BLOCK_ITEMS = 256
 TOKEN_SCATTER_BLOCK_TOKENS = 8
 BLOCK_M = 128
-TARGET_TS = (11948,)
-TARGET_BLOCK_M = {11948: BLOCK_M}
+TARGET_TS = (11948, 14107)
+TARGET_BLOCK_M = {11948: BLOCK_M, 14107: BLOCK_M}
 # T values that use CuTe for GEMM2 (others use Triton GEMM2 for precision)
-CUTE_GEMM2_TS = {11948}
+CUTE_GEMM2_TS = {11948, 14107}
 CUTE_GEMM1_RAW_DTYPE = torch.float16
 CUTE_GEMM2_EXPERT_OUT_DTYPE = torch.bfloat16
+
+_CUTE_GEMM1_RUNTIMES = {
+    11948: _cute_gemm1_mma_runtime_11948,
+    14107: _cute_gemm1_mma_runtime_14107,
+}
+_CUTE_GEMM2_RUNTIMES = {
+    11948: _cute_gemm2_mma_runtime_11948,
+    14107: _cute_gemm2_mma_runtime_14107,
+}
 
 
 @triton.jit
@@ -346,6 +363,8 @@ def kernel(
         raise ValueError(f"hybrid CuTe path only supports T in {TARGET_TS}, got {T}")
     if _pure._select_block_m(T * TOP_K) != block_m:
         raise ValueError(f"hybrid CuTe path expects block_m={block_m} for T={T}")
+    cute_gemm1_runtime = _CUTE_GEMM1_RUNTIMES[T]
+    cute_gemm2_runtime = _CUTE_GEMM2_RUNTIMES[T] if T in CUTE_GEMM2_TS else None
 
     device = hidden_states.device
     local_start = _pure._cached_host_scalar(local_expert_offset, int)
@@ -460,7 +479,7 @@ def kernel(
         BLOCK_H=128,
         num_warps=8,
     )
-    _cute_gemm1_mma_runtime.run_cute_gemm1_mma(
+    cute_gemm1_runtime.run_cute_gemm1_mma(
         a_sorted_fp16,
         gemm1_weights,
         gemm1_weights_scale,
@@ -486,7 +505,7 @@ def kernel(
 
     if T in CUTE_GEMM2_TS:
         # Full CuTe path: CuTe GEMM2 + weighted token reduce
-        _cute_gemm2_mma_runtime.run_cute_gemm2_mma(
+        cute_gemm2_runtime.run_cute_gemm2_mma(
             intermediate,
             gemm2_weights,
             gemm2_weights_scale,

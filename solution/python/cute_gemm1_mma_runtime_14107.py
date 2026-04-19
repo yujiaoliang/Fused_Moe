@@ -9,7 +9,7 @@ if str(_THIS_DIR) not in sys.path:
 
 _CUTE_GEMM1_MOD = None
 _CUTE_GEMM1_ERROR = None
-_CUTE_GEMM1_TARGET_TS = (11948, 14107)
+_CUTE_GEMM1_TARGET_T = 14107
 _CUTE_GEMM1_BLOCK_M = 128
 
 
@@ -30,10 +30,10 @@ def _load_gemm1_module():
     if _CUTE_GEMM1_MOD is not None:
         return _CUTE_GEMM1_MOD
     if _CUTE_GEMM1_ERROR is not None:
-        raise RuntimeError(f"cached CuTe GEMM1 MMA failure: {_CUTE_GEMM1_ERROR!r}")
+        raise RuntimeError(f"cached CuTe GEMM1 MMA T=14107 failure: {_CUTE_GEMM1_ERROR!r}")
 
     try:
-        _CUTE_GEMM1_MOD = _load_local_module("hybrid_cute_gemm1_mma", "cute_gemm1_mma.py")
+        _CUTE_GEMM1_MOD = _load_local_module("hybrid_cute_gemm1_mma_t14107", "cute_gemm1_mma.py")
         return _CUTE_GEMM1_MOD
     except Exception as exc:
         _CUTE_GEMM1_ERROR = exc
@@ -41,8 +41,7 @@ def _load_gemm1_module():
 
 
 def should_use_cute_gemm1_mma(t: int, block_m: int) -> bool:
-    t = int(t)
-    if t not in _CUTE_GEMM1_TARGET_TS or int(block_m) != _CUTE_GEMM1_BLOCK_M:
+    if int(t) != _CUTE_GEMM1_TARGET_T or int(block_m) != _CUTE_GEMM1_BLOCK_M:
         return False
     if _CUTE_GEMM1_ERROR is not None:
         return False
@@ -60,7 +59,7 @@ def run_cute_gemm1_mma(
     block_offsets_host=None,
 ):
     if not should_use_cute_gemm1_mma(int(total_tokens), int(block_m)):
-        raise RuntimeError("CuTe GEMM1 MMA is not selected for this workload")
+        raise RuntimeError("CuTe GEMM1 MMA T=14107 runtime is not selected for this workload")
 
     mod = _load_gemm1_module()
     mod.run(

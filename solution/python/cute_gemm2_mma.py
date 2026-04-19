@@ -3,9 +3,9 @@ import os
 import torch
 
 
-_COMPILED = None
-_COMPILE_ERROR = None
-_STATE = None
+_COMPILED = {}
+_COMPILE_ERROR = {}
+_STATE = {}
 _B_FP16_CACHE = {}
 _METADATA_CACHE = {}
 
@@ -17,7 +17,6 @@ H = 7168
 I_SIZE = 2048
 E_LOCAL = 32
 TOP_K = 8
-MAX_PADDED = max(t * TOP_K + E_LOCAL * block_m for t, block_m in TARGET_BLOCK_M.items())
 EXPERT_OUT_DTYPE = torch.bfloat16
 
 
@@ -36,8 +35,9 @@ def _load_cute_stack():
     return cutlass, cute, cutlass_torch, utils, grouped_gemm
 
 
-def _get_b_fp16(gemm2_weights, gemm2_weights_scale):
+def _get_b_fp16(gemm2_weights, gemm2_weights_scale, total_tokens):
     key = (
+        int(total_tokens),
         str(gemm2_weights.device),
         int(gemm2_weights.data_ptr()),
         int(gemm2_weights_scale.data_ptr()),
@@ -52,6 +52,8 @@ def _get_b_fp16(gemm2_weights, gemm2_weights_scale):
         scale = gemm2_weights_scale[expert].repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
         pieces.append((gemm2_weights[expert].float() * scale).half())
     packed = torch.stack(pieces, dim=0).contiguous()
+    if len(_B_FP16_CACHE) > 4:
+        _B_FP16_CACHE.clear()
     _B_FP16_CACHE[key] = packed
     return packed
 
@@ -65,13 +67,14 @@ def _compute_total_num_clusters(problem_sizes_mnkl, cluster_tile_shape_mn):
     return total
 
 
-def _build_or_get_state():
+def _build_or_get_state(total_tokens):
     global _COMPILED, _COMPILE_ERROR, _STATE
 
-    if _COMPILED is not None:
-        return _STATE
-    if _COMPILE_ERROR is not None:
-        raise RuntimeError(f"cached CuTe grouped GEMM2 compile failure: {_COMPILE_ERROR!r}")
+    total_tokens = int(total_tokens)
+    if total_tokens in _COMPILED:
+        return _STATE[total_tokens]
+    if total_tokens in _COMPILE_ERROR:
+        raise RuntimeError(f"cached CuTe grouped GEMM2 compile failure for T={total_tokens}: {_COMPILE_ERROR[total_tokens]!r}")
 
     try:
         cutlass, cute, cutlass_torch, utils, grouped_gemm = _load_cute_stack()
@@ -132,12 +135,14 @@ def _build_or_get_state():
             utils.TensorMapUpdateMode.SMEM,
         )
         cluster_tile_shape_mn = mma_tiler_mn
-        total_num_clusters = ((MAX_PADDED + cluster_tile_shape_mn[0] - 1) // cluster_tile_shape_mn[0]) * (
+        block_m = TARGET_BLOCK_M[total_tokens]
+        max_padded = total_tokens * TOP_K + E_LOCAL * block_m
+        total_num_clusters = ((max_padded + cluster_tile_shape_mn[0] - 1) // cluster_tile_shape_mn[0]) * (
             (H + cluster_tile_shape_mn[1] - 1) // cluster_tile_shape_mn[1]
         )
         current_stream = cutlass_torch.default_stream()
 
-        _COMPILED = cute.compile(
+        compiled = cute.compile(
             gemm,
             initial_a,
             initial_b,
@@ -152,7 +157,7 @@ def _build_or_get_state():
             current_stream,
             options="--opt-level 3",
         )
-        _STATE = {
+        state = {
             "cutlass_torch": cutlass_torch,
             "initial_a": initial_a,
             "initial_b": initial_b,
@@ -166,9 +171,11 @@ def _build_or_get_state():
             "tensor_of_tensormap": tensor_of_tensormap,
             "current_stream": current_stream,
         }
-        return _STATE
+        _COMPILED[total_tokens] = compiled
+        _STATE[total_tokens] = state
+        return state
     except Exception as exc:
-        _COMPILE_ERROR = exc
+        _COMPILE_ERROR[total_tokens] = exc
         raise
 
 
@@ -179,6 +186,7 @@ def _update_group_metadata(
     expert_out,
     block_offsets,
     block_m,
+    total_tokens,
     block_offsets_host=None,
 ):
     offsets = block_offsets_host if block_offsets_host is not None else block_offsets.detach().cpu().tolist()
@@ -193,14 +201,13 @@ def _update_group_metadata(
         tuple(expert_out.stride()),
     )
 
-    meta_key = (
-        offset_key,
-        layout_key,
-    )
+    total_tokens = int(total_tokens)
+    meta_key = (total_tokens, offset_key, layout_key)
+    metadata_cache = _METADATA_CACHE.setdefault(total_tokens, {})
     if state.get("metadata_key") == meta_key:
         return
 
-    cached = _METADATA_CACHE.get(meta_key)
+    cached = metadata_cache.get(meta_key)
     if cached is not None:
         problems_t, strides_t, ptrs_t = cached
         state["problem_sizes_torch"].copy_(problems_t, non_blocking=True)
@@ -246,9 +253,9 @@ def _update_group_metadata(
     state["strides_torch"].copy_(strides_t, non_blocking=True)
     state["ptrs_torch"].copy_(ptrs_t, non_blocking=True)
     state["metadata_key"] = meta_key
-    if len(_METADATA_CACHE) > 8:
-        _METADATA_CACHE.clear()
-    _METADATA_CACHE[meta_key] = (problems_t, strides_t, ptrs_t)
+    if len(metadata_cache) > 8:
+        metadata_cache.clear()
+    metadata_cache[meta_key] = (problems_t, strides_t, ptrs_t)
 
 
 def run(
@@ -271,8 +278,9 @@ def run(
     if expert_out.dtype != EXPERT_OUT_DTYPE:
         raise TypeError(f"CuTe GEMM2 expects {EXPERT_OUT_DTYPE} expert_out, got {expert_out.dtype}")
 
-    state = _build_or_get_state()
-    b_fp16 = _get_b_fp16(gemm2_weights, gemm2_weights_scale)
+    total_tokens = int(total_tokens)
+    state = _build_or_get_state(total_tokens)
+    b_fp16 = _get_b_fp16(gemm2_weights, gemm2_weights_scale, int(total_tokens))
     _update_group_metadata(
         state,
         intermediate,
@@ -280,10 +288,11 @@ def run(
         expert_out,
         block_offsets,
         int(block_m),
+        total_tokens,
         block_offsets_host=block_offsets_host,
     )
 
-    _COMPILED(
+    _COMPILED[total_tokens](
         state["initial_a"],
         state["initial_b"],
         state["initial_c"],
