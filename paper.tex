@@ -19,7 +19,7 @@
 \title{\textbf{Fused MoE Inference on Blackwell:\\A Pure Triton Approach to DeepSeek-V3 Expert Dispatch}}
 
 \author{
-Jizhang (Janice) \\
+Jiayao Zhang, Yujiao Liang \\
 MLSys 2026 FlashInfer-Bench Challenge --- Track A
 }
 
@@ -79,10 +79,11 @@ Figure~\ref{fig:pipeline} shows the six-stage pipeline:
 
 \subsection{Runtime Dispatch}
 
-Workloads span three orders of magnitude, requiring a 4-level BLOCK\_M hierarchy (Table~\ref{tab:dispatch}).
+Workloads span three orders of magnitude, requiring a multi-level BLOCK\_M hierarchy (Table~\ref{tab:dispatch}).
 For $T{\ge}4096$, we read \texttt{total\_blocks} from sorting to launch with the exact grid size, avoiding ${\sim}30\%$ idle blocks.
+A $T{=}901$-specialized GEMM2 kernel further targets the 58\% GEMM2 bottleneck at that workload.
 
-\begin{table}[h]
+\begin{table}[t]
 \centering
 \small
 \caption{Runtime dispatch by token count.}
@@ -92,12 +93,11 @@ For $T{\ge}4096$, we read \texttt{total\_blocks} from sorting to launch with the
 Token range & BLOCK\_M & Kernel family \\
 \midrule
 $T{=}1$              & 16    & Fused T1 path \\
+$2 \le T \le 31$     & 16    & Small \\
 $32 \le T \le 64$    & 32    & Small-medium \\
 $65 \le T \le 128$   & 32/64 & Medium \\
-$T > 128$            & 64    & Generic \\
-$T{=}901$            & 64    & GEMM2-specialized \\
+$129 \le T \le 2048$ & 64    & Generic \\
 $T > 2048$           & 128   & Generic (large) \\
-$T \ge 4096$         & dyn.  & Exact dispatch \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -137,7 +137,7 @@ A/B: mean +4.5\% (13/19 improved).
 \subsection{Multi-Level Bucket Specialization}
 
 With $T{=}7$, each of 32 experts processes $<$1 token on average; with $T{=}14{,}107$, experts have hundreds.
-We deploy four BLOCK\_M tiers with dedicated kernel families, column-major tile dispatch (\texttt{GROUP\_M=32/64}) for L2 cache reuse on expert weights, and a $T{=}901$-specialized GEMM2 kernel targeting the 58\% GEMM2 bottleneck at that workload.
+We deploy dedicated kernel families per tier with column-major tile dispatch (\texttt{GROUP\_M=32/64}) for L2 cache reuse on expert weights, plus workload-specific kernel specializations (e.g., $T{=}901$ GEMM2).
 Impact: $88\times \to 106.65\times$.
 
 \subsection{bf16 Expert Output Buffer}
