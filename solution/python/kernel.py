@@ -20,10 +20,15 @@ _CUTE_TARGET_BLOCK_M = {
     11948: 128,
     14107: 128,
 }
+_T901_CUTE_TARGET_BLOCK_M = {
+    901: 64,
+}
 _PURE_TRITON_IMPL = None
 _HYBRID_TRITON_IMPL = None
+_T901_TRITON_IMPL = None
 _PURE_TRITON_ERROR = None
 _HYBRID_TRITON_ERROR = None
+_T901_TRITON_ERROR = None
 
 
 def _select_block_m(num_topk_tokens: int) -> int:
@@ -75,6 +80,20 @@ def _load_hybrid_triton_module():
         raise
 
 
+def _load_t901_triton_module():
+    global _T901_TRITON_IMPL, _T901_TRITON_ERROR
+    if _T901_TRITON_IMPL is not None:
+        return _T901_TRITON_IMPL
+    if _T901_TRITON_ERROR is not None:
+        raise RuntimeError(f"cached T=901 CuTe experiment load failure: {_T901_TRITON_ERROR!r}")
+    try:
+        _T901_TRITON_IMPL = _load_local_module("t901_triton_impl", "triton_impl_t901.py")
+        return _T901_TRITON_IMPL
+    except Exception as exc:
+        _T901_TRITON_ERROR = exc
+        raise
+
+
 def kernel(
     routing_logits,
     routing_bias,
@@ -89,6 +108,22 @@ def kernel(
     output=None,
 ):
     T = int(routing_logits.shape[0])
+    t901_block_m = _T901_CUTE_TARGET_BLOCK_M.get(T)
+    if t901_block_m is not None and _select_block_m(T * TOP_K) == t901_block_m:
+        return _load_t901_triton_module().kernel(
+            routing_logits,
+            routing_bias,
+            hidden_states,
+            hidden_states_scale,
+            gemm1_weights,
+            gemm1_weights_scale,
+            gemm2_weights,
+            gemm2_weights_scale,
+            local_expert_offset,
+            routed_scaling_factor,
+            output,
+        )
+
     cute_block_m = _CUTE_TARGET_BLOCK_M.get(T)
     if cute_block_m is not None and _select_block_m(T * TOP_K) == cute_block_m:
         return _load_hybrid_triton_module().kernel(

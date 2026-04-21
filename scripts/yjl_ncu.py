@@ -43,7 +43,7 @@ def _parse_target_t_values():
 
 
 TARGET_T_VALUES = _parse_target_t_values()
-BIG_T_EXPERIMENT_VALUES = [11948, 14107]
+DEFAULT_EXPERIMENT_T_VALUES = [901, 11948, 14107]
 
 
 def _is_modal_return_channel_error(exc: Exception) -> bool:
@@ -684,8 +684,8 @@ def run_profile(solution_json: str, remote_report_path: str = REMOTE_REPORT_PATH
         run_t_values = [t for t in run_t_values if t in TARGET_T_VALUES]
         log(f"Filtered target T values: {run_t_values}")
     else:
-        run_t_values = [t for t in run_t_values if t in BIG_T_EXPERIMENT_VALUES]
-        log(f"No target T filter; profiling big-T experiment values only: {run_t_values}")
+        run_t_values = [t for t in run_t_values if t in DEFAULT_EXPERIMENT_T_VALUES]
+        log(f"No target T filter; profiling selected experiment values only: {run_t_values}")
 
     for t in run_t_values:
         log("")
