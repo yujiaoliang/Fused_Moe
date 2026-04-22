@@ -43,7 +43,7 @@ def _parse_target_t_values():
 
 
 TARGET_T_VALUES = _parse_target_t_values()
-BIG_T_EXPERIMENT_VALUES = [11948, 14107]
+DEFAULT_EXPERIMENT_T_VALUES = [14,901, 11948, 14107]
 
 
 def _is_modal_return_channel_error(exc: Exception) -> bool:
@@ -59,10 +59,9 @@ def _is_modal_return_channel_error(exc: Exception) -> bool:
     return any(marker in msg for marker in markers)
 
 image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
+    modal.Image.from_registry("flashinfer/flashinfer-ci-cu132:20260401-2c675fb")
     .entrypoint([])
-    .apt_install("build-essential", "ninja-build")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .pip_install("flashinfer-bench")
     .env(
         {
             "CUDA_HOME": "/usr/local/cuda",
@@ -684,8 +683,8 @@ def run_profile(solution_json: str, remote_report_path: str = REMOTE_REPORT_PATH
         run_t_values = [t for t in run_t_values if t in TARGET_T_VALUES]
         log(f"Filtered target T values: {run_t_values}")
     else:
-        run_t_values = [t for t in run_t_values if t in BIG_T_EXPERIMENT_VALUES]
-        log(f"No target T filter; profiling big-T experiment values only: {run_t_values}")
+        run_t_values = [t for t in run_t_values if t in DEFAULT_EXPERIMENT_T_VALUES]
+        log(f"No target T filter; profiling selected experiment values only: {run_t_values}")
 
     for t in run_t_values:
         log("")
@@ -1006,20 +1005,32 @@ def read_latest_remote_report(remote_report_path: str = REMOTE_REPORT_PATH) -> s
 
 
 @app.local_entrypoint()
-def main():
-    print("Packing hybrid Python solution from solution/python...")
-    subprocess.run(
-        [sys.executable, str(PROJECT_ROOT / "scripts" / "pack_solution_simple.py")],
-        cwd=str(PROJECT_ROOT),
-        check=True,
-    )
+def main(solution_path: str = "solution.json", output_path: str = "ncu_profiler_yjl.txt"):
+    solution_path = Path(solution_path)
+    if not solution_path.is_absolute():
+        solution_path = PROJECT_ROOT / solution_path
+    solution_path = solution_path.resolve()
 
-    solution_path = PROJECT_ROOT / "solution.json"
+    default_solution_path = (PROJECT_ROOT / "solution.json").resolve()
+    if solution_path == default_solution_path:
+        print("Packing hybrid Python solution from solution/python...")
+        subprocess.run(
+            [sys.executable, str(PROJECT_ROOT / "scripts" / "pack_solution_simple.py")],
+            cwd=str(PROJECT_ROOT),
+            check=True,
+        )
+    else:
+        print(f"Skipping pack; profiling existing solution file: {solution_path}")
+
+    if not solution_path.exists():
+        raise FileNotFoundError(f"Solution json not found: {solution_path}")
+
     solution_json = solution_path.read_text(encoding="utf-8")
-    print(f"Loaded packed solution: {solution_path}")
+    print(f"Loaded solution: {solution_path}")
     import time
 
-    remote_report_path = f"{VOLUME_MOUNT}/ncu_profiler_yjl_{int(time.time())}.txt"
+    report_stem = Path(output_path).stem
+    remote_report_path = f"{VOLUME_MOUNT}/{report_stem}_{int(time.time())}.txt"
 
     print("Running profile on Modal B200...")
     try:
@@ -1047,7 +1058,9 @@ def main():
                 "Modal return channel failed and persisted profiler report could not be read"
             ) from last_read_error
 
-    out_path = PROJECT_ROOT / "ncu_profiler_yjl.txt"
+    out_path = Path(output_path)
+    if not out_path.is_absolute():
+        out_path = PROJECT_ROOT / out_path
     out_path.write_text(report, encoding="utf-8")
     print(f"Saved report: {out_path}")
     if os.environ.get("YJL_PRINT_REPORT_LOCAL", "0") == "1":

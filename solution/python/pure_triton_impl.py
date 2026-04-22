@@ -2160,7 +2160,7 @@ def kernel(
     bkey = (T, block_m)
     use_fp16_inter = T >= SMALL_MEDIUM_T_MIN
     inter_dtype = torch.float16 if use_fp16_inter else torch.float32
-    use_bf16_expert_out = T >= BF16_EXPERT_OUT_T_MIN
+    use_bf16_expert_out = T == 14 or T >= BF16_EXPERT_OUT_T_MIN
     eo_dtype = torch.bfloat16 if use_bf16_expert_out else torch.float32
 
     # Include inter_dtype and eo_dtype in cache key to avoid reusing wrong-dtype buffers
