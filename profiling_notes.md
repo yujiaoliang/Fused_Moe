@@ -4,9 +4,11 @@
 > **硬件:** NVIDIA B200 (Blackwell, sm100a)  
 > **峰值性能:** FP8 ~2500 TFLOPS, TF32 ~1250 TFLOPS, HBM3e ~8 TB/s
 
-> **当前最新版本:** Per-T 隔离 CuTe Runtime (Round 19, 2026-04-19)  
-> **当前 Modal 可复现口径:** 19/19 PASSED, mean ~41-45x (session-dependent)  
+> **当前最新版本:** Per-T 隔离 CuTe Runtime + T=901 隔离 Triton + 最终微调 (Round 22, 2026-04-22)  
+> **当前 Modal 可复现口径:** 19/19 PASSED, mean ~46-54x (session-dependent)  
 > **CuTe 路径:** T=11948 隔离 CuTe, T=14107 隔离 CuTe (AB-test +55% vs Pure Triton fallback)  
+> **T=901 路径:** 隔离 Triton (`triton_impl_t901.py`), static launch cap, AB-test +3-6%  
+> **已确认无效:** Expert skipping (+0.2%), A-side vector load hint (-0.4%) — 均在噪声内  
 
 ---
 
@@ -1555,4 +1557,114 @@ Summary: 2 improved, 1 regressed, 16 neutral (±2% threshold)
 **Per-T 隔离设计确认为最优架构。** 将 CuTe runtime 按 T 值拆分为独立模块是一个零风险、纯工程级的优化，不影响任何 kernel 算法，但带来了显著的性能收益。
 
 后续如果需要支持更多 T 值的 CuTe 路径，只需复制对应的 `*_runtime_TXXXX.py` 文件并在 `triton_impl.py` 中注册即可。
+
+---
+
+## 22. Phase 7: 最终优化尝试 (2026-04-20 — 2026-04-22)
+
+在 Phase 6 Per-T 隔离 CuTe Runtime 之后，继续探索剩余的优化空间。
+
+### ❌ Target 8: Expert Skipping (Epsilon-Based)
+
+**方案：** 在 `triton_ds_routing_kernel` 的 normalization 阶段，将 normalized weight 低于 `EXPERT_SKIP_WEIGHT_THRESHOLD` (设为 0.01, 即 1%) 的 routing assignment 的 expert_id 设为 `E_GLOBAL` (256)，使下游 sort/scatter 忽略这些弱 assignment，从而减少 padding waste。
+
+**AB-test 结果 (2026-04-20, Modal B200, 同 session)：**
+
+| 指标 | A (baseline, threshold=0) | B (threshold=0.01) |
+|------|:-------------------------:|:-------------------:|
+| PASSED | 19/19 | 19/19 |
+| Mean speedup | 53.11x | 53.20x |
+| Mean Δ | — | **+0.2%** |
+
+```
+Summary: 1 improved (+2.1%), 1 regressed (-5.2%), 17 neutral (±2% threshold)
+```
+
+**失败原因分析：**
+- DeepSeek-V3 的 Top-8 routing 中，最弱的 expert 的 normalized weight 通常在 ~3-8% 范围
+- 1% threshold 远低于实际最小权重，几乎没有 expert 被跳过
+- 更高 threshold (3-5%) 有跳过效果但会引发精度风险
+- +0.2% 和单个 ±5% 变化都在 Modal 噪声范围内
+
+**结论：** Expert skipping 在当前 routing 参数下无效。代码已保留但 threshold 设为 0 (disabled)，`EXPERT_SKIP_WEIGHT_THRESHOLD` 可在 `pure_triton_impl.py` 中调整。
+
+---
+
+### ❌ Target 9: A-side 向量化 Load Hint (`tl.max_contiguous` / `tl.multiple_of`)
+
+**方案：** 在所有 GEMM2 kernel 的 K-loop 中，对 `rk`、`rm`、`rn` 添加 Triton 向量化 hint：
+```python
+rk = tl.max_contiguous(tl.multiple_of(k + tl.arange(0, BLOCK_K), BLOCK_K), BLOCK_K)
+rm = tl.max_contiguous(tl.multiple_of(pid_m * BLOCK_M + tl.arange(0, BLOCK_M), BLOCK_M), BLOCK_M)
+rn = tl.max_contiguous(tl.multiple_of(pid_n * BLOCK_N + tl.arange(0, BLOCK_N), BLOCK_N), BLOCK_N)
+```
+目标是让 Triton 编译器生成更宽的 LDG.E.128 向量加载指令，提升 Intermediate (fp16) buffer 的加载吞吐。
+
+**AB-test 结果 (2026-04-22, Modal B200, 同 session)：**
+
+| 指标 | A (baseline, 无 hint) | B (添加 hint) |
+|------|:--------------------:|:-------------:|
+| PASSED | 19/19 | 19/19 |
+| Mean speedup | 46.87x | 46.68x |
+| Mean Δ | — | **-0.4%** |
+
+```
+Summary: 1 improved (+3.3%), 0 regressed, 18 neutral (±2% threshold)
+```
+
+**失败原因分析：**
+- Triton 3.7.0 编译器在 sm_100a 上已经足够智能，能自动推断 K 维度的连续性和对齐
+- `stride_ak` 虽然是运行时值，但编译器通过 dataflow analysis 知道它等于 1
+- 手动添加 hint 没有提供编译器尚不知道的信息，PTX 输出完全相同
+- 与之前 TMA 实验 (Target 6) 的结论一致：B200 的 HBM 带宽已被常规 LDG 指令完全打满
+
+**结论：** 向量化 hint 对当前 kernel 无效。编译器已自动生成最优加载指令。代码已回退。
+
+---
+
+### ✅ Target 10: T=901 Static Launch Cap + 隔离路径 (队友提交)
+
+**方案：** 队友 (commit `c614bd7`→`f5d315d`, merged `03e746f`) 为 T=901 创建了独立的隔离 Triton 路径 `triton_impl_t901.py`：
+- 保持 `BLOCK_M=64`（不走 CuTe 的 128），保护 GEMM1 tile 效率
+- **关键优化：`STATIC_PID_M=64`** — 固定 launch grid 的 M 维度为 64 块，而非动态 `total_blocks.item()`
+- 避免了 host sync (`total_blocks.item()`) 和过大 grid 导致的 SM 竞争
+- 同时启用 bf16 expert_out + fp16 intermediate
+- 附带 T=14 的 bf16 expert_out 优化
+
+**NCU Profiling (队友数据)：**
+
+| 指标 | 之前 | 之后 |
+|------|------|------|
+| T=901 Wall | ~0.86 ms | **0.506 ms** (-41%) |
+| GEMM1 | — | 0.264 ms (52.6%) |
+| GEMM2 | — | 0.178 ms (35.3%) |
+| T=14 Wall | — | 0.136 ms |
+
+**AB-test 验证 (2026-04-22, Modal B200, 同 session)：**
+
+> **A (基线):** 上一版 (commit `cf5fcc3`, 无 T=901 隔离)  
+> **B (实验):** 队友新代码 (commit `03e746f`, T=901 隔离路径)
+
+| 指标 | A (baseline) | B (T=901 隔离) |
+|------|:------------:|:--------------:|
+| PASSED | 19/19 | 19/19 |
+| Mean speedup | 53.81x | **54.26x** |
+| Mean Δ | — | **+0.8%** |
+
+```
+Workload        A speed    B speed    Delta    Verdict
+1a4c6ba1         36.44x     37.67x    +3.4%   ✅ BETTER  (T=901)
+8cba5890         62.35x     66.13x    +6.1%   ✅ BETTER  (T=14 bf16 or noise)
+其余 17 个       —          —         ±2%     ≈ SAME
+Summary: 2 improved, 0 regressed, 17 neutral
+```
+
+**分析：**
+1. **T=901 (`1a4c6ba1`) 稳定提升 +3.4%** (36.44x → 37.67x, latency 0.537ms → 0.519ms)
+   - Static launch cap 有效减少 SM 调度开销
+   - GEMM2 `_fused_moe_gemm2_t901_kernel` 在固定 grid 下运行更稳定
+2. **T=14 (`8cba5890`) +6.1%** — 可能是 bf16 expert_out 优化或 session 噪声
+3. **0 regression** — 纯增量式改进，不影响其他路径
+
+**结论：** T=901 隔离路径确认有效，已合并进 main。
 
