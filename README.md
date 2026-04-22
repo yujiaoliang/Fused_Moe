@@ -339,6 +339,7 @@ kernel.py (入口)
 | `1010fb4` | **小中T GEMM1 Autotune** | ✅✅ | 增补 13 个 candidates 覆盖深流水线，T=32~80 GEMM1 时长稳定减少 1.6%~6.6% |
 | `c35907d` | **T=1 GEMM1/2 Autotune** | ✅✅ | 补充微型 kernel 设置 (warps=2)，单 token 指令开销降低，latency -3% |
 | `a5256cc` | **FP16 Intermediate Buffer** | ✅✅ | AB-test mean +4.5%，13/19 improved，1 regressed。`USE_FP16_INTER` constexpr + `×0.125/×8.0` scale-and-cast，T≥32 fp16，T<32 fp32 fallback |
+| `f040d09` | **T=901 Static Launch Cap** | ✅✅ | AB-test +6%。T=901 保持 `block_m=64` 以保住 GEMM1 tile 效率，同时用 static `pid_m` launch cap 降低 GEMM overlaunch，避免 `total_blocks.item()` host sync；GEMM2 约 `196us→177us`，wall 约 `0.531ms→0.504ms` |
 
 ### Phase 5: 竞赛规则感知优化 — Round 10 (2026-04-15)
 
