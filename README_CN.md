@@ -72,6 +72,7 @@
 | T=14107 | CuTe DSL grouped GEMM | 128 | Per-T 隔离 CuTe runtime |
 | T=901 | 隔离 Triton | 64 | Static launch cap，专属 autotune |
 | T=1 | Pure Triton | 16 | 融合单 token 路径 |
+| T=53–59 | Pure Triton | **8** | Tight BLOCK_M — padding 浪费降低 4× |
 | 32 ≤ T ≤ 64 | Pure Triton | 32 | `_small_medium_*` |
 | 65 ≤ T ≤ 128 | Pure Triton | 32/64 | `_medium_*` |
 | T > 128 | Pure Triton | 64 | `_fused_moe_*` (通用) |
@@ -289,6 +290,7 @@ mlsys_note/
 | `f088f03` | **Per-T 隔离 CuTe Runtime** | AB-test mean +1.4%, **T=14107 +55.1%** (13.19x → 20.45x) |
 | `03e746f` | **T=901 隔离 Triton 路径** | AB-test **+6%**（static launch cap 避免 host sync） |
 | `886c7fc` | CuTe 精度调查 | T=14107 隔离修复后恢复 CuTe 路径 |
+| `2e134c7` | **Tight BLOCK_M=8 (T=53–59)** | AB-test **+3.8% 均值**, 7/19 提升 (最高 +14.5%), 0 退化 |
 
 </details>
 
@@ -326,6 +328,7 @@ mlsys_note/
 | `f040d09` | **T=901 Static Launch Cap** | ✅✅ | AB-test +6% |
 | `f088f03` | **Per-T 隔离 CuTe Runtime** | ✅✅ | T=14107 +55.1% |
 | `c1effcc` | **bf16 expert_out** | ✅ | mean +0.4%, large-T +2.5% |
+| `2e134c7` | **Tight BLOCK_M=8 (T=53–59)** | ✅✅ | AB-test +3.8% 均值, 7/19 提升, 0 退化 |
 
 **结论：当前主线中所有生效改动都是 ✅ 或 ✅✅ 确定真实的。**
 
@@ -385,7 +388,7 @@ mlsys_note/
 2. GEMM1 原生 FP8 tensor core dot — 相比 TF32 2x 吞吐
 3. 非原子 GEMM2 + token-centric reduce — medium-T +46%
 4. FP16 intermediate buffer ×0.125/×8.0 补偿 — 带宽 −50%
-5. 四级 BLOCK_M (16/32/64/128) workload-aware dispatch
+5. 五级 BLOCK_M (8/16/32/64/128) workload-aware dispatch
 6. Per-T 隔离 CuTe DSL runtime 用于大 T grouped GEMM（T=14107 +55%）
 
 编译后论文：[`paper.pdf`](paper.pdf) | 源码：[`paper.tex`](paper.tex)

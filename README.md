@@ -72,6 +72,7 @@ The entry point (`kernel.py`) automatically dispatches based on token count T:
 | T=14107 | CuTe DSL grouped GEMM | 128 | Per-T isolated CuTe runtime |
 | T=901 | Isolated Triton | 64 | Static launch cap, dedicated autotune |
 | T=1 | Pure Triton | 16 | Fused single-token path |
+| T=53–59 | Pure Triton | **8** | Tight BLOCK_M — reduces padding waste 4× |
 | 32 ≤ T ≤ 64 | Pure Triton | 32 | `_small_medium_*` |
 | 65 ≤ T ≤ 128 | Pure Triton | 32/64 | `_medium_*` |
 | T > 128 | Pure Triton | 64 | `_fused_moe_*` (generic) |
@@ -290,6 +291,7 @@ mlsys_note/
 | `f088f03` | **Per-T Isolated CuTe Runtime** | AB-test mean +1.4%, **T=14107 +55.1%** (13.19x → 20.45x) |
 | `03e746f` | **T=901 Isolated Triton Path** | AB-test **+6%** (static launch cap avoids host sync) |
 | `886c7fc` | CuTe precision investigation | T=14107 restored to CuTe after isolation fix |
+| `2e134c7` | **Tight BLOCK_M=8 for T=53–59** | AB-test **+3.8% mean**, 7/19 improved (up to +14.5%), 0 regressed |
 
 </details>
 
@@ -329,6 +331,7 @@ All kernel.py optimization commits are classified into four confidence levels:
 | `f040d09` | **T=901 Static Launch Cap** | ✅✅ | AB-test +6% |
 | `f088f03` | **Per-T Isolated CuTe Runtime** | ✅✅ | T=14107 +55.1% |
 | `c1effcc` | **bf16 expert_out** | ✅ | Mean +0.4%, large-T +2.5% |
+| `2e134c7` | **Tight BLOCK_M=8 (T=53–59)** | ✅✅ | AB-test +3.8% mean, 7/19 improved, 0 regressed |
 
 **Conclusion: All active optimizations in the current mainline are rated ✅ or ✅✅.**
 
@@ -388,7 +391,7 @@ We present a hybrid Triton + CuTe DSL implementation of the DeepSeek-V3 MoE kern
 2. Native FP8 tensor core dot in GEMM1 — 2x throughput over TF32
 3. Non-atomic GEMM2 with token-centric reduce — +46% on medium-T
 4. FP16 intermediate buffers with ×0.125/×8.0 compensation — −50% bandwidth
-5. Four BLOCK_M tiers (16/32/64/128) with workload-aware dispatch
+5. Five BLOCK_M tiers (8/16/32/64/128) with workload-aware dispatch
 6. Per-T isolated CuTe DSL runtimes for large-T grouped GEMM (+55% on T=14107)
 
 The compiled paper is available at [`paper.pdf`](paper.pdf). Source: [`paper.tex`](paper.tex).

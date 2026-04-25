@@ -4,11 +4,12 @@
 > **硬件:** NVIDIA B200 (Blackwell, sm100a)  
 > **峰值性能:** FP8 ~2500 TFLOPS, TF32 ~1250 TFLOPS, HBM3e ~8 TB/s
 
-> **当前最新版本:** Per-T 隔离 CuTe Runtime + T=901 隔离 Triton + 最终微调 (Round 22, 2026-04-22)  
-> **当前 Modal 可复现口径:** 19/19 PASSED, mean ~46-54x (session-dependent)  
+> **当前最新版本:** Tight BLOCK_M=8 (T=53–59) + Per-T 隔离 CuTe/Triton + 最终微调 (Round 23, 2026-04-25)  
+> **当前 Modal 可复现口径:** 19/19 PASSED, mean ~49-54x (session-dependent)  
 > **CuTe 路径:** T=11948 隔离 CuTe, T=14107 隔离 CuTe (AB-test +55% vs Pure Triton fallback)  
 > **T=901 路径:** 隔离 Triton (`triton_impl_t901.py`), static launch cap, AB-test +3-6%  
-> **已确认无效:** Expert skipping (+0.2%), A-side vector load hint (-0.4%) — 均在噪声内  
+> **Tight BLOCK_M:** T=53–59 使用 BLOCK_M=8 (AB-test +3.8% mean, 7/19 improved up to +14.5%)  
+> **已确认无效:** Expert skipping (+0.2%), A-side vector load hint (-0.4%), GEMM2 ×8.0 pre-multiply (0%, compiler folded) — 均在噪声内  
 
 ---
 
@@ -1667,4 +1668,67 @@ Summary: 2 improved, 0 regressed, 17 neutral
 3. **0 regression** — 纯增量式改进，不影响其他路径
 
 **结论：** T=901 隔离路径确认有效，已合并进 main。
+
+---
+
+## 23. [2026-04-25] Tight BLOCK_M=8 for T=53–59 (Round 23)
+
+### 动机
+
+从 profiling 数据看，T=53–59 的 7 个 workload 占 19 个中的 7/19，但 padding 浪费严重：
+- T=53 → 当前 BLOCK_M=32 → padded to 384 tokens → **7.2× waste**
+- T=56 → 当前 BLOCK_M=32 → padded to 416 tokens → **7.4× waste**
+
+改为 BLOCK_M=8 后：
+- T=53 → padded to ~100 tokens → **1.9× waste** (从 7.2× 降到 1.9×)
+- 减少 75% 的无效 FP8 tensor core 计算
+
+### 实现
+
+```python
+TIGHT_BLOCK_M_T_VALUES = (53, 54, 55, 56, 57, 58, 59)
+BLOCK_M_TIGHT = 8
+
+def _select_block_m_for_t(t: int) -> int:
+    if _use_tight_block_m(t):
+        return BLOCK_M_TIGHT
+    return _select_block_m(t * TOP_K)
+```
+
+Commit: `c0fabd0` → merged via `2e134c7`
+
+### AB-test 结果
+
+| 指标 | A (main, BLOCK_M=32) | B (tight BLOCK_M=8) |
+|------|:---:|:---:|
+| PASSED | 19/19 | 19/19 |
+| Mean speedup | **47.71x** | **49.52x** |
+| Mean Δ | — | **+3.8%** |
+| Improved | — | **7** |
+| Regressed | — | **0** |
+| Neutral | — | 12 |
+
+受益 workload 详情（全部 T=53–59）：
+
+```
+Workload        A speed    B speed    Delta    Verdict
+76010cb4         43.36x     49.44x   +14.0%   ✅ BETTER
+81955b1e         43.25x     49.54x   +14.5%   ✅ BETTER
+eedc63b2         45.30x     51.88x   +14.5%   ✅ BETTER
+fc378037         45.11x     49.54x    +9.8%   ✅ BETTER
+74d7ff04         45.34x     49.33x    +8.8%   ✅ BETTER
+e626d3e6         46.33x     49.74x    +7.4%   ✅ BETTER
+4822167c         44.94x     47.68x    +6.1%   ✅ BETTER
+
+Summary: 7 improved, 0 regressed, 12 neutral (±2% threshold)
+```
+
+### 分析
+
+1. **+6.1% 到 +14.5% 提升** — 远超噪声阈值 (2%)，确认真实
+2. **零退化** — BLOCK_M=8 仅对 T=53–59 生效，不影响其他路径
+3. **原理：** 更小的 BLOCK_M 大幅减少了 per-expert padding。之前 BLOCK_M=32 时每个 expert 至少分配 32 行（即使只有 1-2 个 token），导致 ~85% 的计算浪费在 padding 零上。BLOCK_M=8 将这个比例降到 ~50%
+4. **BLOCK_M tier 体系更新为 5 级：** 8 / 16 / 32 / 64 / 128
+
+**结论：** Tight BLOCK_M=8 确认有效，已通过 PR #3 合并进 main。这是最终提交前的最后一个有效优化。
 
