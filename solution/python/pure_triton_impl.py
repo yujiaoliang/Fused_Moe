@@ -41,6 +41,8 @@ SMALL_MEDIUM_T_MIN = 32
 SMALL_MEDIUM_T_MAX = 64
 UPPER_MEDIUM_T_MIN = 65
 UPPER_MEDIUM_T_MAX = 128
+TIGHT_BLOCK_M_T_VALUES = (53, 54, 55, 56, 57, 58, 59)
+BLOCK_M_TIGHT = 8
 # Large traces benefit from exact pid_m dispatch; smaller traces lose to the extra host sync.
 EXACT_WORKLOAD_DISPATCH_T_MIN = 4096
 # A second guard keeps boundary workloads on the base path unless the overlaunch upper bound is large enough.
@@ -1953,12 +1955,22 @@ def _select_block_m(num_topk_tokens: int) -> int:
     return BLOCK_M_LARGE
 
 
+def _select_block_m_for_t(t: int) -> int:
+    if _use_tight_block_m(t):
+        return BLOCK_M_TIGHT
+    return _select_block_m(t * TOP_K)
+
+
 def _use_small_medium_gemm_bucket(t: int) -> bool:
     return SMALL_MEDIUM_T_MIN <= t <= SMALL_MEDIUM_T_MAX
 
 
 def _use_upper_medium_gemm_bucket(t: int) -> bool:
     return UPPER_MEDIUM_T_MIN <= t <= UPPER_MEDIUM_T_MAX
+
+
+def _use_tight_block_m(t: int) -> bool:
+    return t in TIGHT_BLOCK_M_T_VALUES
 
 
 def _use_exact_workload_dispatch(t: int, max_pid_m: int) -> bool:
@@ -2152,7 +2164,7 @@ def kernel(
         topk_wts_ws = torch.empty((T, TOP_K), dtype=torch.float32, device=device)
         _routing_cache[rkey] = (topk_idx_ws, topk_wts_ws)
 
-    block_m = _select_block_m(T * TOP_K)
+    block_m = _select_block_m_for_t(T)
     MAX_PADDED = T * TOP_K + E_LOCAL * block_m
     MAX_PID_M = MAX_PADDED // block_m
     use_exact_dispatch = _use_exact_workload_dispatch(T, MAX_PID_M)
