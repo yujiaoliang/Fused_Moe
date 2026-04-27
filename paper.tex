@@ -16,7 +16,7 @@
 \setlist{nosep,leftmargin=*}
 \captionsetup{font=small,skip=4pt}
 
-\title{\textbf{Fused MoE Inference on Blackwell:\\A Pure Triton Approach to DeepSeek-V3 Expert Dispatch}}
+\title{\textbf{Fused MoE Inference on Blackwell:\\A Workload-Adaptive Kernel System for DeepSeek-V3}}
 
 \author{
 Jiayao Zhang, Jiaoliang Yu \\
@@ -30,9 +30,10 @@ MLSys 2026 FlashInfer-Bench Challenge --- Track A
 
 % ============================================================
 \begin{abstract}
-We present a pure Triton implementation of the DeepSeek-V3 MoE kernel targeting the NVIDIA B200 (Blackwell, sm\_100a) GPU.
-Our 6-stage pipeline exploits FP8 native tensor core dot products for 2$\times$ throughput in GEMM1, a non-atomic two-pass GEMM2-then-reduce architecture, FP16 intermediate buffers with scale-and-cast compensation, and multi-level bucket specialization across four BLOCK\_M tiers.
-On 19 real-trace workloads ($T{=}1$ to $T{=}14{,}107$), the system achieves 19/19 correctness and a peak speedup of 106.65$\times$ (mean 55.77$\times$) over the na\"ive per-expert baseline, as measured by CUPTI GPU-only kernel timing.
+We present a workload-adaptive implementation of the DeepSeek-V3 MoE kernel targeting the NVIDIA B200 (Blackwell, sm\_100a) GPU.
+Our fused Triton pipeline exploits FP8 native tensor core dot products for 2$\times$ throughput in GEMM1, a non-atomic two-pass GEMM2-then-reduce architecture, FP16 intermediate buffers with scale-and-cast compensation, and multi-level bucket specialization across BLOCK\_M tiers.
+For the largest traces, a hybrid Triton/CuTe path uses Triton for sparse MoE metadata and epilogues while delegating the dense grouped GEMM core to CuTe.
+On 19 real-trace workloads ($T{=}1$ to $T{=}14{,}107$), the system achieves 19/19 correctness, a peak speedup of roughly 56$\times$, large-$T$ speedups of roughly 13--15$\times$, and mean speedup around 54$\times$ in our reference Modal B200 sessions, as measured by CUPTI GPU-only kernel timing.
 \end{abstract}
 
 % ============================================================
@@ -41,19 +42,18 @@ On 19 real-trace workloads ($T{=}1$ to $T{=}14{,}107$), the system achieves 19/1
 Mixture-of-Experts (MoE) architectures enable massive parameter counts with sub-linear compute growth~\cite{shazeer2017outrageously}.
 DeepSeek-V3~\cite{deepseekv3} uses 256 routed experts (32 local per device), top-8 routing, hidden dimension 7168, and intermediate dimension 2048---yielding two FP8 block-scaled GEMMs per forward pass.
 
-The NVIDIA B200 (Blackwell) GPU presents a compelling target for MoE inference: its \texttt{tcgen05.mma} tensor cores deliver ${\sim}2{,}500$ TFLOPS at FP8, backed by 96\,MB of L2 cache and 8\,TB/s HBM3e bandwidth.
-However, a na\"ive implementation that loops over experts sequentially wastes this hardware: per-expert kernel launches dominate for small batch sizes, while large batches suffer from inefficient atomic scatter in the output reduction.
+On NVIDIA B200, na\"ive per-expert execution wastes hardware: launch overhead dominates small traces, while large traces suffer from atomic scatter in reduction.
 
 This work was developed for Track~A of the MLSys 2026 FlashInfer-Bench Challenge~\cite{flashinfer}, where scoring is the sum of CUPTI GPU kernel times across 19 workloads (tolerance $\text{atol}{=}1.0$, $\text{rtol}{=}0.3$, $\text{ratio}{=}0.9$).
-CUPTI excludes CPU overhead; our profiling showed ${\sim}600\,\mu$s (56--73\% of wall time) invisible to scoring, redirecting efforts toward GPU kernel efficiency.
+CUPTI excludes CPU overhead, so optimization is driven by GPU kernel efficiency.
 Our contributions:
 
 \begin{enumerate}
-\item A 6-stage fused Triton~\cite{triton} pipeline eliminating per-expert launches;
+\item A fused Triton~\cite{triton} pipeline eliminating per-expert launches;
 \item Native FP8 tensor core dot in GEMM1, delivering 2$\times$ throughput over TF32;
 \item Non-atomic GEMM2 with token-centric reduce, yielding +46\% on medium-$T$;
 \item FP16 intermediate buffers with $\times$0.125/$\times$8.0 compensation ($-$50\% bandwidth);
-\item Four BLOCK\_M tiers (16/32/64/128) with workload-aware dispatch.
+\item Workload-aware dispatch, including singleton, tight-padding, static-cap, and CuTe-assisted large-$T$ buckets.
 \end{enumerate}
 
 % ============================================================
@@ -61,53 +61,54 @@ Our contributions:
 
 \subsection{Pipeline Overview}
 
-Figure~\ref{fig:pipeline} shows the six-stage pipeline:
-\textbf{(1)~Routing:} Pure Triton DeepSeek-V3 no-aux routing (sigmoid, group top-4, global top-8, normalization) with one program per token.
-\textbf{(2)~Sorting:} Tile-level parallel histogram with atomic offsets; hybrid CPU path for $T{<}1024$ (one CPU$\leftrightarrow$GPU sync beats ${\sim}25$ GPU kernel launches).
+Figure~\ref{fig:pipeline} shows the generic five-stage pipeline:
+\textbf{(1)~Routing:} Triton DeepSeek-V3 no-aux routing (sigmoid, group top-4, global top-8, normalization) with one program per token.
+\textbf{(2)~Sorting:} Tile-level parallel histogram with atomic offsets; very small traces may use a hybrid CPU path to replace many tiny GPU launches in wall time.
 \textbf{(3)~GEMM1+SwiGLU:} Fused $W_1$/$W_3$ projections in a shared K-loop with \texttt{tl.dot(fp8, fp8)}.
 \textbf{(4)~GEMM2:} Non-atomic down-projection writing to \texttt{expert\_out} buffer.
 \textbf{(5)~Token Reduce:} Each output token reads $K{=}8$ expert contributions, accumulates in FP32, writes bf16.
-\textbf{(6)~T=1 path:} Fused routing+sort+GEMM for single-token decode.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/pipeline.pdf}
-\caption{Six-stage MoE pipeline with two intermediate buffers. The $T{=}1$ path fuses stages 1--4 into a single kernel.}
+\caption{Generic MoE pipeline. Singleton and large-$T$ workloads reuse the same stages with different kernels.}
 \label{fig:pipeline}
 \end{figure}
 
-\subsection{Runtime Dispatch}
+\subsection{Dispatch and Specialization}
 
-Workloads span three orders of magnitude, requiring a multi-level BLOCK\_M hierarchy (Table~\ref{tab:dispatch}).
-For $T{\ge}4096$, we read \texttt{total\_blocks} from sorting to launch with the exact grid size, avoiding ${\sim}30\%$ idle blocks.
-A $T{=}901$-specialized GEMM2 kernel further targets the 58\% GEMM2 bottleneck at that workload.
+Workloads span four orders of magnitude, so a single tile shape is suboptimal.
+We therefore organize execution around a default BLOCK\_M tiering rule plus a small number of explicit trace-specific overrides (Table~\ref{tab:dispatch}).
+The main overrides are: singleton $T{=}1$, tight BLOCK\_M=8 for fragmented $T{=}53$--59, isolated $T{=}901$, and a hybrid Triton/CuTe path for the largest traces.
+For large traces, the dispatcher also switches from static overlaunch to exact block-count launch using \texttt{total\_blocks} produced by sorting.
 
-\begin{table}[t]
+\begin{table*}[t]
 \centering
-\small
-\caption{Runtime dispatch by token count.}
+\footnotesize
+\caption{Workload-adaptive dispatch: generic Triton tiers plus explicit overrides.}
 \label{tab:dispatch}
-\begin{tabular}{@{}lll@{}}
+\begin{tabular}{@{}p{0.30\textwidth}p{0.10\textwidth}p{0.45\textwidth}@{}}
 \toprule
-Token range & BLOCK\_M & Kernel family \\
+Regime & BLOCK\_M & Specialization \\
 \midrule
-$T{=}1$              & 16    & Fused T1 path \\
-$2 \le T \le 31$     & 16    & Small \\
-$32 \le T \le 64$    & 32    & Small-medium \\
-$65 \le T \le 128$   & 32/64 & Medium \\
-$129 \le T \le 2048$ & 64    & Generic \\
-$T > 2048$           & 128   & Generic (large) \\
+Default: $2 \le T \le 128$ & 16 & Generic Triton small/mid-$T$ tier \\
+Default: $129 \le T \le 512$ & 32 & Generic Triton medium tier \\
+Default: $513 \le T < 4096$ & 64 & Generic Triton large tier \\
+\addlinespace
+Override: $T{=}1$ & 16 & Singleton fused Triton path \\
+Override: $T \in \{53,\ldots,59\}$ & 8 & Tight-padding mid-$T$ path \\
+Override: $T{=}901$ & 64 & Isolated static-cap Triton path \\
+Override: $T \in \{11948,14107\}$ & 128 & Hybrid Triton/CuTe path \\
 \bottomrule
 \end{tabular}
-\end{table}
+\end{table*}
 
 % ============================================================
 \section{Key Optimizations}
 
 \subsection{FP8 Native Tensor Core Dot}
 
-Blackwell's \texttt{tcgen05.mma} supports native FP8$\times$FP8 dot with FP32 accumulation.
-We apply block-scale dequantization \emph{after} the dot:
+Blackwell's \texttt{tcgen05.mma} supports native FP8$\times$FP8 dot with FP32 accumulation. We apply block-scale dequantization \emph{after} the dot:
 
 \vspace{-2mm}
 \begin{verbatim}
@@ -116,29 +117,38 @@ We apply block-scale dequantization \emph{after} the dot:
 \end{verbatim}
 \vspace{-2mm}
 
-This yields ${\sim}2\times$ throughput vs.\ TF32 (which requires FP8$\to$FP32 dequantization \emph{before} the dot), enabled by Triton 3.6.0+ on sm\_100a where \texttt{tl.dot(fp8, fp8)} compiles to native tensor core instructions.
-In GEMM1, both hidden-state activations and expert weights are stored in \texttt{float8\_e4m3fn} with per-128 block scaling; the kernel fuses both $W_1$ and $W_3$ projections in a shared K-loop, amortizing A-side loads, followed by inline SwiGLU activation.
+This yields ${\sim}2\times$ throughput vs.\ TF32, which requires FP8$\to$FP32 dequantization before the dot. GEMM1 stores activations and weights in \texttt{float8\_e4m3fn} with per-128 scaling and fuses $W_1$/$W_3$ with inline SwiGLU.
 
 \subsection{Non-Atomic GEMM2 + Token-Centric Reduce}
 
-Since multiple experts write to the same output token, the na\"ive \texttt{tl.atomic\_add} scatter causes $6\times$ bandwidth amplification (12~B/elem FP32 RMW vs.\ 2~B bf16 store).
-We split into two passes: (1)~GEMM2 writes to \texttt{expert\_out} (bf16, non-atomic); (2)~a dedicated reduce kernel loads exactly 8 contributions per output token.
-For large $T$, 2D tiled reduction ($[\text{BLOCK\_T}, \text{BLOCK\_N}]$) cuts the grid $8\times$.
-A/B testing: peak speedup $47.9\times \to 80.3\times$ (+46\%).
+Na\"ive \texttt{tl.atomic\_add} causes $6\times$ bandwidth amplification (12~B/elem FP32 RMW vs.\ 2~B bf16 store).
+We therefore split GEMM2 and reduction: GEMM2 writes bf16 \texttt{expert\_out}, then a token-centric reduce loads 8 contributions per token. For large $T$, 2D tiling cuts the reduce grid $8\times$.
+A/B testing showed this was one of the largest single algorithmic gains, especially on the medium-$T$ workloads where atomic write contention previously dominated.
 
 \subsection{FP16 Intermediate with Scale Compensation}
 
 The Intermediate buffer $[\text{num\_padded}, 2048]$ dominates HBM traffic.
-We apply $\times$0.125 in GEMM1's epilogue (compressing SwiGLU range to ${\pm}5{,}000$, within FP16 max 65{,}504), store as FP16, and compensate with $\times$8.0 in GEMM2.
+We scale by $\times$0.125 in GEMM1, store FP16, then compensate by $\times$8.0 in GEMM2.
 For $T{<}32$, a \texttt{constexpr} branch falls back to FP32 to avoid SwiGLU outlier overflow.
 A/B: mean +4.5\% (13/19 improved).
 
-\subsection{Multi-Level Bucket Specialization}
+\subsection{Workload-Adaptive Bucket Specialization}
 
-With $T{=}7$, each of 32 experts processes $<$1 token on average; with $T{=}14{,}107$, experts have hundreds.
-We deploy dedicated kernel families per tier with column-major tile dispatch (\texttt{GROUP\_M=32/64}), where consecutive thread blocks process different tokens of the \emph{same} expert, maximizing L2 cache reuse on shared weight tiles.
-Workload-specific specializations (e.g., $T{=}901$ GEMM2) further target per-workload bottlenecks.
-Impact: $88\times \to 106.65\times$.
+Column-major dispatch (\texttt{GROUP\_M=32/64}) improves L2 reuse by mapping consecutive blocks to different tokens of the same expert.
+The $T{=}1$ path is a dedicated decode implementation: it bypasses generic histogram/offset metadata and directly fuses routing, packing, GEMM1, GEMM2, and reduction around a fixed small workspace.
+For fragmented $T{=}53$--59, BLOCK\_M=8 reduces padding and invalid-row compute. For $T{=}901$, an isolated path targets the transition regime.
+
+\subsection{Routing, Sorting, and Autotuning Support}
+
+Several supporting optimizations are smaller individually but important to the final system.
+Routing uses gather-first and pre-allocated workspaces to reduce overhead; sorting uses tile-parallel histogram/offset construction and, for large traces, can reuse the histogram structure in dispatch.
+Autotuning remains workload-specific: GEMM1/GEMM2 tile shapes, \texttt{BLOCK\_K}, and stage depth are selected per regime rather than by a single global configuration.
+
+\subsection{CuTe-Assisted Large-T GEMM}
+
+For the largest traces, bottlenecks shift from launch/padding overhead to sustained grouped GEMM throughput.
+We therefore use a hybrid path for $T{=}11{,}948$ and $T{=}14{,}107$: Triton handles sparse metadata and epilogues, while CuTe executes the dense grouped GEMM core.
+We do not use CuTe for small/mid-$T$, where metadata and setup dominate.
 
 \subsection{bf16 Expert Output Buffer}
 
@@ -148,28 +158,27 @@ A/B: +0.4\% mean, +2.5\% at $T{=}14{,}107$.
 
 \subsection{Compiler Hints and Cache Policy}
 
-Two compiler/architecture-level hints yielded a combined +4.9\% mean speedup:
+Two compiler hints yielded a combined +4.9\% mean speedup:
 \textbf{(1)~Disable LLVM LSR:}
-Setting \texttt{DISABLE\_LLVM\_OPT="disable-lsr"} prevents Loop Strength Reduction from increasing register pressure in the complex SwiGLU addressing patterns, avoiding spills.
+Setting \texttt{DISABLE\_LLVM\_OPT="disable-lsr"} avoids extra register pressure and spills in SwiGLU addressing.
 \textbf{(2)~Asymmetric L2 eviction:}
-Expert weights use \texttt{evict\_last} (high reuse across tokens), while token activations use \texttt{evict\_first} (streaming access), matching the MoE access pattern and improving L2 hit rate.
+Expert weights use \texttt{evict\_last}; token activations use \texttt{evict\_first}.
 
 \subsection{2D Tiled Token Reduce}
 
-The original 1D reduce launched one program per output token ($T{\times}\lceil 7168/\text{BLOCK\_N}\rceil$ grid), producing $>$100K programs at $T{=}14{,}107$ with minimal per-program work.
-We restructure to 2D $[\text{BLOCK\_T}, \text{BLOCK\_N}]$ tiling (16--32 tokens per block), cutting the grid $>$10$\times$ and enabling ILP to hide HBM latency.
-A/B: +2.9\% at $T{=}8{,}192$, +2.5\% at $T{=}14{,}107$.
+The original 1D reduce launched one program per output token, producing $>$100K programs at $T{=}14{,}107$.
+We switch to 2D $[\text{BLOCK\_T}, \text{BLOCK\_N}]$ tiling, cutting the grid $>$10$\times$ and improving ILP.
+A/B: roughly +2.5--2.9\% on the largest traces.
 
 \subsection{Deep Software Pipelining for GEMM2}
 
-GEMM2's FP16 A-side (Intermediate buffer) incurs high HBM read latency that the default \texttt{num\_stages=2/3} cannot fully hide.
-We extend the autotuner search to \texttt{num\_stages=6/7/8}, enabling TMA prefetch instructions to issue $6{-}8$ tiles ahead of consumption.
-At \texttt{BLOCK\_N=128/256} with sufficient register budget, the deeper pipeline overlaps compute with the FP32$\to$FP16 read stream, yielding +2.1\% mean (+10.1\% peak) on medium-$T$ workloads.
+GEMM2's FP16 A-side incurs high HBM latency.
+Extending autotuning to \texttt{num\_stages=6/7/8} overlaps compute with reads and yields +2.1\% mean (+10.1\% peak) on medium-$T$ workloads.
 
 % ============================================================
 \section{Negative Results}
 
-Table~\ref{tab:negative} summarizes seven major failed optimizations explored over 15 rounds.
+Table~\ref{tab:negative} summarizes major failed optimizations explored over 15 rounds.
 
 \begin{table}[t]
 \centering
@@ -192,22 +201,22 @@ Warp Specialize & Crash & TTGIR lowering failure; $-$34\% on simple GEMM \\
 \addlinespace
 Fused GEMM2+Reduce & $-$4.5\% & fp32 atomic RMW = $6\times$ BW vs bf16 store \\
 \addlinespace
+CuTe for mid-$T$ & Neutral/$-$ & metadata and host sync not amortized at small expert counts \\
+\addlinespace
 GEMM2 FP8 Dot & 5/19 & fp16$\to$fp8 cast: abs=500K direct, 14K scaled \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \textbf{Precision hierarchy} (Figure~\ref{fig:precision}).
-Intermediate requires $\ge$FP16 (10-bit mantissa); bf16 was tested three times (6/19, 10/19, 8/19---worsening with register pressure).
-Expert\_out tolerates bf16 but fp16 overflows (3/19 fail).
-FP8 is insufficient for any activation buffer.
+Intermediate requires $\ge$FP16; bf16 was tested three times and failed 8--13 workloads. \texttt{expert\_out} tolerates bf16, while fp16 overflows. FP8 is insufficient for any activation buffer.
 \textbf{Architectural dead-ends.}
-Persistent kernels, TMA, and warp specialization all failed because $K{=}2048$ (16 K-loop iters) is too short to amortize large-$K$ overheads.
+Persistent kernels, TMA, and warp specialization fail because $K{=}2048$ is too short to amortize setup. CuTe follows the same rule and only helps at large $T$.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=0.85\columnwidth]{figures/precision_matrix.pdf}
-\caption{Precision compatibility matrix. Green = 19/19 pass; red = fail. Intermediate requires $\ge$FP16; expert\_out tolerates bf16.}
+\caption{Precision compatibility matrix. Intermediate requires $\ge$FP16; \texttt{expert\_out} tolerates bf16.}
 \label{fig:precision}
 \end{figure}
 
@@ -215,104 +224,97 @@ Persistent kernels, TMA, and warp specialization all failed because $K{=}2048$ (
 \section{Evaluation}
 
 \textbf{Setup.}
-NVIDIA B200 (sm\_100a), PyTorch 2.12.0+cu132, Triton 3.7.0.
+NVIDIA B200 (sm\_100a), PyTorch 2.12.0+cu132, Triton 3.6.0.
 Scoring: CUPTI GPU kernel time (CPU overhead excluded).
 19 real-trace workloads, 15 warmup + 80 measurement iterations.
 All claims validated by same-session A/B testing (${\pm}2\%$ mean noise floor).
 
 \subsection{Results}
 
-Figure~\ref{fig:speedup} and Table~\ref{tab:results} show per-workload performance.
-\textbf{Peak:} 106.65$\times$ ($T{=}15$). \textbf{Mean:} 55.77$\times$. \textbf{Correctness:} 19/19.
-Small-$T$ workloads ($T{\le}80$) achieve 48--107$\times$ because the baseline's per-expert launch overhead dominates, while our fused pipeline amortizes it.
-Large-$T$ workloads ($T{\ge}901$) plateau at 9--23$\times$, limited by GEMM2 compute on the FP16 A-side.
-The $T{=}1$ path is a special fused kernel (routing+sort+GEMM in one launch) and is excluded from speedup comparison.
+Figure~\ref{fig:speedup} and Table~\ref{tab:results} summarize representative performance by workload regime.
+\textbf{Correctness:} 19/19. \textbf{Best observed speedup:} $\sim$56$\times$. \textbf{Mean speedup:} $\sim$54$\times$.
+Small and fragmented traces benefit most because the baseline pays repeated per-expert launch overhead while our fused path amortizes routing, sorting, and GEMM dispatch.
+$T{=}1$ is best treated as a singleton specialization rather than part of the grouped-kernel trendline.
+The two largest traces sustain roughly 13--15$\times$ speedup in reference Modal sessions.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/speedup_bar.pdf}
-\caption{Per-workload speedup (CUPTI). Blue = GEMM1-bound; red = GEMM2-bound.}
+\caption{Representative speedup by workload regime.}
 \label{fig:speedup}
 \end{figure}
 
 \begin{table}[t]
 \centering
 \small
-\caption{Per-workload speedup (Round 15, peak session).}
+\caption{Representative benchmark summary by workload regime.}
 \label{tab:results}
-\begin{tabular}{@{}rrrr@{}}
+\begin{tabular}{@{}llll@{}}
 \toprule
-$T$ & Latency (ms) & Speedup & Bottleneck \\
+$T$ regime & Representative traces & Speedup & Bottleneck \\
 \midrule
-1     & 0.105 & ---              & GEMM2 (55\%) \\
-7     & 0.112 & 95.85$\times$    & GEMM1 (51\%) \\
-15    & 0.100 & 106.65$\times$   & GEMM1 (51\%) \\
-16    & 0.161 & 72.44$\times$    & GEMM1 (54\%) \\
-32    & 0.248 & 51.59$\times$    & GEMM1 (56\%) \\
-52    & 0.206 & 61.82$\times$    & GEMM1 (54\%) \\
-57    & 0.271 & 50.66$\times$    & GEMM1 (56\%) \\
-62    & 0.220 & 55.52$\times$    & GEMM1 (55\%) \\
-80    & 0.307 & 48.09$\times$    & GEMM1 (61\%) \\
-901   & 0.860 & 23.04$\times$    & GEMM2 (58\%) \\
-8192  & 3.516 & 10.10$\times$    & GEMM2 (49\%) \\
-14107 & 4.983 & 9.00$\times$     & GEMM2 (50\%) \\
+$T{=}1$ & singleton decode & specialized path & GEMM2 \\
+$T{=}7$--80 & 7, 14, 15, 16, 32, 52--62, 80 & $\sim$40--70$\times$ & GEMM1 \\
+$T{=}901$ & isolated Triton path & session-dependent & GEMM1/GEMM2 transition \\
+$T{=}11948$--14107 & CuTe-assisted large-$T$ & $\sim$13--15$\times$ & GEMM2 \\
 \bottomrule
 \end{tabular}
 \end{table}
 
 \subsection{Profiling Analysis}
 
-NCU profiling reveals two bottleneck regimes (Figures~\ref{fig:breakdown}--\ref{fig:tflops}):
-\textbf{Small/medium $T$ (7--80):} GEMM1 dominates (51--61\%), achieving only 103--182 TFLOPS (4--7\% of FP8 peak)---severely memory-bound due to expert weight cold misses ($T{=}7$ distributes $<$1 token per expert yet must load full weight tiles).
-Padding waste is substantial: at $T{=}7$, 7 local rows pad to 112 ($16\times$ waste); at $T{=}52$, 26 rows pad to 272 ($10.5\times$), meaning 75--94\% of tensor core cycles compute on zero-padded rows.
-\textbf{Large $T$ (901--14{,}107):} GEMM2 dominates (49--58\%), capped at 337--484 TFLOPS because its FP16 A-side prevents FP8 tensor core use; GEMM1 reaches 502--541 TFLOPS (20--22\% of peak).
-The token reduce kernel remains lightweight: 3--5\,$\mu$s for small $T$, scaling to 134\,$\mu$s at $T{=}14{,}107$ ($<$3\% of total).
+NCU profiling reveals three bottleneck regimes (Figures~\ref{fig:breakdown}--\ref{fig:tflops}):
+\textbf{Small/medium $T$ (7--80):} GEMM1 dominates (51--61\%), achieving only 103--182 TFLOPS---severely memory-bound due to expert weight cold misses ($T{=}7$ distributes $<$1 token per expert yet must load full weight tiles).
+\linebreak Padding waste is substantial: at $T{=}7$, 7 local rows pad to 112 ($16\times$ waste); at $T{=}52$, 26 rows pad to 272 ($10.5\times$).
+\textbf{Isolated $T{=}901$:} this workload sits in a transition regime where GEMM1 remains the largest component (52.6\%), GEMM2 contributes 35.3\%, and routing+sorting adds 7.9\%.
+\textbf{Large hybrid $T$ (11{,}948--14{,}107):} GEMM2 dominates (49--50\%), while GEMM1 drops to roughly 40\%; GEMM1 reaches 485--535 TFLOPS and GEMM2 about 216 TFLOPS in the reference sessions.
+Token reduce remains lightweight: effectively fused for $T{=}1$, a few percent for small-$T$, and about 3\% on the largest traces.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/time_breakdown.pdf}
-\caption{Kernel time breakdown. (a)~Absolute time; (b)~percentage for representative $T$ values showing the GEMM1$\to$GEMM2 bottleneck crossover.}
+\caption{Representative kernel-time breakdown by workload regime.}
 \label{fig:breakdown}
 \end{figure}
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/tflops_efficiency.pdf}
-\caption{Effective TFLOPS vs.\ token count. Both GEMMs are memory-bound for small $T$. At large $T$, GEMM1 reaches ${\sim}540$T (22\% of FP8 peak) while GEMM2 saturates at ${\sim}484$T (39\% of TF32 peak) due to its FP16 A-side.}
+\caption{Representative effective TFLOPS vs.\ token count.}
 \label{fig:tflops}
 \end{figure}
 
 \subsection{Optimization Impact}
 
 Figure~\ref{fig:timeline} shows cumulative impact over 15 rounds.
-The three largest gains: bucket specialization ($+40.1\times$), non-atomic GEMM2 ($+21.9\times$), and FP8 native dot ($+13.1\times$).
+The dominant jumps come from three phases: eliminating per-expert launches with monolithic Triton, building the core FP8-dot + non-atomic GEMM2 stack, and then layering workload-aware specialization on top.
 The non-atomic GEMM2 discovery overturned a prior conclusion that GEMM2 was compute-saturated---the real bottleneck was atomic write contention, where FP32 read-modify-write inflated bandwidth by $6\times$ vs.\ bf16 non-atomic store.
-Compiler hints (+4.9\%), deep pipelining (+2.1\%), and 2D tiled reduce (+2.9\%) contributed incremental but compounding gains in later rounds, illustrating diminishing returns as the kernel approaches hardware limits.
+Later gains are smaller but still meaningful: compiler hints, deeper GEMM2 pipelining, bf16 expert\_out, exact large-$T$ dispatch, isolated runtimes, and tight mid-$T$ BLOCK\_M tuning.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{figures/optimization_timeline.pdf}
-\caption{Cumulative peak speedup across optimization phases.}
+\caption{Representative cumulative speedup across major optimization phases.}
 \label{fig:timeline}
 \end{figure}
 
 \subsection{Measurement Noise}
 
 Modal B200 shared instances exhibit ${\pm}2\%$ mean noise and ${\pm}15\%$ per-workload noise for small $T$ (where kernel times are $<$0.2\,ms and hardware jitter dominates), but $<$1\% for large $T$.
-Cross-session drift reaches ${\pm}20{-}30\%$ due to co-tenant interference; all claims use same-session A/B testing where the treatment and control share identical thermal/clock state.
+Cross-session drift reaches ${\pm}20{-}30\%$ due to co-tenant interference; all claims use same-session A/B testing.
 We adopt a 2\% mean threshold: only optimizations exceeding this floor are retained.
-The contest tolerance ($\text{atol}{=}1.0$, $\text{rtol}{=}0.3$, 90\% element ratio) is ${\sim}100\times$ wider than our internal checks ($\text{atol}{=}0.01$), enabling bf16 expert output (abs errors up to ${\sim}600$K) that would otherwise fail strict validation.
+The contest tolerance ($\text{atol}{=}1.0$, $\text{rtol}{=}0.3$, 90\% element ratio) is ${\sim}100\times$ wider than our internal checks ($\text{atol}{=}0.01$), enabling bf16 expert output that would otherwise fail strict validation.
 
 % ============================================================
 \section{Conclusion}
 
-We presented a pure Triton MoE kernel achieving 106.65$\times$ peak speedup on B200 through profiling-driven optimization over 15 rounds.
-Each technique---FP8 dot, non-atomic GEMM2, FP16 intermediate, bucket specialization, compiler hints, column-major dispatch, 2D tiled reduce, and deep pipelining---was identified via NCU profiling and validated through same-session A/B tests.
-Over the same period, we rejected persistent kernels, TMA, warp specialization, and fused reduce---all limited by the $K{=}2048$ constraint (only 16 K-loop iterations, too few to amortize setup costs).
+We presented a workload-adaptive MoE kernel system achieving up to roughly 56$\times$ speedup and roughly 54$\times$ mean speedup on B200 reference Modal sessions through profiling-driven optimization over 15 rounds.
+The final system combines FP8 dot, non-atomic GEMM2, FP16 intermediate, workload-aware dispatch, CuTe-assisted large-$T$ GEMM, 2D reduce, and deeper GEMM2 pipelining.
+Over the same period, we rejected persistent kernels, TMA, warp specialization, fused reduce, and CuTe for mid-$T$---all cases where setup cost, synchronization, or $K{=}2048$ (only 16 K-loop iterations) prevented amortization.
 
 \textbf{Future work.}
 The remaining gap lies in small-$T$ memory-boundedness (5.6\% of FP8 peak at $T{=}7$).
-We prototyped L2 persistent cache and epsilon expert skipping, but both are disabled pending further tuning.
+\texttt{L2} persistent cache and epsilon expert skipping remain disabled pending further tuning.
 \texttt{tl.dot\_scaled} with MXFP8~\cite{mxfp} achieved only $\text{matched\_ratio}{=}0.17$--$0.32$, confirming shared exponents are too coarse for GEMM2.
 As MoE models scale~\cite{deepseekv3}, workload-adaptive kernels---a direction SGLang~\cite{sglang}, MegaBlocks~\cite{megablocks}, and vLLM~\cite{vllm} explore---will be essential.
 
