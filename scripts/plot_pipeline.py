@@ -12,11 +12,11 @@ ax.axis('off')
 
 # Stage boxes
 stages = [
-    (0.0, 'Routing', '#bbdefb', 'Pure Triton'),
-    (3.0, 'Sorting', '#bbdefb', 'Triton/CPU'),
+    (0.0, 'Routing', '#bbdefb', 'Triton'),
+    (3.0, 'Sorting', '#bbdefb', 'Triton'),
     (6.0, 'GEMM1\n+ SwiGLU', '#bbdefb', 'FP8 dot'),
     (10.0, 'GEMM2', '#bbdefb', 'Non-atomic'),
-    (14.0, 'Token\nReduce', '#bbdefb', 'Zero-copy'),
+    (14.0, 'Token\nReduce', '#bbdefb', 'Atomic-free'),
 ]
 
 # Buffer boxes

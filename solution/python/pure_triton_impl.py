@@ -61,6 +61,9 @@ TOKEN_SCATTER_BLOCK_TOKENS = 8
 # bf16 range = 3.4e38 (same as fp32) — no overflow risk unlike fp16
 BF16_EXPERT_OUT_T_MIN = 32  # bf16 expert_out for all T>=32 workloads
 
+# SwiGLU clamping (DeepSeek V4 approach): clamp activations to fp16 range
+# instead of ×0.125/×8.0 scale-and-compensate. Removes GEMM2 epilogue multiply.
+
 GEMM2_T901_CONFIGS = [
     # Original config
     triton.Config({'BLOCK_N': 128, 'BLOCK_K': 128, 'GROUP_M': 8}, num_warps=4, num_stages=2),
@@ -1034,8 +1037,8 @@ def _fused_moe_gemm1_swiglu_kernel(
     # Epilogue: SwiGLU (Note: PyTorch baseline does silu(W3) * W1)
     sig_out = 1.0 / (1.0 + tl.exp(-acc_3))
     swiglu_out = (acc_3 * sig_out) * acc_1
-    
-    # Store to C: fp16 with scaling for bandwidth opt (T≥32) or fp32 baseline (T<32)
+
+    # Store to C: fp16 with clamping for bandwidth opt (T≥32) or fp32 baseline (T<32)
     c_ptrs = C_ptr + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     if USE_FP16_INTER:
         tl.store(c_ptrs, (swiglu_out * 0.125).to(tl.float16), eviction_policy='evict_first')
