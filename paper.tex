@@ -130,6 +130,7 @@ This yields ${\sim}2\times$ throughput vs.\ TF32, which requires FP8$\to$FP32 de
 
 Na\"ive \texttt{tl.atomic\_add} causes $6\times$ bandwidth amplification (12~B/elem FP32 RMW vs.\ 2~B bf16 store).
 We split GEMM2 and reduction: GEMM2 writes non-atomic \texttt{expert\_out} (bf16 where enabled), then a token-centric reduce loads 8 contributions per token. For large $T$, 2D tiling cuts the reduce grid $>$10$\times$.
+A/B testing confirmed this as one of the largest single gains, especially on medium-$T$ workloads where atomic contention previously dominated.
 
 \subsection{FP16 Intermediate with Scale Compensation}
 
@@ -146,8 +147,9 @@ For fragmented $T{=}53$--59, BLOCK\_M=8 reduces padding and invalid-row compute.
 
 \subsection{Routing, Sorting, and Autotuning Support}
 
-Routing uses a Triton kernel implementing group-filter then global top-K selection with pre-allocated workspaces; sorting uses tile-parallel histogram/offset construction.
-Autotuning is workload-specific: tile shapes, \texttt{BLOCK\_K}, and stage depth are selected per regime.
+Several supporting optimizations are smaller individually but important to the final system.
+Routing uses a Triton kernel implementing group-filter then global top-K selection with pre-allocated workspaces; sorting uses tile-parallel histogram/offset construction and, for large traces, reuses the histogram structure in dispatch.
+Autotuning remains workload-specific: GEMM1/GEMM2 tile shapes, \texttt{BLOCK\_K}, and stage depth are selected per regime rather than by a single global configuration.
 
 \subsection{CuTe-Assisted Large-T GEMM}
 
@@ -269,7 +271,7 @@ $11948$--$14107$ & large-$T$ & ${\sim}13$--$15\times$ & GEMM2 \\
 NCU profiling reveals three bottleneck regimes (Figures~\ref{fig:breakdown}--\ref{fig:tflops}):
 \textbf{Small/medium $T$ (7--80):} GEMM1 dominates because expert weights are repeatedly loaded for very few routed rows, with substantial padding waste.
 \textbf{$T{=}901$:} the workload sits in a GEMM1/GEMM2 transition regime, motivating an isolated path.
-\textbf{Large hybrid $T$ (11{,}948--14{,}107):} GEMM2 is the efficiency bottleneck---its FP16 A-side prevents FP8 tensor core use. CuTe improves the grouped-GEMM core.
+\textbf{Large hybrid $T$ (11{,}948--14{,}107):} GEMM1 still takes the larger time share (2$\times$ the FLOPs from fused $W_1$/$W_3$), but GEMM2 is the efficiency bottleneck---its FP16 A-side prevents FP8 tensor core use, capping throughput well below peak. CuTe improves the grouped-GEMM core.
 Token reduce remains lightweight across regimes.
 
 \begin{figure}[t]
@@ -290,7 +292,7 @@ Token reduce remains lightweight across regimes.
 
 Figure~\ref{fig:timeline} shows cumulative impact over 23 rounds of optimization.
 The largest jumps come from eliminating per-expert launches, building the FP8-dot/non-atomic GEMM2 backbone, and then adding workload-aware specialization.
-Later gains are smaller but cumulative (compiler hints, pipelining, bf16 expert\_out, tight BLOCK\_M tuning).
+Later gains are smaller but cumulative: compiler hints, deeper GEMM2 pipelining, bf16 expert\_out, exact large-$T$ dispatch, isolated runtimes, and tight mid-$T$ BLOCK\_M tuning.
 
 \begin{figure}[t]
 \centering
@@ -301,8 +303,17 @@ Later gains are smaller but cumulative (compiler hints, pipelining, bf16 expert\
 
 \subsection{Measurement Noise}
 
-Modal B200 shared instances exhibit ${\pm}2\%$ mean noise (${\pm}15\%$ per-workload for small $T$). Cross-session drift reaches ${\pm}20{-}30\%$; all claims use same-session A/B testing with a 2\% mean threshold.
-The contest tolerance ($\text{atol}{=}1.0$, $\text{rtol}{=}0.3$) is ${\sim}100\times$ wider than our internal checks, enabling bf16 expert output.
+Modal B200 shared instances exhibit ${\pm}2\%$ mean noise and ${\pm}15\%$ per-workload noise for small $T$, but $<$1\% for large $T$.
+Cross-session drift reaches ${\pm}20{-}30\%$; all claims use same-session A/B testing with a 2\% mean threshold.
+The contest tolerance ($\text{atol}{=}1.0$, $\text{rtol}{=}0.3$, 90\%) is ${\sim}100\times$ wider than our internal checks, enabling bf16 expert output.
+
+% ============================================================
+\section{Tools \& Languages}
+
+All kernels use \textbf{Triton}~\cite{triton}, chosen for rapid iteration, built-in autotuning, and first-class FP8 tensor core support on Blackwell.
+For the two largest traces, the grouped-GEMM core is offloaded to \textbf{CuTe DSL}~\cite{cutlass} for tighter warp-level control.
+Host orchestration uses \textbf{PyTorch}.
+We evaluated but did not adopt raw CUDA, Tilelang, or CuTile: Triton's autotuner and FP8 intrinsics sufficed for 17/19 workloads, and CuTe covered the remaining two.
 
 % ============================================================
 \section{Human vs.\ Agent Contributions}
@@ -315,19 +326,11 @@ All final optimizations were human-reviewed against correctness, benchmark stabi
 % ============================================================
 \section{Conclusion}
 
-We presented a workload-adaptive MoE kernel system achieving ${\sim}56\times$ peak and ${\sim}54\times$ mean speedup on B200 through 23 rounds of profiling-driven optimization.
-The system combines FP8 dot, non-atomic GEMM2, FP16 intermediate, workload-aware dispatch, CuTe-assisted large-$T$ GEMM, and deeper pipelining.
-Eight rejected approaches fall into two groups: precision failures (FP8/bf16 buffers) and amortization failures where $K{=}2048$ (16 K-loop iterations) does not justify setup overhead.
-
-\textbf{Future work.}
-The remaining gap lies in small-$T$ memory-boundedness (5.6\% of FP8 peak at $T{=}7$).
-\texttt{L2} persistent cache and epsilon expert skipping remain disabled pending further tuning.
-\texttt{tl.dot\_scaled} with MXFP8~\cite{mxfp} achieved only $\text{matched\_ratio}{=}0.17$--$0.32$, confirming shared exponents are too coarse for GEMM2.
-As MoE models scale, workload-adaptive kernels will be essential.
+We presented a workload-adaptive MoE kernel system achieving ${\sim}56\times$ peak and ${\sim}54\times$ mean speedup on B200 through 23 rounds of profiling-driven optimization, combining FP8 dot, non-atomic GEMM2, FP16 intermediate, workload-aware dispatch, and CuTe-assisted large-$T$ GEMM.
+Eight rejected approaches fall into precision failures and amortization failures where $K{=}2048$ does not justify setup cost.
 
 \begin{thebibliography}{9}
 \small
-\setlength{\itemsep}{0pt}\setlength{\parskip}{0pt}
 \bibitem{deepseekv3}
 DeepSeek-AI. DeepSeek-V3 technical report. \emph{arXiv:2412.19437}, 2024.
 
