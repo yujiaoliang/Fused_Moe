@@ -27,7 +27,7 @@ colors = [
 
 plot_vals = [v if v is not None else 0.0 for v in speedup]
 
-fig, ax = plt.subplots(figsize=(7, 3.2))
+fig, ax = plt.subplots(figsize=(7, 3.45))
 bars = ax.bar(
     range(len(labels)),
     plot_vals,
@@ -59,9 +59,18 @@ legend_elements = [
     Patch(facecolor="#2e7d32", label="Isolated transition regime ($T{=}901$)"),
     Patch(facecolor="#d32f2f", label="Hybrid large-$T$"),
 ]
-ax.legend(handles=legend_elements, fontsize=7.5, loc="upper right", framealpha=0.92)
+ax.legend(
+    handles=legend_elements,
+    fontsize=7.2,
+    loc="upper center",
+    bbox_to_anchor=(0.5, -0.22),
+    ncol=2,
+    framealpha=0.92,
+    columnspacing=1.2,
+    handlelength=1.4,
+)
 
-plt.tight_layout()
+plt.tight_layout(rect=(0, 0.12, 1, 1))
 plt.savefig(OUT_DIR / "speedup_bar.pdf", bbox_inches="tight", dpi=300)
 plt.savefig(OUT_DIR / "speedup_bar.png", bbox_inches="tight", dpi=300)
 print("Saved figures/speedup_bar.pdf and .png")
