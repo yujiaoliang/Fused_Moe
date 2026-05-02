@@ -376,7 +376,7 @@ mlsys_note/
 
 **标题：** *Fused MoE Inference on Blackwell: A Pure Triton Approach to DeepSeek-V3 Expert Dispatch*
 
-**作者：** Jiayao Zhang, Yujiao Liang
+**作者：** Jiayao Zhang, Jiaoliang Yu
 
 > **注：** 论文标题为 "Pure Triton"，最终提交已演进为 Triton + CuTe DSL 混合架构（CuTe DSL 处理 2 个大 T workloads）。
 

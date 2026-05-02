@@ -199,9 +199,9 @@ Approach & Result & Root Cause \\
 \midrule
 FP8 Intermediate & 0/19 & 3-bit mantissa; SwiGLU exceeds fp8 range \\
 \addlinespace
-bf16 Intermediate & 8/19 & Low mantissa precision; ptxas register failure \\
+bf16 Intermediate & 10/19 & Low mantissa precision; ptxas register failure \\
 \addlinespace
-Persistent GEMM2 & $-$1.0\% & K=2048 too short for weight reuse \\
+Persistent GEMM2 & $-$70\% & Grid 14K$\to$260 programs; lost TLP \\
 \addlinespace
 TMA Descriptor & $-$4\% & Setup cost not amortized over 16 K-tiles \\
 \addlinespace
@@ -324,7 +324,7 @@ All final optimizations were human-reviewed against correctness, benchmark stabi
 % ============================================================
 \section{Conclusion}
 
-We presented a workload-adaptive MoE kernel system achieving ${\sim}56\times$ peak and ${\sim}54\times$ mean speedup on B200 through 15 rounds of profiling-driven optimization, combining FP8 dot, non-atomic GEMM2, FP16 intermediate, workload-aware dispatch, and CuTe-assisted large-$T$ GEMM.
+We presented a workload-adaptive MoE kernel system achieving ${\sim}56\times$ peak and ${\sim}54\times$ mean speedup on B200 through 23 rounds of profiling-driven optimization, combining FP8 dot, non-atomic GEMM2, FP16 intermediate, workload-aware dispatch, and CuTe-assisted large-$T$ GEMM.
 Eight rejected approaches fall into precision failures and amortization failures where $K{=}2048$ does not justify setup cost.
 
 \begin{thebibliography}{9}

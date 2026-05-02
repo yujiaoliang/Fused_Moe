@@ -379,7 +379,7 @@ All three kernels (GEMM1, GEMM2, token_reduce) have fully saturated autotune spa
 
 **Title:** *Fused MoE Inference on Blackwell: A Pure Triton Approach to DeepSeek-V3 Expert Dispatch*
 
-**Authors:** Jiayao Zhang, Yujiao Liang
+**Authors:** Jiayao Zhang, Jiaoliang Yu
 
 > **Note:** The paper title references "Pure Triton" as the core approach. The final submission evolved into a hybrid Triton + CuTe DSL architecture, where CuTe DSL handles 2 large-T workloads for additional performance.
 
