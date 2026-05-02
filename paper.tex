@@ -58,7 +58,7 @@ Our contributions:
 \item Native FP8 tensor core dot in GEMM1, delivering 2$\times$ throughput over TF32;
 \item Non-atomic GEMM2 with token-centric reduce, yielding +46\% on medium-$T$;
 \item FP16 intermediate buffers with $\times$0.125/$\times$8.0 compensation ($-$50\% bandwidth);
-\item Workload-aware dispatch, including singleton, tight-padding, static-cap, and CuTe-assisted large-$T$ buckets.
+\item Workload-aware dispatch, including singleton, tight-padding, isolated transition, and CuTe-assisted large-$T$ buckets.
 \end{enumerate}
 
 % ============================================================
@@ -154,7 +154,7 @@ Autotuning remains workload-specific: GEMM1/GEMM2 tile shapes, \texttt{BLOCK\_K}
 \subsection{CuTe-Assisted Large-T GEMM}
 
 For the largest traces, bottlenecks shift from launch/padding overhead to sustained grouped GEMM throughput.
-We therefore use a hybrid path for $T{=}11{,}948$ and $T{=}14{,}107$: Triton handles sparse metadata and epilogues, while CuTe~\cite{cutlass} executes the grouped GEMM core.
+We therefore use a hybrid path for $T{=}11{,}948$ and $T{=}14{,}107$: Triton handles sparse metadata and epilogues, while CuTe executes the grouped GEMM core.
 We do not use CuTe for small/mid-$T$, where metadata and setup dominate.
 
 \subsection{bf16 Expert Output Buffer}
@@ -310,10 +310,8 @@ The contest tolerance ($\text{atol}{=}1.0$, $\text{rtol}{=}0.3$, 90\%) is ${\sim
 % ============================================================
 \section{Tools \& Languages}
 
-All kernels use \textbf{Triton}~\cite{triton}, chosen for rapid iteration, built-in autotuning, and first-class FP8 tensor core support on Blackwell.
-For the two largest traces, the grouped-GEMM core is offloaded to \textbf{CuTe DSL}~\cite{cutlass} for tighter warp-level control.
-Host orchestration uses \textbf{PyTorch}.
-We evaluated but did not adopt raw CUDA, Tilelang, or CuTile: Triton's autotuner and FP8 intrinsics sufficed for 17/19 workloads, and CuTe covered the remaining two.
+We implement in \textbf{Python}, using \textbf{Triton}~\cite{triton} for routing/sorting/GEMM/reduce kernels and \textbf{CuTe DSL} for the two largest grouped-GEMM workloads.
+We evaluated raw CUDA, Tilelang, and CuTile, but retained Triton/CuTe because Triton's FP8 intrinsics and autotuner covered 17/19 workloads efficiently and CuTe cleanly handled the remaining two.
 
 % ============================================================
 \section{Human vs.\ Agent Contributions}
@@ -326,7 +324,7 @@ All final optimizations were human-reviewed against correctness, benchmark stabi
 % ============================================================
 \section{Conclusion}
 
-We presented a workload-adaptive MoE kernel system achieving ${\sim}56\times$ peak and ${\sim}54\times$ mean speedup on B200 through 23 rounds of profiling-driven optimization, combining FP8 dot, non-atomic GEMM2, FP16 intermediate, workload-aware dispatch, and CuTe-assisted large-$T$ GEMM.
+We presented a workload-adaptive MoE kernel system achieving ${\sim}56\times$ peak and ${\sim}54\times$ mean speedup on B200 through 15 rounds of profiling-driven optimization, combining FP8 dot, non-atomic GEMM2, FP16 intermediate, workload-aware dispatch, and CuTe-assisted large-$T$ GEMM.
 Eight rejected approaches fall into precision failures and amortization failures where $K{=}2048$ does not justify setup cost.
 
 \begin{thebibliography}{9}
@@ -343,8 +341,6 @@ B.~Darvish~Rouhani et al. Microscaling data formats for deep learning. \emph{arX
 \bibitem{flashinfer}
 Z.~Ye et al. FlashInfer: Efficient and customizable attention engine for LLM inference serving. \emph{arXiv:2501.01005}, 2025.
 
-\bibitem{cutlass}
-A.~Kerr et al. CUTLASS: Fast linear algebra in CUDA C++. NVIDIA, 2017--2025.
 \end{thebibliography}
 
 \end{document}
