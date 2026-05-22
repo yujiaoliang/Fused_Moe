@@ -1,39 +1,43 @@
-# Fused MoE Kernel Optimization
+# Fused MoE Kernel Demo
 
-> **Fused MoE Inference Kernel — Hybrid Triton + CuTe DSL for DeepSeek-V3 Expert Dispatch on NVIDIA B200 Blackwell**
+> **A compact demo of a fused DeepSeek-V3 MoE inference kernel built with Triton and CuTe DSL.**
 
-[![Status](https://img.shields.io/badge/Status-19%2F19%20PASSED-brightgreen)](#key-results)
+[![Status](https://img.shields.io/badge/Status-19%2F19%20PASSED-brightgreen)](#demo-highlights)
 [![GPU](https://img.shields.io/badge/GPU-NVIDIA%20B200%20(sm100a)-76b900)](https://www.nvidia.com/en-us/data-center/b200/)
 [![Triton](https://img.shields.io/badge/Triton-3.6.0-blue)](https://github.com/triton-lang/triton)
 [![CuTe DSL](https://img.shields.io/badge/CuTe%20DSL-CUTLASS-blue)](https://github.com/NVIDIA/cutlass)
-[![Peak Speedup](https://img.shields.io/badge/Peak%20Speedup-~56x-orange)](#key-results)
+[![Peak Speedup](https://img.shields.io/badge/Peak%20Speedup-~56x-orange)](#demo-highlights)
 [![中文](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87%E7%89%88-red)](README_CN.md)
 
-A hybrid **[Triton](https://github.com/triton-lang/triton) + [CuTe DSL](https://github.com/NVIDIA/cutlass)** implementation of the DeepSeek-V3 Mixture-of-Experts (MoE) inference kernel, targeting **NVIDIA B200 (Blackwell, sm_100a)**.
+This repository demonstrates a high-performance implementation of the DeepSeek-V3 Mixture-of-Experts (MoE) inference path. It fuses routing, token sorting, expert GEMMs, activation, and token reduction into a small set of GPU kernels, with a hybrid **[Triton](https://github.com/triton-lang/triton) + [CuTe DSL](https://github.com/NVIDIA/cutlass)** backend targeting **B200 / Blackwell (sm_100a)**.
 
-- **Triton** powers 17/19 workloads (routing, sorting, GEMM1+SwiGLU, GEMM2, token reduce)
-- **CuTe DSL** (NVIDIA CUTLASS) handles 2/19 large-T workloads (T=11948, T=14107) via grouped GEMM with per-T isolated runtimes
+The project is intended as a readable demo and reference implementation:
+
+- `solution/python/kernel.py` is the main entry point.
+- Triton handles routing, sorting, GEMM1+SwiGLU, GEMM2, and token reduction for most workloads.
+- CuTe DSL handles the two largest trace shapes with isolated grouped-GEMM runtimes.
+- Scripts under `scripts/` package, benchmark, profile, and compare kernel variants.
 
 **19/19 workloads passed** | Peak ~56x | Large-T ~13–15x | Mean ~54x (session-dependent)
 
-> **Note on absolute speedup numbers:** Modal B200 shared instances have no clock-locking; the same code can fluctuate 20–30% across sessions. Official evaluation runs on bare-metal B200 with locked clocks (`nvidia-smi -ac 3996,1965`). Numbers here are for relative trend reference only.
+> **Performance note:** Absolute speedup numbers vary across machines and cloud sessions, especially when clocks are not locked. Treat the numbers here as reference measurements for the implementation, not as portable guarantees.
 
 ---
 
 ## Table of Contents
 
-- [Key Results](#key-results)
+- [Demo Highlights](#demo-highlights)
 - [Architecture](#architecture)
 - [Quick Start](#quick-start)
 - [Project Structure](#project-structure)
-- [Evaluation Environment](#evaluation-environment)
+- [Benchmark Environment](#benchmark-environment)
 - [Optimization Journey](#optimization-journey)
 - [Paper](#paper)
 - [Constraints](#constraints)
 
 ---
 
-## Key Results
+## Demo Highlights
 
 | Metric | Value |
 |--------|-------|
@@ -41,7 +45,7 @@ A hybrid **[Triton](https://github.com/triton-lang/triton) + [CuTe DSL](https://
 | Peak Speedup | ~56x (Modal B200, session-dependent) |
 | Large-T Speedup (T=8192–14107) | ~13–15x |
 | Mean Speedup | ~54x |
-| Scoring Method | CUPTI GPU kernel time only (CPU overhead excluded) |
+| Timing Method | CUPTI GPU kernel time only (CPU overhead excluded) |
 
 ---
 
@@ -192,7 +196,7 @@ mlsys_note/
 
 ---
 
-## Evaluation Environment
+## Benchmark Environment
 
 | Item | Value |
 |------|-------|
@@ -202,7 +206,7 @@ mlsys_note/
 | CuTe DSL | nvidia-cutlass-dsl (CUTLASS) |
 | GPU | B200 (bare-metal, sm_100a) |
 | Tolerance | `--atol 1 --rtol 0.3 --required-matched-ratio 0.9` |
-| Scoring | Sum of CUPTI GPU kernel times (CPU overhead excluded) |
+| Timing | Sum of CUPTI GPU kernel times (CPU overhead excluded) |
 
 ---
 
@@ -268,11 +272,11 @@ mlsys_note/
 </details>
 
 <details>
-<summary><b>Phase 5: Evaluation Rule-Aware Optimization</b></summary>
+<summary><b>Phase 5: Benchmark-Setting-Aware Optimization</b></summary>
 
-**Key evaluation-setting updates (Apr 14–15 clarification):**
+**Key benchmark-setting updates:**
 - **100x tolerance relaxation**: `atol=1.0, rtol=0.3, ratio=0.9` (we tested at `atol=0.01`)
-- **CUPTI GPU-only timing**: CPU overhead, launch latency, `.item()` syncs all excluded from scoring
+- **CUPTI GPU-only timing**: CPU overhead, launch latency, `.item()` syncs all excluded from timing
 - **Self-contained requirement**: cuBLAS/CUTLASS/FlashInfer runtime calls discouraged to keep the kernel implementation inspectable
 
 | Commit | Optimization | Result |
@@ -357,8 +361,8 @@ All kernel.py optimization commits are classified into four confidence levels:
 | TMA Accelerator | −1~2% | HBM bandwidth already saturated by LDG |
 | 1D Atomic Scatter | 8.3x → 5.37x | Scalar atomic storm crashed memory controller |
 | Fused GEMM2+Reduce (atomic_add) | −4.5~4.8% | 12 bytes/elem atomic vs 2 bytes bf16 store |
-| CUDA Graph for GEMMs | No benefit | CUPTI scores GPU kernel time only |
-| torch.compile on routing | No benefit | CPU overhead excluded from scoring |
+| CUDA Graph for GEMMs | No benefit | CUPTI measures GPU kernel time only |
+| torch.compile on routing | No benefit | CPU overhead excluded from timing |
 | Warp Specialization | Crashes / −34% | Needs TMA block pointers to benefit |
 | `tl.make_tensor_descriptor` (TMA) | −4% | Descriptor setup cost not amortized for K=2048 |
 | `num_ctas=2` without TMA | No benefit | Both CTAs compute identical tile |
@@ -418,7 +422,7 @@ The compiled paper is available at [`paper.pdf`](paper.pdf). Source: [`paper.tex
 |------------|-------------|
 | API Style | Destination-passing: `kernel(*inputs, *outputs)`, output is the last argument |
 | **Tolerance** | **`atol=1.0, rtol=0.3, matched_ratio=0.9`** — an element only fails if abs>1 AND rel>0.3 |
-| Scoring | Sum of CUPTI GPU kernel times; CPU overhead excluded |
+| Timing | Sum of CUPTI GPU kernel times; CPU overhead excluded |
 | Docker | `flashinfer/flashinfer-ci-cu132:20260401-2c675fb` (pinned) |
 | GPU Arch | sm_100a — must explicitly specify `-arch=sm_100a` in build flags |
 | cuBLAS/CUTLASS | Not hard-banned; minimized at runtime to keep the implementation self-contained |
@@ -454,7 +458,7 @@ Measured via back-to-back self-comparison on the **same Modal B200 session** (`a
 
 ## Notes
 
-1. **Evaluation environment is unified:** All Modal scripts use the official Docker image, PyTorch 2.12.0+cu132, Triton 3.6.0, CuTe DSL (CUTLASS), Python 3.12. Local (Windows) is for packing and code review only.
+1. **Benchmark environment is unified:** All Modal scripts use the same Docker image, PyTorch 2.12.0+cu132, Triton 3.6.0, CuTe DSL (CUTLASS), Python 3.12. Local (Windows) is for packing and code review only.
 
 2. **Three-way dispatch paths are independent:** Each can be iterated separately via `kernel.py`'s T-based routing. Per-T isolation ensures no shared state pollution.
 

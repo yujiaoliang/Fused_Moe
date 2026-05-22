@@ -1,39 +1,43 @@
-# 融合 MoE 推理核优化
+# 融合 MoE 推理核 Demo
 
-> **Hybrid Triton + CuTe DSL for DeepSeek-V3 Expert Dispatch on NVIDIA B200 Blackwell**
+> **一个基于 Triton 和 CuTe DSL 的 DeepSeek-V3 MoE 融合推理核 demo。**
 
-[![Status](https://img.shields.io/badge/%E7%8A%B6%E6%80%81-19%2F19%20%E9%80%9A%E8%BF%87-brightgreen)](#核心结果)
+[![Status](https://img.shields.io/badge/%E7%8A%B6%E6%80%81-19%2F19%20%E9%80%9A%E8%BF%87-brightgreen)](#demo-亮点)
 [![GPU](https://img.shields.io/badge/GPU-NVIDIA%20B200%20(sm100a)-76b900)](https://www.nvidia.com/en-us/data-center/b200/)
 [![Triton](https://img.shields.io/badge/Triton-3.6.0-blue)](https://github.com/triton-lang/triton)
 [![CuTe DSL](https://img.shields.io/badge/CuTe%20DSL-CUTLASS-blue)](https://github.com/NVIDIA/cutlass)
-[![Peak Speedup](https://img.shields.io/badge/%E5%B3%B0%E5%80%BC%E5%8A%A0%E9%80%9F-~56x-orange)](#核心结果)
+[![Peak Speedup](https://img.shields.io/badge/%E5%B3%B0%E5%80%BC%E5%8A%A0%E9%80%9F-~56x-orange)](#demo-亮点)
 [![English](https://img.shields.io/badge/lang-English-blue)](README.md)
 
-基于 **[Triton](https://github.com/triton-lang/triton) + [CuTe DSL](https://github.com/NVIDIA/cutlass)** 混合架构的 DeepSeek-V3 MoE 推理核实现，目标硬件 **NVIDIA B200 (Blackwell, sm_100a)**。
+这个仓库演示了 DeepSeek-V3 Mixture-of-Experts (MoE) 推理路径的一套高性能实现。它把 routing、token 排序、expert GEMM、激活函数和 token 归约融合到少量 GPU kernel 中，后端采用 **[Triton](https://github.com/triton-lang/triton) + [CuTe DSL](https://github.com/NVIDIA/cutlass)** 混合架构，目标硬件为 **B200 / Blackwell (sm_100a)**。
 
-- **Triton** 处理 17/19 workloads（routing、sorting、GEMM1+SwiGLU、GEMM2、token reduce）
-- **CuTe DSL**（NVIDIA CUTLASS）处理 2/19 大 T workloads（T=11948、T=14107），通过 per-T 隔离 runtime 的 grouped GEMM 实现
+这个项目更适合作为可读的 demo 和参考实现：
+
+- `solution/python/kernel.py` 是主入口。
+- Triton 负责大多数 workload 的 routing、sorting、GEMM1+SwiGLU、GEMM2 和 token reduce。
+- CuTe DSL 负责两个最大的 trace shape，并使用隔离的 grouped-GEMM runtime。
+- `scripts/` 下的脚本用于打包、benchmark、profile 和 A/B 对比 kernel 变体。
 
 **19/19 全部通过** | 峰值 ~56x | 大 T ~13–15x | 均值 ~54x (session-dependent)
 
-> **关于绝对 speedup 数值：** Modal B200 共享实例无锁频，同一代码不同时段可波动 20–30%。官方评测在裸金属 B200 + 锁频 (`nvidia-smi -ac 3996,1965`) 下运行。本文数值仅作相对趋势参考。
+> **性能说明：** 绝对 speedup 会随机器和云端 session 波动，尤其是在未锁频环境中。这里的数字更适合作为实现效果的参考测量，而不是跨环境保证。
 
 ---
 
 ## 目录
 
-- [核心结果](#核心结果)
+- [Demo 亮点](#demo-亮点)
 - [架构](#架构)
 - [快速开始](#快速开始)
 - [项目结构](#项目结构)
-- [评测环境](#评测环境)
+- [Benchmark 环境](#benchmark-环境)
 - [优化历程](#优化历程)
 - [论文](#论文)
 - [关键约束](#关键约束)
 
 ---
 
-## 核心结果
+## Demo 亮点
 
 | 指标 | 值 |
 |------|-----|
@@ -41,7 +45,7 @@
 | 峰值加速比 | ~56x (Modal B200, session-dependent) |
 | 大 T 加速比 (T=8192–14107) | ~13–15x |
 | 平均加速比 | ~54x |
-| 评分方式 | CUPTI GPU kernel 时间之和（CPU 开销不计入） |
+| 计时方式 | CUPTI GPU kernel 时间之和（CPU 开销不计入） |
 
 ---
 
@@ -191,7 +195,7 @@ mlsys_note/
 
 ---
 
-## 评测环境
+## Benchmark 环境
 
 | 项目 | 值 |
 |------|----|
@@ -201,7 +205,7 @@ mlsys_note/
 | CuTe DSL | nvidia-cutlass-dsl (CUTLASS) |
 | GPU | B200 (bare-metal, sm_100a) |
 | 容差 | `--atol 1 --rtol 0.3 --required-matched-ratio 0.9` |
-| 评分 | CUPTI GPU kernel 时间之和（CPU 开销不计入） |
+| 计时 | CUPTI GPU kernel 时间之和（CPU 开销不计入） |
 
 ---
 
@@ -267,11 +271,11 @@ mlsys_note/
 </details>
 
 <details>
-<summary><b>Phase 5：评测规则感知优化</b></summary>
+<summary><b>Phase 5：Benchmark 设置感知优化</b></summary>
 
-**关键评测设置更新（Apr 14–15 澄清）：**
+**关键 benchmark 设置更新：**
 - **容差 100x 放宽**：`atol=1.0, rtol=0.3, ratio=0.9`（我们之前测试用 `atol=0.01`）
-- **CUPTI GPU-only 计时**：CPU 开销、launch latency、`.item()` sync 全部不计入评分
+- **CUPTI GPU-only 计时**：CPU 开销、launch latency、`.item()` sync 全部不计入计时
 - **Self-contained 要求**：不推荐 cuBLAS/CUTLASS/FlashInfer runtime 调用，以便保持 kernel 实现可审查
 
 | Commit | 优化内容 | 结果 |
@@ -355,7 +359,7 @@ mlsys_note/
 | 1D Atomic Scatter | 8.3x → 5.37x | 标量原子风暴打瘫内存控制器 |
 | Fused GEMM2+Reduce (atomic_add) | −4.5~4.8% | 12 bytes/elem 原子 vs 2 bytes bf16 store |
 | CUDA Graph for GEMMs | 无收益 | CUPTI 仅计 GPU kernel 时间 |
-| torch.compile on routing | 无收益 | CPU overhead 不在评分范围 |
+| torch.compile on routing | 无收益 | CPU overhead 不在计时范围 |
 | Warp Specialization | 崩溃 / −34% | 需要 TMA block pointers 才能获益 |
 | `tl.make_tensor_descriptor` (TMA) | −4% | Descriptor 建立成本无法被 K=2048 摊销 |
 | `num_ctas=2` without TMA | 无收益 | 两个 CTA 计算完全相同的 tile |
@@ -414,8 +418,8 @@ mlsys_note/
 | 约束 | 说明 |
 |------|------|
 | API 风格 | Destination-passing：`kernel(*inputs, *outputs)`，output 是最后一个参数 |
-| **评测容差** | **`atol=1.0, rtol=0.3, matched_ratio=0.9`** — 元素仅在 abs>1 AND rel>0.3 时才 fail |
-| 评分方式 | CUPTI GPU kernel 时间之和，CPU 开销不计入 |
+| **容差** | **`atol=1.0, rtol=0.3, matched_ratio=0.9`** — 元素仅在 abs>1 AND rel>0.3 时才 fail |
+| 计时方式 | CUPTI GPU kernel 时间之和，CPU 开销不计入 |
 | Docker | `flashinfer/flashinfer-ci-cu132:20260401-2c675fb` (pinned) |
 | GPU 架构 | sm_100a — 需在 build flags 中显式指定 `-arch=sm_100a` |
 | cuBLAS/CUTLASS | 不硬禁；runtime 中尽量减少依赖，以保持实现自包含 |
@@ -451,7 +455,7 @@ mlsys_note/
 
 ## 注意事项
 
-1. **评测环境统一：** 所有 Modal 脚本使用官方 Docker image，PyTorch 2.12.0+cu132, Triton 3.6.0, CuTe DSL (CUTLASS), Python 3.12。本地 (Windows) 仅用于打包和代码审查。
+1. **Benchmark 环境统一：** 所有 Modal 脚本使用同一 Docker image，PyTorch 2.12.0+cu132, Triton 3.6.0, CuTe DSL (CUTLASS), Python 3.12。本地 (Windows) 仅用于打包和代码审查。
 
 2. **三路 Dispatch 可独立迭代：** 通过 `kernel.py` 的 T 值条件路由。Per-T 隔离确保无共享状态污染。
 
