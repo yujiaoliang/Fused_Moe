@@ -1,4 +1,4 @@
-# Fused MoE Kernel — Track A (MLSys 2026 FlashInfer-Bench Challenge)
+# Fused MoE Kernel Optimize
 
 > **Fused MoE Inference Kernel — Hybrid Triton + CuTe DSL for DeepSeek-V3 Expert Dispatch on NVIDIA B200 Blackwell**
 
