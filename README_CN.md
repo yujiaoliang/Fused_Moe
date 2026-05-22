@@ -1,4 +1,4 @@
-# 融合 MoE 推理核 — Track A (MLSys 2026 FlashInfer-Bench 挑战赛)
+# 融合 MoE 推理核优化
 
 > **Hybrid Triton + CuTe DSL for DeepSeek-V3 Expert Dispatch on NVIDIA B200 Blackwell**
 
@@ -9,7 +9,7 @@
 [![Peak Speedup](https://img.shields.io/badge/%E5%B3%B0%E5%80%BC%E5%8A%A0%E9%80%9F-~56x-orange)](#核心结果)
 [![English](https://img.shields.io/badge/lang-English-blue)](README.md)
 
-基于 **[Triton](https://github.com/triton-lang/triton) + [CuTe DSL](https://github.com/NVIDIA/cutlass)** 混合架构的 DeepSeek-V3 MoE 推理核实现，目标硬件 **NVIDIA B200 (Blackwell, sm_100a)**。为 [MLSys 2026 FlashInfer-Bench 挑战赛](https://github.com/flashinfer-ai/flashinfer-bench) **Track A** 开发。
+基于 **[Triton](https://github.com/triton-lang/triton) + [CuTe DSL](https://github.com/NVIDIA/cutlass)** 混合架构的 DeepSeek-V3 MoE 推理核实现，目标硬件 **NVIDIA B200 (Blackwell, sm_100a)**。
 
 - **Triton** 处理 17/19 workloads（routing、sorting、GEMM1+SwiGLU、GEMM2、token reduce）
 - **CuTe DSL**（NVIDIA CUTLASS）处理 2/19 大 T workloads（T=11948、T=14107），通过 per-T 隔离 runtime 的 grouped GEMM 实现
@@ -121,9 +121,8 @@ conda activate fi-bench
 # 2. 安装依赖
 pip install flashinfer-bench modal torch triton numpy
 
-# 3. 克隆比赛数据集
-git lfs install
-git clone https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest
+# 3. 准备 benchmark traces
+# 将 trace 数据放在 /path/to/benchmark-traces
 
 # 4. Modal 登录（一次性）
 modal setup
@@ -134,7 +133,7 @@ modal setup
 ```bash
 # 上传数据到 Modal volume（一次性）
 modal volume create flashinfer-trace
-modal volume put flashinfer-trace /path/to/mlsys26-contest /
+modal volume put flashinfer-trace /path/to/benchmark-traces /
 
 # 打包 & 运行
 python scripts/pack_solution_simple.py
@@ -165,7 +164,7 @@ python -m modal run scripts/ab_test_modal.py
 ```
 mlsys_note/
 ├── solution/
-│   └── python/                              # 提交代码目录 (config.toml: language=python)
+│   └── python/                              # 运行时代码目录 (config.toml: language=python)
 │       ├── kernel.py                        # 入口：三路 dispatch (CuTe / T=901 / Pure Triton)
 │       ├── pure_triton_impl.py              # Pure Triton 主实现 (16/19 workloads)
 │       ├── triton_impl.py                   # Hybrid CuTe+Triton 实现 (大 T workloads)
@@ -185,9 +184,9 @@ mlsys_note/
 │   └── ...
 ├── paper.tex                                # 技术论文 (LaTeX)
 ├── paper.pdf                                # 编译后论文
-├── config.toml                              # 配置（队名、赛道、entry_point）
-├── solution.json                            # 打包后的提交文件
-└── mlsys26-contest/                         # 比赛数据集 (submodule)
+├── config.toml                              # 运行配置
+├── solution.json                            # 打包后的 solution bundle
+└── benchmark-traces/                        # 可选的本地 benchmark trace 数据
 ```
 
 ---
@@ -268,12 +267,12 @@ mlsys_note/
 </details>
 
 <details>
-<summary><b>Phase 5：竞赛规则感知优化 (Round 10)</b></summary>
+<summary><b>Phase 5：评测规则感知优化</b></summary>
 
-**关键赛制更新（Apr 14–15 组委会澄清）：**
-- **容差 100x 放宽**：官方 `atol=1.0, rtol=0.3, ratio=0.9`（我们之前测试用 `atol=0.01`）
+**关键评测设置更新（Apr 14–15 澄清）：**
+- **容差 100x 放宽**：`atol=1.0, rtol=0.3, ratio=0.9`（我们之前测试用 `atol=0.01`）
 - **CUPTI GPU-only 计时**：CPU 开销、launch latency、`.item()` sync 全部不计入评分
-- **Self-contained 要求**：cuBLAS/CUTLASS/FlashInfer runtime 调用不推荐；组委会 "value seeing the team's own implementation"
+- **Self-contained 要求**：不推荐 cuBLAS/CUTLASS/FlashInfer runtime 调用，以便保持 kernel 实现可审查
 
 | Commit | 优化内容 | 结果 |
 |--------|---------|------|
@@ -378,7 +377,7 @@ mlsys_note/
 
 **作者：** Jiayao Zhang, Jiaoliang Yu
 
-> **注：** 论文标题为 "Pure Triton"，最终提交已演进为 Triton + CuTe DSL 混合架构（CuTe DSL 处理 2 个大 T workloads）。
+> **注：** 论文标题为 "Pure Triton"，最终实现已演进为 Triton + CuTe DSL 混合架构（CuTe DSL 处理 2 个大 T workloads）。
 
 **摘要：**
 我们提出了一种混合 Triton + CuTe DSL 的 DeepSeek-V3 MoE kernel 实现，目标硬件为 NVIDIA B200 (Blackwell, sm_100a) GPU。我们的 6 阶段流水线利用 FP8 原生 tensor core dot 在 GEMM1 中实现 2x 吞吐，采用非原子的两阶段 GEMM2-then-reduce 架构，使用 FP16 intermediate buffer 配合 scale-and-cast 补偿，以及四级 BLOCK_M 多桶特化。在 19 个真实 trace workloads (T=1 到 T=14,107) 上，系统达到 19/19 正确性，峰值加速比 106.65x（均值 55.77x），基于 CUPTI GPU-only kernel 计时。
@@ -419,9 +418,9 @@ mlsys_note/
 | 评分方式 | CUPTI GPU kernel 时间之和，CPU 开销不计入 |
 | Docker | `flashinfer/flashinfer-ci-cu132:20260401-2c675fb` (pinned) |
 | GPU 架构 | sm_100a — 需在 build flags 中显式指定 `-arch=sm_100a` |
-| cuBLAS/CUTLASS | 不硬禁，组委会 "value seeing team's own implementation" |
+| cuBLAS/CUTLASS | 不硬禁；runtime 中尽量减少依赖，以保持实现自包含 |
 | FlashInfer runtime | 不允许 runtime 调用 FlashInfer API；可复制源码到 repo |
-| Self-contained | 所有代码必须在 `solution/python/` 目录内，打包进 solution.json |
+| Self-contained | 运行时代码位于 `solution/python/` 目录内，打包进 solution.json |
 | 显存 | 32 experts × ~56MB FP8 = ~1.8GB；B200 ~180GB，不是瓶颈 |
 
 ---

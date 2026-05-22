@@ -1,4 +1,4 @@
-# Fused MoE Kernel Optimize
+# Fused MoE Kernel Optimization
 
 > **Fused MoE Inference Kernel — Hybrid Triton + CuTe DSL for DeepSeek-V3 Expert Dispatch on NVIDIA B200 Blackwell**
 
@@ -9,7 +9,7 @@
 [![Peak Speedup](https://img.shields.io/badge/Peak%20Speedup-~56x-orange)](#key-results)
 [![中文](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87%E7%89%88-red)](README_CN.md)
 
-A hybrid **[Triton](https://github.com/triton-lang/triton) + [CuTe DSL](https://github.com/NVIDIA/cutlass)** implementation of the DeepSeek-V3 Mixture-of-Experts (MoE) inference kernel, targeting **NVIDIA B200 (Blackwell, sm_100a)**. Developed for **Track A** of the [MLSys 2026 FlashInfer-Bench Challenge](https://github.com/flashinfer-ai/flashinfer-bench).
+A hybrid **[Triton](https://github.com/triton-lang/triton) + [CuTe DSL](https://github.com/NVIDIA/cutlass)** implementation of the DeepSeek-V3 Mixture-of-Experts (MoE) inference kernel, targeting **NVIDIA B200 (Blackwell, sm_100a)**.
 
 - **Triton** powers 17/19 workloads (routing, sorting, GEMM1+SwiGLU, GEMM2, token reduce)
 - **CuTe DSL** (NVIDIA CUTLASS) handles 2/19 large-T workloads (T=11948, T=14107) via grouped GEMM with per-T isolated runtimes
@@ -121,9 +121,8 @@ conda activate fi-bench
 # 2. Install dependencies
 pip install flashinfer-bench modal torch triton numpy
 
-# 3. Clone contest dataset
-git lfs install
-git clone https://huggingface.co/datasets/flashinfer-ai/mlsys26-contest
+# 3. Prepare benchmark traces
+# Place trace data under /path/to/benchmark-traces
 
 # 4. Modal login (one-time)
 modal setup
@@ -134,7 +133,7 @@ modal setup
 ```bash
 # Upload data to Modal volume (one-time)
 modal volume create flashinfer-trace
-modal volume put flashinfer-trace /path/to/mlsys26-contest /
+modal volume put flashinfer-trace /path/to/benchmark-traces /
 
 # Pack & run
 python scripts/pack_solution_simple.py
@@ -165,7 +164,7 @@ python -m modal run scripts/ab_test_modal.py
 ```
 mlsys_note/
 ├── solution/
-│   └── python/                              # Submission directory (config.toml: language=python)
+│   └── python/                              # Runtime package directory (config.toml: language=python)
 │       ├── kernel.py                        # Entry: 3-way dispatch (CuTe / T=901 / Pure Triton)
 │       ├── pure_triton_impl.py              # Pure Triton main impl (16/19 workloads)
 │       ├── triton_impl.py                   # Hybrid CuTe+Triton impl (large-T workloads)
@@ -186,9 +185,9 @@ mlsys_note/
 │   └── ...
 ├── paper.tex                                # Technical paper (LaTeX)
 ├── paper.pdf                                # Compiled paper
-├── config.toml                              # Config (team name, track, entry_point)
-├── solution.json                            # Packed submission file
-└── mlsys26-contest/                         # Contest dataset (submodule)
+├── config.toml                              # Runtime config
+├── solution.json                            # Packed solution bundle
+└── benchmark-traces/                        # Optional local benchmark trace data
 ```
 
 ---
@@ -269,12 +268,12 @@ mlsys_note/
 </details>
 
 <details>
-<summary><b>Phase 5: Contest Rule-Aware Optimization (Round 10)</b></summary>
+<summary><b>Phase 5: Evaluation Rule-Aware Optimization</b></summary>
 
-**Key rule updates (Apr 14–15 organizer clarification):**
-- **100x tolerance relaxation**: Official `atol=1.0, rtol=0.3, ratio=0.9` (we tested at `atol=0.01`)
+**Key evaluation-setting updates (Apr 14–15 clarification):**
+- **100x tolerance relaxation**: `atol=1.0, rtol=0.3, ratio=0.9` (we tested at `atol=0.01`)
 - **CUPTI GPU-only timing**: CPU overhead, launch latency, `.item()` syncs all excluded from scoring
-- **Self-contained requirement**: cuBLAS/CUTLASS/FlashInfer runtime calls discouraged; organizers "value seeing the team's own implementation"
+- **Self-contained requirement**: cuBLAS/CUTLASS/FlashInfer runtime calls discouraged to keep the kernel implementation inspectable
 
 | Commit | Optimization | Result |
 |--------|-------------|--------|
@@ -381,7 +380,7 @@ All three kernels (GEMM1, GEMM2, token_reduce) have fully saturated autotune spa
 
 **Authors:** Jiayao Zhang, Jiaoliang Yu
 
-> **Note:** The paper title references "Pure Triton" as the core approach. The final submission evolved into a hybrid Triton + CuTe DSL architecture, where CuTe DSL handles 2 large-T workloads for additional performance.
+> **Note:** The paper title references "Pure Triton" as the core approach. The final implementation evolved into a hybrid Triton + CuTe DSL architecture, where CuTe DSL handles 2 large-T workloads for additional performance.
 
 **Abstract:**
 We present a hybrid Triton + CuTe DSL implementation of the DeepSeek-V3 MoE kernel targeting the NVIDIA B200 (Blackwell, sm_100a) GPU. Our 6-stage pipeline exploits FP8 native tensor core dot products for 2x throughput in GEMM1, a non-atomic two-pass GEMM2-then-reduce architecture, FP16 intermediate buffers with scale-and-cast compensation, and multi-level bucket specialization across four BLOCK_M tiers. On 19 real-trace workloads (T=1 to T=14,107), the system achieves 19/19 correctness and a peak speedup of 106.65x (mean 55.77x) over the naive per-expert baseline, as measured by CUPTI GPU-only kernel timing.
@@ -422,9 +421,9 @@ The compiled paper is available at [`paper.pdf`](paper.pdf). Source: [`paper.tex
 | Scoring | Sum of CUPTI GPU kernel times; CPU overhead excluded |
 | Docker | `flashinfer/flashinfer-ci-cu132:20260401-2c675fb` (pinned) |
 | GPU Arch | sm_100a — must explicitly specify `-arch=sm_100a` in build flags |
-| cuBLAS/CUTLASS | Not hard-banned; organizers "value seeing team's own implementation" |
+| cuBLAS/CUTLASS | Not hard-banned; minimized at runtime to keep the implementation self-contained |
 | FlashInfer Runtime | Not allowed to call FlashInfer API at runtime; may copy source into repo |
-| Self-contained | All code must reside in `solution/python/`, packed into solution.json |
+| Self-contained | Runtime code resides in `solution/python/`, packed into solution.json |
 | Memory | 32 experts × ~56MB FP8 = ~1.8GB; B200 has ~180GB — not a bottleneck |
 
 ---

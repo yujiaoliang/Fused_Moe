@@ -1,6 +1,23 @@
-# FlashInfer Competition
+# Generated solution bundles
 # solution.json
 solution_*.json
+
+# LaTeX build artifacts
+*.aux
+*.bbl
+*.bcf
+*.blg
+*.fdb_latexmk
+*.fls
+*.lof
+*.log
+*.lot
+*.nav
+*.out
+*.run.xml
+*.snm
+*.synctex.gz
+*.toc
 
 # CUDA build artifacts
 *.o
